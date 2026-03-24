@@ -212,8 +212,12 @@ class GameSettings:
     music_volume:  float = 0.5       # 0.0 – 1.0
     sfx_volume:    float = 0.7       # 0.0 – 1.0
     music_enabled: bool  = True
-    profit_flash:  bool  = True      # golden flash on large earnings
-    hotkeys:       Dict[str, str] = field(
+    profit_flash:          bool  = True      # golden flash on large earnings
+    double_click_action:   bool  = True      # double-click table rows to perform primary action
+    right_click_haggle:    bool  = True      # right-click buy table item to haggle
+    enable_signatures:     bool  = True      # show parchment signing dialog for licenses/loans/etc.
+    gamble_mercy:          int   = 0           # mercy counter: at 15 the next coffer roll excludes commons
+    hotkeys:               Dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_HOTKEYS)
     )
 
@@ -249,8 +253,12 @@ class GameSettings:
                 "music_volume":  self.music_volume,
                 "sfx_volume":    self.sfx_volume,
                 "music_enabled": self.music_enabled,
-                "profit_flash":  self.profit_flash,
-                "hotkeys":       self.hotkeys,
+                "profit_flash":         self.profit_flash,
+                "double_click_action":   self.double_click_action,
+                "right_click_haggle":    self.right_click_haggle,
+                "enable_signatures":     self.enable_signatures,
+                "gamble_mercy":          self.gamble_mercy,
+                "hotkeys":               self.hotkeys,
             }, f)
 
     def load(self):
@@ -264,7 +272,11 @@ class GameSettings:
                 self.music_volume  = float(d.get("music_volume",  0.5))
                 self.sfx_volume    = float(d.get("sfx_volume",    0.7))
                 self.music_enabled = bool(d.get("music_enabled",  True))
-                self.profit_flash  = bool(d.get("profit_flash",   True))
+                self.profit_flash         = bool(d.get("profit_flash",         True))
+                self.double_click_action  = bool(d.get("double_click_action",   True))
+                self.right_click_haggle   = bool(d.get("right_click_haggle",    True))
+                self.enable_signatures    = bool(d.get("enable_signatures",     True))
+                self.gamble_mercy         = int(d.get("gamble_mercy",          0))
                 # Merge saved hotkeys with defaults (new actions get default binding)
                 raw_hk = d.get("hotkeys", {})
                 if isinstance(raw_hk, dict):
@@ -577,6 +589,209 @@ class BusinessManagerRecord:
     auto_sell: bool = True
     auto_repair: bool = True
     auto_hire: bool = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NPC MANAGER SYSTEM
+# Each HiredManager automates a domain of the game.  Managers level 1-5;
+# higher levels are more efficient, make fewer mistakes, and understand
+# economy fluctuations better.  They earn XP from successful actions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ManagerType(Enum):
+    BUSINESS_FOREMAN    = "Business Foreman"      # repairs, hires, manages production
+    TRADE_STEWARD       = "Trade Steward"          # scans markets, sells inventory smartly
+    PROPERTY_STEWARD    = "Property Steward"       # manages tenants, repairs, leases
+    CONTRACT_AGENT      = "Contract Agent"         # accepts & fulfills delivery contracts
+    LENDING_ADVISOR     = "Lending Advisor"        # vets & issues citizen loans, manages defaults
+    INVESTMENT_BROKER   = "Investment Broker"      # buys / sells stocks intelligently
+    FUND_CUSTODIAN      = "Fund Custodian"         # manages investment fund clients
+    CAMPAIGN_HANDLER    = "Campaign Handler"       # runs market influence campaigns
+    SMUGGLING_HANDLER   = "Smuggling Handler"      # manages contraband operations
+
+# XP thresholds to reach each level (cumulative from L1)
+MANAGER_XP_THRESHOLDS: List[int] = [0, 50, 150, 350, 750]   # L1 base, L1→L2, L2→L3, L3→L4, L4→L5
+
+# Per-level efficiency multipliers (affects quality and profit of decisions)
+MANAGER_EFFICIENCY: Dict[int, float] = {1: 0.65, 2: 0.76, 3: 0.86, 4: 0.93, 5: 0.98}
+
+# Per manager-type definition: base weekly wage, required license, description, icon
+MANAGER_DEFS: Dict[str, Dict] = {
+    ManagerType.BUSINESS_FOREMAN: {
+        "icon": "🔧", "wage": 25.0, "license": LicenseType.BUSINESS,
+        "desc": "Maintains your businesses — repairs breakdowns, hires workers, and handles daily operations.",
+        "detail": "At Lv1 makes decent hires and eventually repairs breakdowns. At Lv5 optimally staffs all businesses and prevents most failures.",
+    },
+    ManagerType.TRADE_STEWARD: {
+        "icon": "⚖", "wage": 30.0, "license": LicenseType.MERCHANT,
+        "desc": "Sells accumulated inventory at market — finds decent prices and clears excess stock.",
+        "detail": "At Lv1 sells at your current area for 70% of best price. At Lv5 identifies optimal routes and achieves 98% of peak value.",
+    },
+    ManagerType.PROPERTY_STEWARD: {
+        "icon": "🏠", "wage": 35.0, "license": LicenseType.REAL_ESTATE,
+        "desc": "Manages your real estate — finds tenants, collects rent, and keeps properties maintained.",
+        "detail": "At Lv1 may accept risky tenants and misses repair windows. At Lv5 screens tenants carefully and pre-empts condition decay.",
+    },
+    ManagerType.CONTRACT_AGENT: {
+        "icon": "📜", "wage": 40.0, "license": LicenseType.CONTRACTS,
+        "desc": "Monitors contracts and fulfills deliveries — accepts good orders and delivers on time.",
+        "detail": "At Lv1 may accept contracts with thin margins. At Lv5 only accepts profitable orders and fulfills them efficiently.",
+    },
+    ManagerType.LENDING_ADVISOR: {
+        "icon": "⊛", "wage": 45.0, "license": LicenseType.LENDER,
+        "desc": "Manages your citizen lending — vets borrowers, issues loans, and monitors repayments.",
+        "detail": "At Lv1 lends to average-risk citizens. At Lv5 only funds highly creditworthy borrowers at optimal rates.",
+    },
+    ManagerType.INVESTMENT_BROKER: {
+        "icon": "📈", "wage": 50.0, "license": LicenseType.FUND_MGR,
+        "desc": "Invests in the stock market on your behalf — reads trends and world events.",
+        "detail": "At Lv1 follows simple momentum signals. At Lv5 anticipates event impacts and builds an optimal portfolio.",
+    },
+    ManagerType.FUND_CUSTODIAN: {
+        "icon": "💰", "wage": 55.0, "license": LicenseType.FUND_MGR,
+        "desc": "Handles your fund management clients — accepts capital and collects management fees.",
+        "detail": "At Lv1 accepts any clients with modest rates. At Lv5 curates high-capital clients and maximises fee income.",
+    },
+    ManagerType.CAMPAIGN_HANDLER: {
+        "icon": "⭐", "wage": 35.0, "license": LicenseType.MERCHANT,
+        "desc": "Runs market influence campaigns and product promotions on your behalf.",
+        "detail": "At Lv1 runs basic campaigns with modest gold returns. At Lv5 times campaigns perfectly around supply events for maximum impact.",
+    },
+    ManagerType.SMUGGLING_HANDLER: {
+        "icon": "🦝", "wage": 60.0, "license": LicenseType.MERCHANT,
+        "desc": "Manages contraband operations — buys and sells illegal goods while minimising heat.",
+        "detail": "At Lv1 sticks to small conservative ops with average margins. At Lv5 runs sophisticated routes for maximum profit.",
+    },
+}
+
+@dataclass
+class HiredManager:
+    manager_type: str       # ManagerType.value string for JSON serialisation
+    name: str
+    level: int = 1
+    xp: int = 0
+    days_employed: int = 0
+    weekly_wage: float = 25.0
+    is_active: bool = True
+    # Configurable behaviour (type-specific keys; stored as free dict)
+    config: Dict = field(default_factory=dict)
+    # Lifetime stats for this manager
+    stats: Dict = field(default_factory=lambda: {
+        "total_actions":        0,
+        "total_gold_generated": 0.0,
+        "total_wages_paid":    0.0,   # actual wages deducted
+        "total_gold_cost":      0.0,   # operational gold spent (buys, repairs, etc.)
+        "mistakes":             0,
+        "level_ups":            0,
+        "last_action_day":      0,
+        "last_action_desc":     "",
+    })
+
+    # ── XP / levelling helpers ──────────────────────────────────────────────
+
+    def xp_to_next(self) -> int:
+        """XP needed to reach the next level (0 if already Lv5)."""
+        if self.level >= 5:
+            return 0
+        return MANAGER_XP_THRESHOLDS[self.level] - self.xp
+
+    def add_xp(self, amount: int) -> bool:
+        """Add XP; returns True if levelled up."""
+        if self.level >= 5:
+            return False
+        self.xp += amount
+        if self.xp >= MANAGER_XP_THRESHOLDS[self.level]:
+            self.level += 1
+            self.stats["level_ups"] += 1
+            return True
+        return False
+
+    @property
+    def efficiency(self) -> float:
+        return MANAGER_EFFICIENCY.get(self.level, 0.65)
+
+    def type_enum(self) -> "ManagerType":
+        for mt in ManagerType:
+            if mt.value == self.manager_type:
+                return mt
+        raise ValueError(self.manager_type)
+
+# Default configs per manager type (applied when hiring)
+_MANAGER_DEFAULT_CONFIGS: Dict[str, Dict] = {
+    ManagerType.BUSINESS_FOREMAN.value: {
+        "auto_repair":             True,    # repair broken-down businesses
+        "auto_hire":               True,    # fill empty worker slots
+        "repair_threshold":        500.0,   # skip repairs costing more than this
+        "max_wage_per_worker":     8.0,     # don't hire workers asking more than this
+        "auto_fire_lazy":          False,   # fire workers below productivity threshold
+        "min_worker_productivity": 0.6,     # fire workers below this productivity
+    },
+    ManagerType.TRADE_STEWARD.value: {
+        "sell_min_quantity":    1,      # minimum qty per item before selling
+        "keep_quantity":        0,      # always keep at least this many of each item
+        "sell_business_output": True,   # sell goods produced by your businesses
+        "sell_purchased_goods": True,   # sell goods in inventory (tracked by cost basis)
+        "auto_buy_for_resale":  False,  # buy cheap goods to resell later
+        "max_buy_gold":         200.0,  # max gold to spend on resale buys per day
+        "min_profit_pct":       0.08,   # minimum profit above cost before selling (8%)
+        "patience_days":        5,      # days to hold waiting for target price
+        "allow_travel":         False,  # steward travels independently to better markets
+        "max_travel_days":      2,      # only consider routes up to this many days away
+    },
+    ManagerType.PROPERTY_STEWARD.value: {
+        "auto_lease":                True,   # find and place tenants in empty properties
+        "reject_risky_tenants":      False,  # skip low-creditworthiness tenants
+        "auto_repair":               True,   # repair properties with low condition
+        "min_condition_to_repair":   0.55,   # trigger repair below this condition
+        "max_repair_cost":           1000.0, # skip single repairs costing more than this
+        "auto_evict_low_condition":  False,  # evict tenant so repairs can proceed
+        "evict_condition_threshold": 0.30,   # evict when condition drops below this
+    },
+    ManagerType.CONTRACT_AGENT.value: {
+        "auto_fulfill":         True,   # deliver fulfilled contracts automatically
+        "auto_procure":         True,   # buy missing items to fulfil contracts
+        "min_profit_per_unit":  0.5,    # only act on contracts at this margin or better
+        "max_deadline_days":    30,     # ignore contracts with deadlines beyond this
+        "max_procure_gold":     300.0,  # max gold to spend procuring per contract
+    },
+    ManagerType.LENDING_ADVISOR.value: {
+        "auto_issue":           True,
+        "min_creditworthiness": 0.7,    # 0.5=risky  1.0=average  1.5=safe
+        "max_loan_amount":      300.0,
+        "max_active_loans":     5,
+        "prefer_short_loans":   False,  # only accept loans ≤8 weeks duration
+        "max_total_loaned":     1000.0, # cap on total outstanding principal
+        "auto_write_off":       False,  # auto-clear defaulted loans from the ledger
+    },
+    ManagerType.INVESTMENT_BROKER.value: {
+        "auto_buy":                 True,   # buy stocks when signals are positive
+        "auto_sell":                True,   # sell stocks when take-profit/stop-loss hit
+        "max_investment_per_stock": 200.0,
+        "max_portfolio_value":      1000.0,
+        "risk_tolerance":           0.5,    # 0=conservative  1=aggressive
+        "min_gain_to_sell":         0.15,   # sell when gain % reaches this threshold
+        "stop_loss_pct":            0.20,   # sell when loss % reaches this threshold
+    },
+    ManagerType.FUND_CUSTODIAN.value: {
+        "auto_accept":        True,
+        "max_clients":        4,
+        "min_client_capital": 300.0,
+        "min_fee_rate":       0.01,  # reject clients offering less than this fee rate
+        "min_duration_days":  30,    # reject very short-term fund contracts
+    },
+    ManagerType.CAMPAIGN_HANDLER.value: {
+        "campaign_frequency_days": 14,
+        "preferred_area":          "CITY",
+        "max_campaign_cost":       50.0,  # spending cap per campaign run
+        "skip_if_last_loss":       False, # pause if the last campaign lost money
+    },
+    ManagerType.SMUGGLING_HANDLER.value: {
+        "max_heat":              60,    # refuse to operate above this heat level
+        "ops_frequency_days":    7,
+        "max_bust_risk":         0.25,  # skip run if estimated bust chance exceeds this
+        "min_net_profit":        0.0,   # skip run if expected net profit is below this
+        "heat_pause_after_bust": True,  # rest 3 days after a bust before resuming
+    },
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STOCK MARKET
@@ -2219,6 +2434,9 @@ class Game:
         self.next_plot_id: int     = 1
         self._re_listings_cache: List[Dict] = []   # cached area listings
         self._re_listings_area:  str        = ""   # area name those listings were for
+        # ── NPC Managers ──────────────────────────────────────────────────
+        self.hired_managers: List[HiredManager] = []
+        self._manager_action_log: deque = deque(maxlen=100)  # detailed action log
         # ── Achievements ──────────────────────────────────────────────────
         self.achievements: set  = set()   # unlocked achievement IDs
         self.ach_queue: list    = []       # IDs pending display
@@ -2543,6 +2761,912 @@ class Game:
             else:
                 warn(f"Can't pay manager {mgr.name}'s wages — manager quits!")
                 self.business_manager = None
+
+    # ── NPC Manager System ────────────────────────────────────────────────────
+
+    def _mgr_log(self, mgr: "HiredManager", msg: str) -> None:
+        """Log a manager action to both the manager action log and trade log."""
+        abs_day = self._absolute_day()
+        full = f"[Y{self.year} D{self.day}] [{mgr.name} L{mgr.level}] {msg}"
+        self._manager_action_log.appendleft(full)
+        self._log_trade(f"[{mgr.name}] {msg}")
+        mgr.stats["last_action_day"]  = abs_day
+        mgr.stats["last_action_desc"] = msg
+
+    def _mgr_award_xp(self, mgr: "HiredManager", amount: int) -> None:
+        """Award XP; announce level-ups in the game log."""
+        levelled = mgr.add_xp(amount)
+        if levelled:
+            self._mgr_log(mgr, f"LEVEL UP → Lv{mgr.level}! Efficiency now {mgr.efficiency*100:.0f}%")
+
+    def _run_hired_managers(self) -> None:
+        """Called once per day from _advance_day to run all hired managers."""
+        fired: List["HiredManager"] = []
+        for mgr in self.hired_managers:
+            if not mgr.is_active:
+                continue
+            mgr.days_employed += 1
+            # Weekly wage deduction
+            if mgr.days_employed % 7 == 0:
+                wage = mgr.weekly_wage * self.settings.cost_mult
+                if self.inventory.gold >= wage:
+                    self.inventory.gold -= wage
+                    mgr.stats["total_wages_paid"] += wage
+                    mgr.stats["total_gold_cost"]  += wage
+                else:
+                    self._mgr_log(mgr, "Wages unpaid — manager quits!")
+                    self._log_event(f"Manager {mgr.name} quit — wages unpaid")
+                    fired.append(mgr)
+                    continue
+            # Dispatch to the correct action handler
+            mt = mgr.manager_type
+            if   mt == ManagerType.BUSINESS_FOREMAN.value:  self._mgr_business_foreman(mgr)
+            elif mt == ManagerType.TRADE_STEWARD.value:     self._mgr_trade_steward(mgr)
+            elif mt == ManagerType.PROPERTY_STEWARD.value:  self._mgr_property_steward(mgr)
+            elif mt == ManagerType.CONTRACT_AGENT.value:    self._mgr_contract_agent(mgr)
+            elif mt == ManagerType.LENDING_ADVISOR.value:   self._mgr_lending_advisor(mgr)
+            elif mt == ManagerType.INVESTMENT_BROKER.value: self._mgr_investment_broker(mgr)
+            elif mt == ManagerType.FUND_CUSTODIAN.value:    self._mgr_fund_custodian(mgr)
+            elif mt == ManagerType.CAMPAIGN_HANDLER.value:  self._mgr_campaign_handler(mgr)
+            elif mt == ManagerType.SMUGGLING_HANDLER.value: self._mgr_smuggling_handler(mgr)
+        for mgr in fired:
+            self.hired_managers.remove(mgr)
+
+    # ── Per-manager action methods ────────────────────────────────────────────
+
+    def _mgr_business_foreman(self, mgr: "HiredManager") -> None:
+        """Repairs breakdowns, optionally fires underperformers, and fills worker slots."""
+        cfg = mgr.config
+        eff = mgr.efficiency
+        # ── Auto-repair broken businesses ────────────────────────────────
+        if cfg.get("auto_repair", True):
+            threshold = cfg.get("repair_threshold", 500.0)
+            for b in self.businesses:
+                if not b.broken_down:
+                    continue
+                if random.random() > eff:   # low-level managers sometimes miss it
+                    continue
+                cost = b.repair_cost
+                if cost > threshold or self.inventory.gold < cost:
+                    continue
+                self.inventory.gold  -= cost
+                b.broken_down         = False
+                b.repair_cost         = 0.0
+                mgr.stats["total_actions"]   += 1
+                mgr.stats["total_gold_cost"] += cost
+                self._mgr_log(mgr, f"Repaired {b.name} for {cost:.0f}g")
+                self._mgr_award_xp(mgr, 2)
+        # ── Auto-fire underperforming / over-priced workers ───────────────
+        if cfg.get("auto_fire_lazy", False):
+            prod_floor = cfg.get("min_worker_productivity", 0.6)
+            max_wage   = cfg.get("max_wage_per_worker", 8.0)
+            for b in self.businesses:
+                if b.broken_down:
+                    continue
+                for worker in list(b.hired_workers):
+                    prod = worker.get("productivity", 1.0)
+                    wage = worker.get("wage", 0.0)
+                    if prod < prod_floor or wage > max_wage:
+                        b.hired_workers.remove(worker)
+                        b.workers = len(b.hired_workers)
+                        mgr.stats["total_actions"] += 1
+                        self._mgr_log(mgr, f"Replaced {worker['name']} at {b.name} "
+                                           f"(prod {prod:.2f}, wage {wage:.1f}g/day)")
+                        self._mgr_award_xp(mgr, 1)
+        # ── Auto-hire workers to fill empty slots ─────────────────────────
+        if cfg.get("auto_hire", True):
+            # Pool size = how many applicants the foreman can interview per slot.
+            # L1 (0.65): 3 candidates — limited network, less selective.
+            # L5 (1.00): 8 candidates — wide network, picks the best of many.
+            pool_size = max(3, round(3 + eff * 5))
+            max_wage  = cfg.get("max_wage_per_worker", 8.0)
+            for b in self.businesses:
+                if b.broken_down or b.workers >= b.max_workers:
+                    continue
+                while b.workers < b.max_workers:
+                    candidates = self._generate_applicants(pool_size)
+                    candidates = [c for c in candidates if c.get("wage", 99) <= max_wage]
+                    if not candidates:
+                        break
+                    best = max(candidates,
+                               key=lambda x: x["productivity"] / max(x["wage"], 0.01))
+                    b.hired_workers.append(best)
+                    b.workers = len(b.hired_workers)
+                    mgr.stats["total_actions"] += 1
+                    self._mgr_log(mgr, f"Hired {best['name']} for {b.name} "
+                                       f"at {best['wage']:.1f}g/day")
+                    self._mgr_award_xp(mgr, 1)
+
+    def _mgr_trade_steward(self, mgr: "HiredManager") -> None:
+        """P&L-aware sell agent with optional same-day multi-market routing.
+
+        Design:
+          - No position/transit state. Steward always operates from player's area.
+          - Tracks cost_basis per item. Player-bought items are registered at the
+            current sell price (the "floor" — steward wants a move above that).
+          - With allow_travel=True: evaluates nearby markets, pays 3g×days trip cost,
+            and sells the entire batch at the best destination that day. One decision,
+            one trip. No delayed state, no stuck-in-transit bugs.
+
+        Intelligence (eff = mgr.efficiency):
+          L1 (0.65): 35% miss, no trend reads, checks ~2 destinations
+          L3 (0.86): 14% miss, 3-day trend exit signal, checks ~4 destinations
+          L5 (0.98):  2% miss, full market scan, trend buys
+        """
+        cfg = mgr.config
+        eff = mgr.efficiency
+
+        # Safe bootstrap — survives any save format
+        mgr.stats.setdefault("cost_basis",     {})
+        mgr.stats.setdefault("hold_since_day", {})
+
+        min_qty       = cfg.get("sell_min_quantity",  1)
+        keep_qty      = cfg.get("keep_quantity",      0)
+        sell_biz      = cfg.get("sell_business_output", True)
+        sell_purch    = cfg.get("sell_purchased_goods", True)
+        auto_buy      = cfg.get("auto_buy_for_resale",  False)
+        max_spend     = cfg.get("max_buy_gold",       200.0)
+        min_profit    = cfg.get("min_profit_pct",      0.05)  # 5% target above basis
+        patience      = cfg.get("patience_days",         5)   # days before accepting near-cost
+        allow_travel  = cfg.get("allow_travel",        False)
+        max_travel_d  = cfg.get("max_travel_days",       2) if allow_travel else 0
+
+        home_area  = self.current_area
+        home_mkt   = self.markets[home_area]
+        biz_items  = {b.item_produced for b in self.businesses}
+        cost_basis = mgr.stats["cost_basis"]
+        hold_since = mgr.stats["hold_since_day"]
+
+        # ── Clean stale basis entries for items no longer in inventory ────
+        for ik in list(cost_basis.keys()):
+            if self.inventory.items.get(ik, 0) == 0:
+                cost_basis.pop(ik, None)
+                hold_since.pop(ik, None)
+
+        # ── Register estimated floor for manually-held items ──────────────
+        # Use current sell price as the cost floor. Steward needs a price ABOVE
+        # this before selling (target_margin %). After patience_days it relaxes.
+        if sell_purch:
+            for item_key in list(self.inventory.items.keys()):
+                if (item_key not in biz_items
+                        and item_key not in cost_basis
+                        and item_key in home_mkt.item_keys):
+                    cost_basis[item_key] = home_mkt.get_sell_price(
+                        item_key, self.season, self.skills.trading)
+                    hold_since.setdefault(item_key, self.day)
+
+        # ── Determine sell market (home or best routed destination) ───────
+        # With allow_travel, the steward scouts nearby markets and can pay a
+        # trip cost to sell the whole batch there on the same day.
+        sell_area     = home_area
+        sell_mkt      = home_mkt
+        trip_cost_paid = 0.0
+
+        if allow_travel and max_travel_d > 0:
+            # Collect items we intend to sell
+            route_items = []
+            for item_key, qty in self.inventory.items.items():
+                is_b = item_key in biz_items
+                if is_b and not sell_biz:
+                    continue
+                if not is_b and not sell_purch:
+                    continue
+                net = qty - keep_qty
+                if net >= min_qty and item_key in home_mkt.item_keys:
+                    route_items.append((item_key, net))
+
+            if route_items:
+                home_tdtbl  = AREA_INFO[home_area]["travel_days"]
+                # Gather route candidates — intelligence limits awareness
+                # L1: each destination has only eff chance to be considered
+                best_dest   = home_area
+                best_bonus  = 0.0  # must be positive to justify the trip
+
+                for dest_area in Area:
+                    if dest_area == home_area:
+                        continue
+                    td = home_tdtbl.get(dest_area, 99)
+                    if td > max_travel_d:
+                        continue
+                    # Low-level stewards miss some routes
+                    if random.random() > eff + 0.35:
+                        continue
+                    tc       = td * 3.0 * self.settings.cost_mult
+                    dest_mkt = self.markets[dest_area]
+                    bonus    = -tc  # overcome trip cost to be worthwhile
+
+                    for item_key, net in route_items:
+                        if item_key in dest_mkt.item_keys:
+                            local_sp = home_mkt.get_sell_price(
+                                item_key, self.season, self.skills.trading)
+                            dest_sp  = dest_mkt.get_sell_price(
+                                item_key, self.season, self.skills.trading)
+                            bonus += (dest_sp - local_sp) * net
+
+                    if bonus > best_bonus:
+                        best_bonus = bonus
+                        best_dest  = dest_area
+
+                # Execute the trip if the net gain is worthwhile
+                if best_dest != home_area:
+                    td = home_tdtbl[best_dest]
+                    tc = round(td * 3.0 * self.settings.cost_mult, 1)
+                    if self.inventory.gold >= tc:
+                        self.inventory.gold          -= tc
+                        trip_cost_paid                = tc
+                        sell_area                     = best_dest
+                        sell_mkt                      = self.markets[best_dest]
+                        mgr.stats["total_gold_cost"] += tc
+                        # Road risk (higher eff = safer traveller)
+                        risk     = (AREA_INFO[best_dest]["travel_risk"]
+                                    + self.markets[best_dest].travel_risk_override)
+                        eff_risk = risk * (1.2 - eff)
+                        if random.random() < eff_risk:
+                            loss = max(0, min(
+                                int(self.inventory.gold * random.uniform(0.03, 0.12)),
+                                int(self.inventory.gold)))
+                            self.inventory.gold = max(0, self.inventory.gold - loss)
+                            mgr.stats["mistakes"] += 1
+                            self._mgr_log(mgr,
+                                f"⚠ Trouble on road to {best_dest.value}! "
+                                f"Lost {loss:.0f}g")
+                        else:
+                            self._mgr_log(mgr,
+                                f"Routed to {best_dest.value} "
+                                f"(+{best_bonus:.0f}g est. vs local, {tc:.0f}g trip)")
+                        mgr.stats["total_actions"] += 1
+                        self._mgr_award_xp(mgr, 1)
+
+        # ── SELL loop ─────────────────────────────────────────────────────
+        for item_key, qty in list(self.inventory.items.items()):
+            is_biz = item_key in biz_items
+            if is_biz and not sell_biz:
+                continue
+            if not is_biz and not sell_purch:
+                continue
+
+            sellable = qty - keep_qty
+            if sellable < min_qty:
+                continue
+            if item_key not in sell_mkt.item_keys:
+                continue
+
+            pressure = sell_mkt.pressure.get(item_key, 1.0)
+            nat      = sell_mkt.natural_pressure.get(item_key, 1.0)
+
+            # ── Business goods: sell unless market is severely depressed ──
+            if is_biz:
+                if pressure < nat * 0.88:
+                    continue
+                to_sell  = max(1, int(sellable * eff))
+                earnings = sell_mkt.sell_to_market(
+                    item_key, to_sell, self.season, self.skills.trading)
+                if earnings <= 0:
+                    continue
+                self.inventory.remove(item_key, to_sell)
+                self.inventory.gold   += earnings
+                self.total_profit     += earnings
+                mgr.stats["total_actions"]        += 1
+                mgr.stats["total_gold_generated"] += earnings
+                loc = f" at {sell_area.value}" if sell_area != home_area else ""
+                self._mgr_log(mgr, f"Sold {to_sell}× {item_key} for {earnings:.0f}g "
+                                   f"(×{pressure:.2f}{loc})")
+                self._mgr_award_xp(mgr, 1)
+                if eff >= 0.85:
+                    self._mgr_award_xp(mgr, 2)
+                continue
+
+            # ── Purchased goods: P&L gate ─────────────────────────────────
+            basis     = cost_basis.get(item_key, 0.0)
+            day_held  = self.day - hold_since.get(item_key, self.day)
+            sell_p    = sell_mkt.get_sell_price(item_key, self.season, self.skills.trading)
+
+            # Scale target slightly with level; L1=5%, L5=6.6%
+            target_margin = min_profit + (eff - 0.65) * 0.05
+            target_price  = basis * (1.0 + target_margin) if basis > 0 else 0.01
+
+            will_sell   = False
+            sell_reason = ""
+
+            if sell_p >= target_price:
+                will_sell   = True
+                pct = (sell_p / max(basis, 0.01) - 1) * 100
+                sell_reason = f"{pct:+.0f}% vs floor"
+
+            if not will_sell and basis >= 0:
+                # After patience_days accept within −5% of basis; after max_hold sell anything
+                max_hold = patience * (1.0 + (eff - 0.65) * 2.0)
+                if day_held >= max_hold:
+                    will_sell   = True
+                    sell_reason = f"max-hold ({day_held:.0f}d)"
+                elif day_held >= patience and sell_p >= basis * 0.95:
+                    will_sell   = True
+                    sell_reason = f"patience ({day_held:.0f}d)"
+
+            # L3+: cut position on declining trend when still above basis
+            if not will_sell and eff >= 0.79:
+                hist = list(sell_mkt.history.get(item_key, []))
+                if len(hist) >= 3:
+                    t3 = (hist[-1].price - hist[-3].price) / max(hist[-3].price, 0.01)
+                    if t3 < -0.02 and sell_p >= basis * 1.02:
+                        will_sell   = True
+                        sell_reason = "trend ↓ exit"
+
+            # Miss rate: simulates imperfect timing (L1: 35%, L5: ~2%)
+            if will_sell and random.random() > eff:
+                will_sell = False
+
+            if not will_sell:
+                continue
+
+            to_sell  = sellable
+            earnings = sell_mkt.sell_to_market(
+                item_key, to_sell, self.season, self.skills.trading)
+            if earnings <= 0:
+                continue
+
+            pnl = earnings - (basis * to_sell) if basis > 0 else earnings
+            self.inventory.remove(item_key, to_sell)
+            self.inventory.gold   += earnings
+            self.total_profit     += earnings
+            cost_basis.pop(item_key, None)
+            hold_since.pop(item_key, None)
+            mgr.stats["total_actions"]        += 1
+            mgr.stats["total_gold_generated"] += earnings
+            loc = f" at {sell_area.value}" if sell_area != home_area else ""
+            self._mgr_log(mgr,
+                f"Sold {to_sell}× {item_key} for {earnings:.0f}g "
+                f"(P&L {pnl:+.0f}g, {sell_reason}{loc})")
+            self._mgr_award_xp(mgr, 1)
+            if pnl > 0:
+                self._mgr_award_xp(mgr, 1)
+
+        # ── AUTO-BUY for resale ───────────────────────────────────────────
+        if not auto_buy:
+            return
+        spent = 0.0
+        for item_key in list(home_mkt.item_keys):
+            if spent >= max_spend or self.inventory.gold < 5:
+                break
+            item = ALL_ITEMS.get(item_key)
+            if not item or item.illegal:
+                continue
+            # Skip items already in inventory with a known basis (don't double-dip)
+            if item_key in cost_basis and self.inventory.items.get(item_key, 0) > 0:
+                continue
+
+            buy_p = home_mkt.get_buy_price(item_key, self.season, self.skills.trading)
+
+            # Best expected sell price (local or best routed destination)
+            best_sell_p   = home_mkt.get_sell_price(item_key, self.season, self.skills.trading)
+            best_sell_area = home_area
+            if allow_travel:
+                for dest_area in Area:
+                    if dest_area == home_area:
+                        continue
+                    td = AREA_INFO[home_area]["travel_days"].get(dest_area, 99)
+                    if td > max_travel_d:
+                        continue
+                    dest_mkt = self.markets[dest_area]
+                    if item_key not in dest_mkt.item_keys:
+                        continue
+                    tc       = td * 3.0 * self.settings.cost_mult
+                    dest_sp  = dest_mkt.get_sell_price(item_key, self.season, self.skills.trading)
+                    # Amortise trip cost over an expected 10-unit lot
+                    adj_sp   = dest_sp - tc / 10.0
+                    if adj_sp > best_sell_p:
+                        best_sell_p    = adj_sp
+                        best_sell_area = dest_area
+
+            target_sell = buy_p * (1.0 + min_profit)
+            if best_sell_p < target_sell:
+                continue
+
+            # L3+: trend signal at best sell destination
+            if eff >= 0.79:
+                dest_mkt = self.markets[best_sell_area]
+                hist = list(dest_mkt.history.get(item_key, []))
+                if (len(hist) >= 3 and best_sell_p < target_sell):
+                    t3 = (hist[-1].price - hist[-3].price) / max(hist[-3].price, 0.01)
+                    if t3 > 0.015:
+                        pass  # still need target_sell to pass above
+
+            if random.random() > eff:  # miss rate
+                continue
+
+            budget   = min(max_spend - spent, self.inventory.gold * 0.25)
+            qty_cap  = max(1, int(budget / max(buy_p, 0.01)))
+            qty      = min(qty_cap, home_mkt.stock.get(item_key, 0), 30)
+            if qty < 1:
+                continue
+
+            cost = home_mkt.buy_from_market(item_key, qty, self.season, self.skills.trading)
+            if cost < 0 or self.inventory.gold < cost:
+                continue
+
+            self.inventory.gold -= cost
+            self.inventory.add(item_key, qty)
+            spent += cost
+
+            old_qty = self.inventory.items.get(item_key, qty) - qty
+            paid_pu = cost / qty
+            if old_qty > 0 and item_key in cost_basis:
+                cost_basis[item_key] = (cost_basis[item_key] * old_qty + cost) / (old_qty + qty)
+            else:
+                cost_basis[item_key] = paid_pu
+            hold_since[item_key] = self.day
+
+            dest_note = (f" → {best_sell_area.value}" if best_sell_area != home_area else "")
+            mgr.stats["total_actions"]   += 1
+            mgr.stats["total_gold_cost"] += cost
+            self._mgr_log(mgr,
+                f"Bought {qty}× {item_key} @ {paid_pu:.1f}g "
+                f"({cost:.0f}g){dest_note}, need >{target_sell:.1f}g to sell")
+            self._mgr_award_xp(mgr, 1)
+
+    def _mgr_property_steward(self, mgr: "HiredManager") -> None:
+        """Manages real estate: finds tenants, triggers repairs, handles leases."""
+        cfg = mgr.config
+        eff = mgr.efficiency
+        # ── Auto-evict tenants from critically damaged properties ─────────
+        if cfg.get("auto_evict_low_condition", False):
+            evict_thresh = cfg.get("evict_condition_threshold", 0.30)
+            for prop in self.real_estate:
+                if not prop.is_leased or prop.condition > evict_thresh:
+                    continue
+                old_tenant  = prop.tenant_name or "Tenant"
+                prop.is_leased   = False
+                prop.tenant_name = ""
+                self.reputation  = max(0, self.reputation - 1)
+                mgr.stats["total_actions"] += 1
+                self._mgr_log(mgr, f"Evicted {old_tenant} from {prop.name} "
+                                   f"(condition {prop.condition:.0%} < {evict_thresh:.0%})")
+        # ── Auto-lease vacant properties ─────────────────────────────────
+        if cfg.get("auto_lease", True):
+            for prop in self.real_estate:
+                if prop.under_construction or prop.is_leased or prop.condition < 0.20:
+                    continue
+                # Low-level stewards occasionally miss vacancies
+                if random.random() > eff:
+                    continue
+                reject_risky = cfg.get("reject_risky_tenants", False)
+                rate_base = max(0.1, eff - random.uniform(0, 0.15))
+                cw_floor  = 0.5 if not reject_risky else max(0.5, eff * 0.8)
+                cw        = random.uniform(cw_floor, 1.5)
+                reliability_labels = ["Troublesome","Risky","Average","Good","Excellent"]
+                cw_idx      = min(4, int((cw - 0.5) / 0.25))
+                _tf = ["Aldric","Bram","Cora","Dag","Elra","Finn","Greta","Holt","Isa",
+                       "Jorin","Kev","Lena","Mira","Ned","Ora","Pip","Quinn","Rolf","Sable","Tilda"]
+                _tl = ["Miller","Cooper","Smith","Tanner","Fisher","Brewer","Mason",
+                       "Wright","Fletcher","Barrow","Cotter","Dyer","Galloway","Hayward"]
+                tenant_name          = f"{random.choice(_tf)} {random.choice(_tl)}"
+                prop.is_leased       = True
+                prop.tenant_name     = tenant_name
+                prop.lease_rate_mult = round(rate_base * 1.1, 2)
+                mgr.stats["total_actions"] += 1
+                mgr.stats["total_gold_generated"] += prop.daily_lease * 30
+                self._mgr_log(mgr, f"Leased {prop.name} to {tenant_name} "
+                                   f"({reliability_labels[cw_idx]}) "
+                                   f"at {prop.daily_lease:.1f}g/day")
+                self._mgr_award_xp(mgr, 3)
+        # ── Auto-repair low-condition properties ─────────────────────────
+        if not cfg.get("auto_repair", True):
+            return
+        threshold    = cfg.get("min_condition_to_repair", 0.55)
+        max_repair   = cfg.get("max_repair_cost", 1000.0)
+        for prop in self.real_estate:
+            if prop.under_construction or prop.condition >= threshold:
+                continue
+            if prop.is_leased:
+                continue   # can't repair while occupied; use auto_evict first
+            cost = prop.repair_cost
+            if cost <= 0 or self.inventory.gold < cost:
+                continue
+            if cost > max_repair:
+                self._mgr_log(mgr, f"Skipped repair of {prop.name}: cost {cost:.0f}g "
+                                   f"exceeds limit {max_repair:.0f}g")
+                continue
+            if random.random() > eff:
+                continue
+            self.inventory.gold -= cost
+            prop.condition       = min(1.0, prop.condition + random.uniform(0.3, 0.5) * eff)
+            mgr.stats["total_actions"]   += 1
+            mgr.stats["total_gold_cost"] += cost
+            self._mgr_log(mgr, f"Repaired {prop.name} (condition now {prop.condition:.0%})")
+            self._mgr_award_xp(mgr, 2)
+
+    def _mgr_contract_agent(self, mgr: "HiredManager") -> None:
+        """Fulfills accepted contracts by procuring items and marking deliveries."""
+        cfg = mgr.config
+        eff = mgr.efficiency
+        auto_fulfill = cfg.get("auto_fulfill", True)
+        auto_procure = cfg.get("auto_procure", True)
+        max_deadline = cfg.get("max_deadline_days", 999)
+        max_procure  = cfg.get("max_procure_gold", 300.0)
+        for con in self.contracts:
+            if con.fulfilled:
+                continue
+            days_left = con.deadline_day - self._absolute_day()
+            if days_left > max_deadline:
+                continue
+            urgency  = 1.0 - (days_left / max(con.deadline_day, 1))
+            act_prob = eff + urgency * 0.3
+            if random.random() > min(1.0, act_prob):
+                continue
+            have   = self.inventory.items.get(con.item_key, 0)
+            needed = con.quantity
+            # ── Fulfill if we have stock at the destination ───────────────
+            if auto_fulfill and have >= needed and self.current_area == con.destination:
+                value = needed * con.price_per_unit + con.reward_bonus
+                self.inventory.remove(con.item_key, needed)
+                self.inventory.gold += value
+                self.reputation      = min(100, self.reputation + 2)
+                self.total_profit   += value
+                self._track_stat("contracts_completed")
+                if days_left > 0:
+                    self._track_stat("contracts_ontime")
+                con.fulfilled = True
+                mgr.stats["total_actions"] += 1
+                mgr.stats["total_gold_generated"] += value
+                self._mgr_log(mgr, f"Fulfilled contract: {needed}× {con.item_key} "
+                                   f"→ {con.destination.value}  +{value:.0f}g")
+                self._mgr_award_xp(mgr, 5)
+                self._check_achievements()
+            # ── Procure short-fall from market ────────────────────────────
+            elif auto_procure and have < needed:
+                short = needed - have
+                mkt   = self.markets[self.current_area]
+                if mkt.stock.get(con.item_key, 0) < short:
+                    continue
+                buy_price = mkt.get_buy_price(con.item_key, self.season, self.skills.trading)
+                total_cost = round(buy_price * short, 2)
+                if total_cost > max_procure:
+                    self._mgr_log(mgr, f"Skipped procuring {short}× {con.item_key}: "
+                                       f"cost {total_cost:.0f}g exceeds limit {max_procure:.0f}g")
+                    continue
+                if self.inventory.gold < total_cost:
+                    continue
+                actual_cost = mkt.buy_from_market(con.item_key, short,
+                                                   self.season, self.skills.trading)
+                if actual_cost < 0:
+                    continue
+                self.inventory.gold -= actual_cost
+                self.inventory.add(con.item_key, short)
+                mgr.stats["total_actions"]   += 1
+                mgr.stats["total_gold_cost"] += actual_cost
+                self._mgr_log(mgr, f"Procured {short}× {con.item_key} "
+                                   f"for pending contract ({actual_cost:.0f}g)")
+                self._mgr_award_xp(mgr, 2)
+
+    def _mgr_lending_advisor(self, mgr: "HiredManager") -> None:
+        """Vets and issues citizen loans periodically."""
+        cfg = mgr.config
+        eff = mgr.efficiency
+        # Only acts every 3-5 days
+        if self._absolute_day() % random.randint(3, 5) != 0:
+            return
+        if not cfg.get("auto_issue", True):
+            return
+        # ── Auto write-off: clear very old defaulted loans ───────────────
+        if cfg.get("auto_write_off", False):
+            for cl in list(self.citizen_loans):
+                if cl.defaulted and cl.weeks_remaining <= 0:
+                    self.citizen_loans.remove(cl)
+                    mgr.stats["total_actions"] += 1
+                    self._mgr_log(mgr, f"Wrote off defaulted loan from {cl.borrower_name} "
+                                       f"({cl.principal:.0f}g principal)")
+        max_active = cfg.get("max_active_loans", 5)
+        active     = [cl for cl in self.citizen_loans
+                      if not cl.defaulted and cl.weeks_remaining > 0]
+        if len(active) >= max_active:
+            return
+        # ── Max total loaned cap ──────────────────────────────────────────
+        max_total_loaned = cfg.get("max_total_loaned", 1000.0)
+        outstanding = sum(cl.principal for cl in active)
+        if outstanding >= max_total_loaned:
+            return
+        max_gold = cfg.get("max_loan_amount", 300.0)
+        min_cw   = cfg.get("min_creditworthiness", 0.7)
+        adj_cw   = min_cw + (eff - 0.65) * 0.5
+        prefer_short = cfg.get("prefer_short_loans", False)
+        candidates   = self._gen_loan_applicants(4)
+        for cand in candidates:
+            if cand["creditworthiness"] < adj_cw:
+                continue
+            if cand["amount"] > max_gold:
+                continue
+            if prefer_short and cand["weeks"] > 8:
+                continue
+            if outstanding + cand["amount"] > max_total_loaned:
+                continue
+            if self.inventory.gold < cand["amount"]:
+                continue
+            rate    = round(cand["max_rate"] * (0.9 + eff * 0.1), 3)
+            weeks   = cand["weeks"]
+            payment = round(cand["amount"] * (1 + rate * weeks) / weeks, 2)
+            cl = CitizenLoan(
+                id=self.next_citizen_loan_id,
+                borrower_name=cand["name"],
+                principal=cand["amount"],
+                interest_rate=rate,
+                weeks_remaining=weeks,
+                weekly_payment=payment,
+                creditworthiness=cand["creditworthiness"],
+            )
+            self.next_citizen_loan_id += 1
+            self.citizen_loans.append(cl)
+            self.inventory.gold -= cand["amount"]
+            outstanding         += cand["amount"]
+            mgr.stats["total_actions"] += 1
+            mgr.stats["total_gold_generated"] += payment * weeks - cand["amount"]
+            self._mgr_log(mgr, f"Issued loan to {cand['name']}: {cand['amount']:.0f}g "
+                               f"@ {rate*100:.1f}%/wk × {weeks}wk")
+            self._mgr_award_xp(mgr, 3)
+            break  # one loan per trigger
+
+    def _mgr_investment_broker(self, mgr: "HiredManager") -> None:
+        """Buys and sells stocks based on signals; efficiency controls quality of decisions."""
+        cfg  = mgr.config
+        eff  = mgr.efficiency
+        risk = cfg.get("risk_tolerance", 0.5)
+        # Acts every 2-4 days
+        if self._absolute_day() % random.randint(2, 4) != 0:
+            return
+        auto_sell      = cfg.get("auto_sell", True)
+        auto_buy       = cfg.get("auto_buy", True)
+        min_gain       = cfg.get("min_gain_to_sell", 0.15)
+        stop_loss      = cfg.get("stop_loss_pct", 0.20)
+        max_per        = cfg.get("max_investment_per_stock", 200.0)
+        max_total      = cfg.get("max_portfolio_value", 1000.0)
+        port_val       = self._portfolio_value()
+        # ── Sell signals (take profit or cut loss) ──────────────────────
+        if auto_sell:
+            for sym, holding in list(self.stock_holdings.items()):
+                sd       = self.stock_market.stocks.get(sym)
+                if not sd:
+                    continue
+                price    = sd["price"]
+                avg_cost = holding.avg_cost
+                gain_pct = (price - avg_cost) / max(avg_cost, 1.0)
+                if eff < 0.80:
+                    sell = gain_pct > min_gain or gain_pct < -stop_loss
+                else:
+                    hist  = list(sd["history"])
+                    trend = (hist[-1] - hist[-5]) / max(hist[-5], 1.0) if len(hist) >= 5 else 0
+                    sell  = (gain_pct > min_gain + risk * 0.15) or (trend < -0.04 and gain_pct < 0)
+                if sell:
+                    proceeds = round(holding.shares * price, 2)
+                    profit   = proceeds - round(holding.shares * avg_cost, 2)
+                    del self.stock_holdings[sym]
+                    self.inventory.gold += proceeds
+                    self.total_profit   += profit
+                    self._track_stat("stock_profit", profit)
+                    mgr.stats["total_actions"] += 1
+                    mgr.stats["total_gold_generated"] += max(0.0, profit)
+                    self._mgr_log(mgr, f"Sold {holding.shares}× {sym} for {proceeds:.0f}g "
+                                       f"({'profit' if profit >= 0 else 'loss'} {abs(profit):.0f}g)")
+                    self._mgr_award_xp(mgr, 5 if profit > 0 else 1)
+        # ── Buy signals ──────────────────────────────────────────────────
+        if not auto_buy:
+            return
+        if port_val >= max_total or self.inventory.gold < 50:
+            return
+        candidates = []
+        for sym, sd in self.stock_market.stocks.items():
+            if sym in self.stock_holdings:
+                continue
+            price = sd["price"]
+            hist  = list(sd["history"])
+            if len(hist) < 3:
+                continue
+            trend_3d = (hist[-1] - hist[-3]) / max(hist[-3], 1.0) if len(hist) >= 3 else 0
+            event_score = 0.0
+            if eff >= 0.85:
+                for mkt in self.markets.values():
+                    for ev in mkt.active_events:
+                        impact = sd["linked_events"].get(ev, 0.0)
+                        event_score += impact
+            score = trend_3d + event_score * eff * 0.5
+            candidates.append((score, sym, price, sd["volatility"]))
+        if not candidates:
+            return
+        candidates.sort(reverse=True)
+        top_sym, top_price, top_vol = candidates[0][1], candidates[0][2], candidates[0][3]
+        if candidates[0][0] < (0.01 if eff >= 0.80 else 0.02):
+            return
+        invest = min(max_per * eff, max_total - port_val, self.inventory.gold * 0.3)
+        invest = max(10.0, round(invest, 2))
+        shares = max(1, int(invest / max(top_price, 0.01)))
+        cost   = round(shares * top_price, 2)
+        if cost > self.inventory.gold:
+            return
+        self.inventory.gold -= cost
+        if top_sym in self.stock_holdings:
+            h            = self.stock_holdings[top_sym]
+            total_shares = h.shares + shares
+            avg          = round((h.shares * h.avg_cost + cost) / total_shares, 4)
+            self.stock_holdings[top_sym] = StockHolding(top_sym, total_shares, avg)
+        else:
+            self.stock_holdings[top_sym] = StockHolding(top_sym, shares, top_price)
+        mgr.stats["total_actions"] += 1
+        self._mgr_log(mgr, f"Bought {shares}× {top_sym} @ {top_price:.2f}g ea ({cost:.0f}g)")
+        self._mgr_award_xp(mgr, 2)
+
+    def _mgr_fund_custodian(self, mgr: "HiredManager") -> None:
+        """Accepts fund management clients automatically based on configuration."""
+        cfg = mgr.config
+        eff = mgr.efficiency
+        # Only acts every 5-8 days
+        if self._absolute_day() % random.randint(5, 8) != 0:
+            return
+        if not cfg.get("auto_accept", True):
+            return
+        if LicenseType.FUND_MGR not in self.licenses:
+            return
+        max_clients  = cfg.get("max_clients", 4)
+        active_count = sum(1 for fc in self.fund_clients if not fc.withdrawn)
+        if active_count >= max_clients:
+            return
+        min_cap       = cfg.get("min_client_capital", 300.0)
+        min_fee_rate  = cfg.get("min_fee_rate", 0.01)
+        min_dur_days  = cfg.get("min_duration_days", 30)
+        pool          = self._gen_fund_client_pool(3)
+        for cand in pool:
+            if cand["capital"] < min_cap:
+                continue
+            if cand["duration"] < min_dur_days:
+                self._mgr_log(mgr, f"Skipped {cand['name']}: duration {cand['duration']}d < "
+                                   f"minimum {min_dur_days}d")
+                continue
+            fee_rate = round(cand["fee_rate"] * (0.9 + eff * 0.2), 4)
+            if fee_rate < min_fee_rate:
+                self._mgr_log(mgr, f"Skipped {cand['name']}: fee {fee_rate*100:.1f}% < "
+                                   f"minimum {min_fee_rate*100:.1f}%")
+                continue
+            start = self._absolute_day()
+            dur   = cand["duration"]
+            fc = FundClient(
+                id=self.next_fund_client_id,
+                name=cand["name"],
+                capital=cand["capital"],
+                promised_rate=cand["promised_rate"],
+                start_day=start,
+                duration_days=dur,
+                maturity_day=start + dur,
+                fee_rate=fee_rate,
+            )
+            self.next_fund_client_id += 1
+            self.fund_clients.append(fc)
+            mgr.stats["total_actions"] += 1
+            self._mgr_log(mgr, f"Accepted fund client {cand['name']}: "
+                               f"{cand['capital']:.0f}g, {dur}d, fee {fee_rate*100:.1f}%/mo")
+            self._mgr_award_xp(mgr, 5)
+            break  # one new client per trigger
+
+    def _mgr_campaign_handler(self, mgr: "HiredManager") -> None:
+        """Runs market influence campaigns periodically."""
+        cfg  = mgr.config
+        eff  = mgr.efficiency
+        freq = cfg.get("campaign_frequency_days", 14)
+        if self._absolute_day() % freq != 0:
+            return
+        if LicenseType.MERCHANT not in self.licenses:
+            return
+        # Skip if the last campaign lost money and the toggle is on
+        if cfg.get("skip_if_last_loss", False):
+            if mgr.stats.get("last_campaign_net", 1.0) < 0:
+                self._mgr_log(mgr, "Skipping campaign — last run was a loss")
+                return
+        pref_area_name = cfg.get("preferred_area", "CITY")
+        try:
+            target_area = Area[pref_area_name]
+        except KeyError:
+            target_area = self.current_area
+        mkt          = self.markets[target_area]
+        items        = list(mkt.pressure.items())
+        if not items:
+            return
+        items_scored = sorted(items, key=lambda x: x[1], reverse=True)
+        if not items_scored:
+            return
+        # Intelligence-based item selection:
+        # L1 picks randomly from the top half of items (limited market reading).
+        # L3+ narrows to the top quartile; L5 always picks the single best target.
+        visible_count = max(1, round(len(items_scored) * (1.0 - eff * 0.85)))
+        top_item = random.choice(items_scored[:visible_count])[0]
+        base_campaign_cost = 20.0
+        effective_cost     = round(base_campaign_cost * (1 + eff * 0.5), 2)
+        max_cost           = cfg.get("max_campaign_cost", 50.0)
+        if effective_cost > max_cost:
+            self._mgr_log(mgr, f"Campaign cost {effective_cost:.0f}g would exceed "
+                               f"limit {max_cost:.0f}g — skipping")
+            return
+        if self.inventory.gold < effective_cost:
+            return
+        base_yield           = effective_cost * (0.8 + eff * 0.6)
+        actual_yield         = round(base_yield * random.uniform(0.8, 1.2), 2)
+        net                  = actual_yield - effective_cost
+        self.inventory.gold += net
+        self._track_stat("campaigns_run")
+        mgr.stats["total_actions"] += 1
+        mgr.stats["last_campaign_net"] = net
+        mgr.stats["total_gold_generated"] += max(0.0, net)
+        if net > self.ach_stats.get("max_campaign_gold", 0.0):
+            self.ach_stats["max_campaign_gold"] = net
+        self._mgr_log(mgr, f"Ran campaign for {top_item} in {target_area.value}: "
+                           f"spent {effective_cost:.0f}g, earned {actual_yield:.0f}g "
+                           f"(net {net:+.0f}g)")
+        self._mgr_award_xp(mgr, 5)
+        self._check_achievements()
+
+    def _mgr_smuggling_handler(self, mgr: "HiredManager") -> None:
+        """Manages contraband operations; obeys max_heat and risk limits."""
+        cfg  = mgr.config
+        eff  = mgr.efficiency
+        freq = cfg.get("ops_frequency_days", 7)
+        if self._absolute_day() % freq != 0:
+            return
+        max_heat = cfg.get("max_heat", 60)
+        if self.heat >= max_heat:
+            return
+        # ── Heat cooldown after a bust ────────────────────────────────────
+        if cfg.get("heat_pause_after_bust", True):
+            last_bust = mgr.stats.get("last_bust_day", -999)
+            if mgr.days_employed - last_bust < 3:
+                self._mgr_log(mgr, "Pausing ops — too soon after last bust")
+                return
+        # Find contraband items available at current area market
+        mkt        = self.markets[self.current_area]
+        contraband = [k for k, item in ALL_ITEMS.items()
+                      if item.illegal and mkt.stock.get(k, 0) >= 5]
+        if not contraband:
+            return
+        item_key = random.choice(contraband)
+        item     = ALL_ITEMS[item_key]
+        qty      = max(1, int(5 + eff * 15))
+        cost     = round(item.base_price * mkt.pressure.get(item_key, 1.0) * qty * 0.7, 2)
+        if self.inventory.gold < cost:
+            return
+        # ── Pre-op risk / profit checks ───────────────────────────────────
+        bust_chance  = max(0.03, 0.25 - eff * 0.22)
+        max_risk     = cfg.get("max_bust_risk", 0.25)
+        if bust_chance > max_risk:
+            self._mgr_log(mgr, f"Bust risk {bust_chance:.0%} > limit {max_risk:.0%} — standing down")
+            return
+        premium      = 1.4 + eff * 0.4
+        expected_net = round(item.base_price * qty * premium - cost, 2)
+        min_profit   = cfg.get("min_net_profit", 0.0)
+        if expected_net < min_profit:
+            self._mgr_log(mgr, f"Expected net {expected_net:.0f}g < minimum {min_profit:.0f}g — skipping")
+            return
+        # ── Execute ───────────────────────────────────────────────────────
+        if random.random() < bust_chance:
+            fine    = round(cost * 1.5, 2)
+            penalty = min(fine, self.inventory.gold)
+            self.inventory.gold -= penalty
+            self.heat            = min(100, self.heat + 20)
+            self.reputation      = max(0, self.reputation - 5)
+            self._track_stat("smuggle_busts")
+            mgr.stats["mistakes"]       += 1
+            mgr.stats["last_bust_day"]   = mgr.days_employed
+            self._mgr_log(mgr, f"⚠ BUSTED running {qty}× {item_key}! Fine {penalty:.0f}g  Heat +20")
+            self._mgr_award_xp(mgr, 0)
+            return
+        self.inventory.gold  -= cost
+        sell_earnings         = round(item.base_price * qty * premium, 2)
+        self.inventory.gold  += sell_earnings
+        net                   = sell_earnings - cost
+        self.total_profit    += net
+        heat_gain             = max(2, int(10 - eff * 8))
+        self.heat             = min(100, self.heat + heat_gain)
+        self._track_stat("smuggle_success")
+        self._track_stat("smuggle_gold", net)
+        mgr.stats["total_actions"] += 1
+        mgr.stats["total_gold_generated"] += net
+        self._mgr_log(mgr, f"Smuggled {qty}× {item_key}: spent {cost:.0f}g "
+                           f"sold {sell_earnings:.0f}g (net +{net:.0f}g)  Heat +{heat_gain}")
+        self._mgr_award_xp(mgr, 3)
+        self._check_achievements()
 
     def _gen_loan_applicants(self, count: int = 5) -> List[Dict]:
         """Generate citizens seeking personal loans."""
@@ -5611,6 +6735,10 @@ class Game:
         if self.business_manager:
             self._manager_daily_actions()
 
+        # ── NPC hired managers daily actions ──────────────────────────────
+        if self.hired_managers:
+            self._run_hired_managers()
+
         # ── Citizen loan weekly payments (every 7 days) ───────────────────
         if self.day % 7 == 0:
             for cl in self.citizen_loans[:]:
@@ -5884,6 +7012,22 @@ class Game:
             ],
             "next_property_id": self.next_property_id,
             "next_plot_id": self.next_plot_id,
+            # ── NPC Managers ─────────────────────────────────────────────────────────────
+            "hired_managers": [
+                {
+                    "manager_type":  m.manager_type,
+                    "name":          m.name,
+                    "level":         m.level,
+                    "xp":            m.xp,
+                    "days_employed": m.days_employed,
+                    "weekly_wage":   m.weekly_wage,
+                    "is_active":     m.is_active,
+                    "config":        m.config,
+                    "stats":         m.stats,
+                }
+                for m in self.hired_managers
+            ],
+            "manager_action_log": list(self._manager_action_log),
             # ── Activity logs (saved so they survive a reload) ────────────────────────────
             "news_feed":  [list(entry) for entry in self.news_feed],
             "event_log":  list(self.event_log),
@@ -6104,6 +7248,39 @@ class Game:
                     pass
             self.next_property_id = data.get("next_property_id", 1)
             self.next_plot_id     = data.get("next_plot_id",     1)
+
+            # ── NPC Managers (backward-compatible) ──────────────────────────────────────────
+            self.hired_managers = []
+            for md in data.get("hired_managers", []):
+                try:
+                    default_stats = {
+                        "total_actions": 0, "total_gold_generated": 0.0,
+                        "total_wages_paid": 0.0, "total_gold_cost": 0.0,
+                        "mistakes": 0, "level_ups": 0,
+                        "last_action_day": 0, "last_action_desc": "",
+                        # Trade Steward travel/tracking state (ignored by other types)
+                        "mgr_area": None, "travel_dest": None,
+                        "travel_days_left": 0,
+                        "cost_basis": {}, "hold_since_day": {},
+                    }
+                    saved_stats = md.get("stats", {})
+                    merged_stats = {**default_stats, **saved_stats}
+                    mgr = HiredManager(
+                        manager_type  = md["manager_type"],
+                        name          = md["name"],
+                        level         = md.get("level", 1),
+                        xp            = md.get("xp", 0),
+                        days_employed = md.get("days_employed", 0),
+                        weekly_wage   = md.get("weekly_wage", 25.0),
+                        is_active     = md.get("is_active", True),
+                        config        = md.get("config", {}),
+                        stats         = merged_stats,
+                    )
+                    self.hired_managers.append(mgr)
+                except Exception:
+                    pass
+            for entry in reversed(data.get("manager_action_log", [])):
+                self._manager_action_log.appendleft(str(entry))
 
             # ── Restore activity logs ───────────────────────────────────────────────────────
             for entry in reversed(data.get("news_feed", [])):
@@ -6987,4 +8164,3 @@ class Game:
 if __name__ == "__main__":
     game = Game()
     game.play()
-

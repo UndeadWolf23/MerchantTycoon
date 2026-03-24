@@ -33,6 +33,7 @@ import tkinter as tk
 from tkinter import ttk
 import sys
 import os
+import random
 from typing import Dict, List, Optional, Tuple
 
 # ── Import game model ─────────────────────────────────────────────────────────
@@ -49,6 +50,8 @@ from merchant_tycoon import (
     _PROP_NAMES, condition_label, DEFAULT_HOTKEYS,
     Item, LoanRecord, CDRecord, make_business, Contract,
     CitizenLoan, FundClient, StockHolding, Property, LandPlot,
+    ManagerType, HiredManager, MANAGER_DEFS, MANAGER_XP_THRESHOLDS,
+    MANAGER_EFFICIENCY, _MANAGER_DEFAULT_CONFIGS,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -278,7 +281,7 @@ def apply_dark_theme(style: ttk.Style) -> None:
         background=T["bg_panel"],
         fieldbackground=T["bg_panel"],
         foreground=T["fg"],
-        rowheight=26,
+        rowheight=max(20, round(26 * _UI_SCALE)),
         font=FONT_MONO_S,
         bordercolor=T["border"],
         relief="flat",
@@ -289,6 +292,7 @@ def apply_dark_theme(style: ttk.Style) -> None:
         font=FONT_FANTASY_BOLD,
         relief="flat",
         bordercolor=T["border"],
+        padding=(5, 3, 4, 3),   # left-pad matches the ~5px cell interior indent
     )
     style.map("MT.Treeview",
         background=[("selected", T["bg_hover"])],
@@ -709,8 +713,11 @@ class DataTable(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
 
         for key, heading, width in columns:
-            self.tree.heading(key, text=heading)
-            self.tree.column(key, width=width, minwidth=40, anchor="w")
+            scaled_w = max(40, round(width * _UI_SCALE))
+            self.tree.heading(key, text=heading, anchor="w")
+            self.tree.column(key, width=scaled_w,
+                             minwidth=max(30, round(40 * _UI_SCALE)),
+                             anchor="w", stretch=True)
 
         # Built-in colour tags
         self.tree.tag_configure("green",  foreground=T["green"])
@@ -755,6 +762,10 @@ class DataTable(ttk.Frame):
 
     def bind_double(self, callback) -> None:
         self.tree.bind("<Double-1>", lambda _: callback(self.selected()))
+
+    def bind_right_click(self, callback) -> None:
+        """Bind right-click (Button-3) to callback(selected_row)."""
+        self.tree.bind("<Button-3>", lambda _e: callback(self.selected()))
 
     def bind_select(self, callback) -> None:
         self.tree.bind("<<TreeviewSelect>>", lambda _: callback(self.selected()))
@@ -1127,6 +1138,965 @@ class InfoDialog(_BaseDialog):
     def _ok(self) -> None:
         self.result = True
         self.destroy()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNATURE DIALOG  —  parchment signing popup for binding agreements
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SignatureDialog(tk.Toplevel):
+    """
+    Fancy parchment-style signing window shown before the player enters any
+    binding agreement (license, loan, contract, fund client, real estate).
+
+    Drawing a signature is entirely optional — only clicking 'Sign & Accept'
+    is required. A quill.png cursor tracks the mouse over the ink canvas.
+    """
+
+    # ── Quill tip offset (bottom-left of quill image relative to cursor) ─────
+    # Adjust these two class variables to fine-tune the quill tip position.
+    _QUILL_TIP_OX: int = 2    # positive = nudge quill image rightward
+    _QUILL_TIP_OY: int = -2   # positive = nudge quill image downward
+
+    # ── Parchment palette ────────────────────────────────────────────────────
+    _P_BG    = "#f0e4be"   # aged vellum
+    _P_DARK  = "#c8a86a"   # inner border / shadow tones
+    _P_INK   = "#180e00"   # primary quill-ink text
+    _P_DIM   = "#5a3e14"   # captions / italic secondaries
+    _P_SIGN  = "#e6d49e"   # signature canvas fill
+    _P_BORD  = "#8b6914"   # outer brass-gold border
+    _P_SEAL  = "#881414"   # wax seal red
+
+    # ── Document templates ────────────────────────────────────────────────────
+    _DOCS: Dict[str, Dict] = {
+        "license": {
+            "title": "LETTERS PATENT",
+            "sub":   "Official Grant of Trade License",
+            "body": (
+                "BE IT KNOWN UNTO ALL PERSONS that the undersigned Merchant, having\n"
+                "demonstrated sufficient gold, a passable reputation, and a pulse,\n"
+                "is hereby GRANTED the license described herein, subject to Guild\n"
+                "inspection and any levies the tax collector invents on the way over.\n\n"
+                "The holder is authorised to conduct commerce freely, provided it does\n"
+                "not embarrass the Guild, alarm the Crown, or spill anything permanent.\n\n"
+                "The Guild assumes no liability for bandits, bad harvests, or any acts\n"
+                "of Gods — major, minor, or inexplicably petty."
+            ),
+            "seal": "GUILD\nSEAL",
+        },
+        "loan": {
+            "title": "PROMISSORY NOTE",
+            "sub":   "Deed of Financial Obligation",
+            "body": (
+                "I, the undersigned Borrower, acknowledge receipt of the sum of {detail}\n"
+                "from the Merchant's Bank of the Realm — hereafter 'the Bank', or more\n"
+                "colloquially, 'Those Remarkably Patient Gentlemen'.\n\n"
+                "I solemnly promise repayment in the agreed installments without exception,\n"
+                "excuses, or creative arithmetic. Should repayment lapse, the Bank reserves\n"
+                "the right to dispatch a polite reminder — followed, if needed, by a\n"
+                "considerably less polite individual.\n\n"
+                "The Borrower accepts that spending this sum on rare birds or 'sure things'\n"
+                "at the docks is done entirely at their own considerable peril."
+            ),
+            "seal": "BANK\nSEAL",
+        },
+        "contract": {
+            "title": "CONTRACT OF DELIVERY",
+            "sub":   "Binding Commercial Agreement",
+            "body": (
+                "THIS AGREEMENT is entered into between the Contracting Party (hereafter\n"
+                "'the Client', 'the One Who Really Needs This') and the undersigned\n"
+                "Merchant (hereafter 'the Carrier', 'the One Doing All the Work').\n\n"
+                "The Carrier agrees to deliver {detail} to the named destination within the\n"
+                "stated deadline. Failure shall incur the noted penalty — payable promptly\n"
+                "and with an expression of sincere and genuine remorse.\n\n"
+                "The Client warrants the goods are legal, or at least legal enough for\n"
+                "this document. The Carrier opts to ask no further questions whatsoever."
+            ),
+            "seal": "TRADE\nSEAL",
+        },
+        "fund_client": {
+            "title": "INVESTMENT MANDATE",
+            "sub":   "Fund Management Agreement",
+            "body": (
+                "The undersigned Client ({detail}) hereby entrusts capital to the Fund\n"
+                "Manager, who shall invest said capital with Skill, Diligence, and the\n"
+                "occasional burst of optimism that markets seem to require.\n\n"
+                "The Manager promises to return principal plus the agreed yield at\n"
+                "maturity. Should markets conspire against all rational expectation —\n"
+                "which they will — the Manager agrees to look appropriately apologetic.\n\n"
+                "Management fees are collected automatically. The Client acknowledges\n"
+                "that 'guaranteed returns' appears nowhere in this document on purpose."
+            ),
+            "seal": "FUND\nSEAL",
+        },
+        "real_estate": {
+            "title": "DEED OF CONVEYANCE",
+            "sub":   "Transfer of Property Title",
+            "body": (
+                "THIS DEED records that for the consideration of {detail}, the Seller\n"
+                "hereby conveys and forever warrants to the Buyer full title to the\n"
+                "property described herein, walls, roof, and all that is attached.\n\n"
+                "The Buyer takes possession in the property's current condition. Any\n"
+                "hidden defects, subsidence, neighbourly disputes, or unaccounted-for\n"
+                "smells are accepted by the Buyer upon signing.\n\n"
+                "This Deed is attested by a Notary of the Realm, who was sober at the\n"
+                "time of signing — or very close to it, which is nearly the same thing."
+            ),
+            "seal": "DEED\nSEAL",
+        },
+        "land": {
+            "title": "LAND GRANT",
+            "sub":   "Title to Land and Soil",
+            "body": (
+                "LET THESE PRESENTS confirm that the Purchaser has acquired the parcel\n"
+                "of land described as {detail} — consisting of earth, stone, and whatever\n"
+                "the previous occupant chose to leave behind.\n\n"
+                "The Buyer receives full rights to build upon, excavate within, and\n"
+                "impose their commercial vision upon the described plot. Prior tenants\n"
+                "— badgers, hermits, wandering musicians — must vacate in fourteen days.\n\n"
+                "The Crown retains rights to anything shiny found below four feet. The\n"
+                "Guild will identify a tax on anything the Crown subsequently overlooks."
+            ),
+            "seal": "CROWN\nSEAL",
+        },
+    }
+
+    def __init__(self, parent: tk.Widget, doc_type: str,
+                 context: Optional[Dict] = None) -> None:
+        super().__init__(parent)
+        self._result    = False
+        self._draw_last = None
+        self._quill_img = None
+        self._quill_id  = None
+        self._drag_ox   = 0
+        self._drag_oy   = 0
+
+        ctx = context or {}
+        doc = self._DOCS.get(doc_type, self._DOCS["license"])
+        body = doc["body"].replace("{detail}", ctx.get("detail", "the agreement herein"))
+
+        # ── Window geometry ────────────────────────────────────────────────
+        W, H = 542, 644
+        self.overrideredirect(True)
+        rx = max(0, parent.winfo_rootx() + (parent.winfo_width()  - W) // 2)
+        ry = max(0, parent.winfo_rooty() + (parent.winfo_height() - H) // 2)
+        self.geometry(f"{W}x{H}+{rx}+{ry}")
+        self.lift()
+        self.grab_set()
+
+        # Shadow window
+        self._shadow = tk.Toplevel(parent)
+        self._shadow.overrideredirect(True)
+        self._shadow.geometry(f"{W}x{H}+{rx+6}+{ry+6}")
+        self._shadow.config(bg="#040201")
+        self._shadow.lower(self)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        # ── Outer brass border → double inner border → parchment field ────
+        outer = tk.Frame(self, bg=self._P_BORD)
+        outer.pack(fill="both", expand=True)
+        mid = tk.Frame(outer, bg=self._P_BG)
+        mid.pack(fill="both", expand=True, padx=3, pady=3)
+        inner_bord = tk.Frame(mid, bg=self._P_DARK)
+        inner_bord.pack(fill="both", expand=True)
+        inner = tk.Frame(inner_bord, bg=self._P_BG)
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Drag callbacks (title bar area only)
+        def _ds(e):
+            self._drag_ox = e.x_root - self.winfo_x()
+            self._drag_oy = e.y_root - self.winfo_y()
+        def _dm(e):
+            x = e.x_root - self._drag_ox
+            y = e.y_root - self._drag_oy
+            self.geometry(f"+{x}+{y}")
+            self._shadow.geometry(f"{W}x{H}+{x+6}+{y+6}")
+
+        # Corner ornament helper
+        def _corner_lbl(fr, side, anch):
+            tk.Label(fr, text="✦", bg=self._P_BG, fg=self._P_BORD,
+                     font=("Palatino Linotype", 12)).pack(
+                         side=side, anchor=anch, padx=4)
+
+        # ── Top ornament row (draggable) ────────────────────────────────
+        tr = tk.Frame(inner, bg=self._P_BG)
+        tr.pack(fill="x", pady=(4, 0))
+        for w in (tr,): w.bind("<ButtonPress-1>", _ds); w.bind("<B1-Motion>", _dm)
+        _corner_lbl(tr, "left", "n")
+        tk.Frame(tr, bg=self._P_BORD, height=2).pack(
+            fill="x", expand=True, side="left", padx=4, pady=8)
+        _corner_lbl(tr, "right", "n")
+
+        # ── Title block ─────────────────────────────────────────────────
+        hdr = tk.Frame(inner, bg=self._P_BG)
+        hdr.pack(fill="x", padx=18)
+        for w in (hdr,): w.bind("<ButtonPress-1>", _ds); w.bind("<B1-Motion>", _dm)
+        tk.Label(hdr, text=doc["title"], bg=self._P_BG, fg=self._P_INK,
+                 font=("Palatino Linotype", 18, "bold")).pack()
+        tk.Label(hdr, text=doc["sub"], bg=self._P_BG, fg=self._P_DIM,
+                 font=("Palatino Linotype", 11, "italic")).pack()
+
+        # Triple-rule divider
+        for thick, col in ((1, self._P_BORD), (2, self._P_BG), (1, self._P_DARK)):
+            tk.Frame(inner, bg=col, height=thick).pack(fill="x", padx=14, pady=0)
+
+        # Flavour date (right-aligned)
+        tk.Label(inner,
+                 text="Dated this Day of Commerce  ·  Realm Year 12  A.R.",
+                 bg=self._P_BG, fg=self._P_DIM,
+                 font=("Palatino Linotype", 9, "italic"),
+                 ).pack(anchor="e", padx=20, pady=(4, 2))
+
+        # ── Body text + wax seal ────────────────────────────────────────
+        body_row = tk.Frame(inner, bg=self._P_BG)
+        body_row.pack(fill="both", expand=True, padx=16, pady=(0, 2))
+
+        body_txt = tk.Text(
+            body_row, wrap="word",
+            font=("Palatino Linotype", 10),
+            bg=self._P_BG, fg=self._P_INK,
+            relief="flat", bd=0, padx=2, pady=4,
+            cursor="arrow", state="normal", height=10,
+        )
+        body_txt.insert("1.0", body)
+        body_txt.config(state="disabled")
+        body_txt.pack(side="left", fill="both", expand=True)
+
+        # Wax seal (drawn on a tiny canvas)
+        sc = tk.Canvas(body_row, width=72, height=72,
+                       bg=self._P_BG, highlightthickness=0)
+        sc.pack(side="right", anchor="s", padx=(6, 0), pady=(0, 6))
+        sc.create_oval(2, 2, 70, 70, fill=self._P_SEAL, outline="#5a0808", width=2)
+        sc.create_oval(8, 8, 64, 64, fill="", outline="#c07060", width=1)
+        sc.create_text(36, 35, text=doc["seal"], fill="#f0c0b0",
+                       font=("Palatino Linotype", 8, "bold"), justify="center")
+
+        # Thin rule above signature area
+        tk.Frame(inner, bg=self._P_DARK, height=1).pack(fill="x", padx=8)
+
+        # ── "Sign here" label ────────────────────────────────────────────
+        sh = tk.Frame(inner, bg=self._P_BG)
+        sh.pack(fill="x", padx=16, pady=(4, 0))
+        tk.Label(sh, text="✒  Sign below:",
+                 bg=self._P_BG, fg=self._P_DIM,
+                 font=("Palatino Linotype", 9, "italic")).pack(side="left")
+        tk.Label(sh, text="(draw your mark, or simply click Sign & Accept)",
+                 bg=self._P_BG, fg=self._P_DIM,
+                 font=("Palatino Linotype", 8, "italic")).pack(side="left", padx=6)
+
+        # ── Ink / signature canvas ────────────────────────────────────────
+        self._sign_canvas = tk.Canvas(
+            inner, bg=self._P_SIGN, height=82,
+            cursor="crosshair",
+            highlightthickness=1, highlightbackground=self._P_BORD,
+        )
+        self._sign_canvas.pack(fill="x", padx=16, pady=(2, 0))
+        # X marker, dashed sign line, caption
+        _CW = 510
+        self._sign_canvas.create_text(
+            14, 41, text="✗", fill=self._P_DIM,
+            font=("Palatino Linotype", 14, "bold"), anchor="w")
+        self._sign_canvas.create_line(
+            30, 64, _CW, 64, fill=self._P_DARK, width=1, dash=(4, 2))
+        self._sign_canvas.create_text(
+            30, 73, text="Signature of Merchant",
+            fill=self._P_DIM, font=("Palatino Linotype", 7, "italic"), anchor="w")
+
+        # Load quill image (graceful fallback if not found)
+        _quill_path = os.path.join(_HERE, "quill.png")
+        if os.path.isfile(_quill_path):
+            try:
+                _raw = tk.PhotoImage(file=_quill_path)
+                _w, _h = _raw.width(), _raw.height()
+                _factor = 1
+                while _w // _factor > 80 or _h // _factor > 80:
+                    _factor *= 2
+                self._quill_img = _raw.subsample(_factor, _factor) if _factor > 1 else _raw
+                self._quill_id = self._sign_canvas.create_image(
+                    -200, -200, image=self._quill_img, anchor="sw", state="hidden")
+            except Exception:
+                self._quill_img = None
+
+        self._sign_canvas.bind("<Enter>",         self._cv_enter)
+        self._sign_canvas.bind("<Leave>",         self._cv_leave)
+        self._sign_canvas.bind("<Motion>",        self._cv_motion)
+        self._sign_canvas.bind("<ButtonPress-1>", self._cv_press)
+        self._sign_canvas.bind("<B1-Motion>",     self._cv_drag)
+
+        # ── Bottom corner ornaments ────────────────────────────────────
+        br = tk.Frame(inner, bg=self._P_BG)
+        br.pack(fill="x", pady=(4, 2))
+        _corner_lbl(br, "left", "s")
+        tk.Frame(br, bg=self._P_BORD, height=2).pack(
+            fill="x", expand=True, side="left", padx=4, pady=8)
+        _corner_lbl(br, "right", "s")
+
+        # ── Action buttons ────────────────────────────────────────────────
+        btn_row = tk.Frame(inner, bg=self._P_BG)
+        btn_row.pack(fill="x", padx=20, pady=(0, 10))
+        tk.Button(
+            btn_row, text="  ✒  Sign & Accept  ",
+            bg="#2e5a1a", fg="#f5e8c8",
+            activebackground="#3d7022", activeforeground="#ffffff",
+            font=("Palatino Linotype", 11, "bold"),
+            relief="flat", padx=10, pady=5,
+            command=self._accept, cursor="hand2",
+        ).pack(side="left", padx=(0, 12))
+        tk.Button(
+            btn_row, text="  Decline  ",
+            bg="#5a1a1a", fg="#f5e8c8",
+            activebackground="#7a2020", activeforeground="#ffffff",
+            font=("Palatino Linotype", 10),
+            relief="flat", padx=8, pady=5,
+            command=self._cancel, cursor="hand2",
+        ).pack(side="left")
+
+    # ── Quill cursor & ink drawing ───────────────────────────────────────────
+
+    def _cv_enter(self, event) -> None:
+        if self._quill_id:
+            self._sign_canvas.config(cursor="none")
+            self._sign_canvas.itemconfig(self._quill_id, state="normal")
+
+    def _cv_leave(self, event) -> None:
+        if self._quill_id:
+            self._sign_canvas.config(cursor="crosshair")
+            self._sign_canvas.itemconfig(self._quill_id, state="hidden")
+
+    def _cv_motion(self, event) -> None:
+        self._draw_last = (event.x, event.y)
+        if self._quill_id:
+            self._sign_canvas.coords(
+                self._quill_id,
+                event.x + self._QUILL_TIP_OX,
+                event.y + self._QUILL_TIP_OY,
+            )
+            self._sign_canvas.tag_raise(self._quill_id)
+
+    def _cv_press(self, event) -> None:
+        self._draw_last = (event.x, event.y)
+        if self._quill_id:
+            self._sign_canvas.coords(
+                self._quill_id,
+                event.x + self._QUILL_TIP_OX,
+                event.y + self._QUILL_TIP_OY,
+            )
+
+    def _cv_drag(self, event) -> None:
+        if self._draw_last:
+            self._sign_canvas.create_line(
+                self._draw_last[0], self._draw_last[1],
+                event.x, event.y,
+                fill="#1a1060", width=2, capstyle=tk.ROUND, smooth=True,
+            )
+        self._draw_last = (event.x, event.y)
+        if self._quill_id:
+            self._sign_canvas.coords(
+                self._quill_id,
+                event.x + self._QUILL_TIP_OX,
+                event.y + self._QUILL_TIP_OY,
+            )
+            self._sign_canvas.tag_raise(self._quill_id)
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def _accept(self) -> None:
+        self._result = True
+        self._cleanup()
+
+    def _cancel(self) -> None:
+        self._result = False
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        try:
+            self._shadow.destroy()
+        except Exception:
+            pass
+        self.destroy()
+
+    def wait(self) -> bool:
+        """Block until the player signs or declines. Returns True if signed."""
+        self.wait_window()
+        return self._result
+
+
+def _maybe_sign(screen: "Screen", doc_type: str, detail: str = "") -> bool:
+    """
+    Show the SignatureDialog if the player has signatures enabled.
+    Returns True to continue with the action, False to cancel it.
+    Called immediately before any binding commitment is made.
+    """
+    if not screen.game.settings.enable_signatures:
+        return True
+    return SignatureDialog(screen, doc_type, {"detail": detail}).wait()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MYSTERY COFFER DIALOG  —  CS:GO-style spinning loot reel (200g per spin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MysteriousCofferDialog(tk.Toplevel):
+    """
+    Borderless loot-coffer popup with an animated CS:GO-style spinning reel.
+    Call open_and_wait() to display it; prizes are applied immediately on land.
+    """
+
+    W, H = 690, 660
+
+    # Rarity visual definitions
+    _RARITY: Dict[str, Dict] = {
+        "C":         {"bg": "#404040", "border": "#777777", "glow": None,      "label": "Common",             "sfg": "#cccccc"},
+        "UC":        {"bg": "#0e3812", "border": "#28c434", "glow": None,      "label": "Uncommon",           "sfg": "#28c434"},
+        "R":         {"bg": "#0a1a5e", "border": "#3068ff", "glow": None,      "label": "Rare",               "sfg": "#5a90ff"},
+        "UR":        {"bg": "#2c0858", "border": "#9e28f0", "glow": None,      "label": "Ultra Rare",         "sfg": "#c060ff"},
+        "SR":        {"bg": "#5c0042", "border": "#ff14a0", "glow": None,      "label": "Super Rare",         "sfg": "#ff60c0"},
+        "SSR":       {"bg": "#003050", "border": "#00c8ff", "glow": None,      "label": "Super Super Rare",   "sfg": "#00c8ff"},
+        "SSS":       {"bg": "#4e0000", "border": "#ff1a1a", "glow": "#ff1a1a", "label": "Triple Super Rare",  "sfg": "#ff8080"},
+        "LEGENDARY": {"bg": "#473500", "border": "#ffd700", "glow": "#ffd700", "label": "LEGENDARY",          "sfg": "#ffd700"},
+    }
+
+    # Full probability table (sums to 1.0)
+    _PROBS_FULL: List[Tuple[str, float]] = [
+        ("C",   .514), ("UC",  .220), ("R",   .120), ("UR",  .065),
+        ("SR",  .040), ("SSR", .025), ("SSS", .015), ("LEGENDARY", .001),
+    ]
+
+
+    # Reel geometry
+    BOX  = 88     # box side length
+    GAP  = 8      # gap between boxes
+    STEP = 96     # BOX + GAP
+    CW   = 580    # canvas width
+    CH   = 118    # canvas height
+    N    = 26     # total boxes in strip
+    WIN  = 20     # winning box index (center lands here)
+    PTR  = 290    # pointer x (CW // 2)
+
+    # Animation
+    FRAME_MS = 16
+    N_FRAMES = 240
+
+    def __init__(self, parent: tk.Widget, game, mercy: int, free_spins: int = 0):
+        super().__init__(parent)
+        self._game       = game
+        self._mercy      = mercy
+        self._free_spins = free_spins
+        self._spinning      = False
+        self._after_id      = None
+        self._winner        = ""
+        self._ox            = float(self.CW)
+        self._fast_spin_var = tk.BooleanVar(value=False)
+
+        self.overrideredirect(True)
+        self.resizable(False, False)
+        self.configure(bg="#000000")
+
+        # Drop-shadow window
+        self._shadow = tk.Toplevel(self)
+        self._shadow.overrideredirect(True)
+        self._shadow.configure(bg="#000000")
+        self._shadow.attributes("-alpha", 0.50)
+        self._shadow.lower(self)
+
+        self.update_idletasks()
+        root = parent.winfo_toplevel()
+        rx = root.winfo_rootx()
+        ry = root.winfo_rooty()
+        pw = root.winfo_width()
+        ph = root.winfo_height()
+        sx = rx + (pw - self.W) // 2
+        sy = ry + (ph - self.H) // 2
+        self.geometry(f"{self.W}x{self.H}+{sx}+{sy}")
+        self._shadow.geometry(f"{self.W + 10}x{self.H + 10}+{sx - 5}+{sy - 5}")
+        self._shadow.lower(self)
+        self.lift()
+
+        self._build_ui()
+        self._start_roll()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        # Outer brass border frame
+        bord  = tk.Frame(self, bg="#8b6914", padx=3, pady=3)
+        bord.pack(fill="both", expand=True)
+        inner = tk.Frame(bord, bg="#09070400".replace("00", ""))
+        inner.configure(bg="#09070e")
+        inner.pack(fill="both", expand=True)
+
+        # Title / drag bar
+        tbar = tk.Frame(inner, bg="#130e06", height=38)
+        tbar.pack(fill="x")
+        tbar.pack_propagate(False)
+        tk.Label(tbar, text="✦  Mystery Coffer  ✦",
+                 bg="#130e06", fg="#ffd700",
+                 font=("Palatino Linotype", 14, "bold")).pack(side="left", padx=14, pady=8)
+        tk.Button(tbar, text="✕", bg="#130e06", fg="#888888",
+                  bd=0, relief="flat",
+                  activebackground="#2a1a0a", activeforeground="#ffffff",
+                  font=("Consolas", 12),
+                  command=self._on_close).pack(side="right", padx=10)
+        tbar.bind("<ButtonPress-1>", self._drag_start)
+        tbar.bind("<B1-Motion>",     self._drag_move)
+        for child in tbar.winfo_children():
+            child.bind("<ButtonPress-1>", self._drag_start)
+            child.bind("<B1-Motion>",     self._drag_move)
+
+        tk.Frame(inner, bg="#8b6914", height=1).pack(fill="x")
+
+        body = tk.Frame(inner, bg="#09070e")
+        body.pack(fill="both", expand=True, padx=14, pady=8)
+
+        # Coffer image
+        img_frame = tk.Frame(body, bg="#09070e")
+        img_frame.pack()
+        self._coffer_ph = None
+        cpath = os.path.join(_HERE, "LootCoffer.png")
+        if os.path.isfile(cpath):
+            try:
+                raw = tk.PhotoImage(file=cpath)
+                w, h = raw.width(), raw.height()
+                sx_s = max(1, w // 200)
+                sy_s = max(1, h // 170)
+                s    = max(sx_s, sy_s)
+                self._coffer_ph = raw.subsample(s, s)
+                tk.Label(img_frame, image=self._coffer_ph,
+                         bg="#09070e", bd=0).pack()
+            except Exception:
+                self._coffer_ph = None
+        if not self._coffer_ph:
+            tk.Label(img_frame, text="🎁",
+                     font=("Palatino Linotype", 52),
+                     bg="#09070e", fg="#ffd700").pack()
+
+        # Reel band
+        reel_wrap = tk.Frame(body, bg="#6b4a22", padx=2, pady=2)
+        reel_wrap.pack(fill="x", pady=(6, 0))
+        tk.Frame(reel_wrap, bg="#181008", height=7).pack(fill="x")
+        self._reel = tk.Canvas(reel_wrap,
+                               width=self.CW, height=self.CH,
+                               bg="#0c0c06", highlightthickness=0)
+        self._reel.pack()
+        tk.Frame(reel_wrap, bg="#181008", height=7).pack(fill="x")
+
+        # Pointer canvas — triangle pointing up at the centre
+        ptr_cv = tk.Canvas(body, width=self.CW, height=20,
+                           bg="#09070e", highlightthickness=0)
+        ptr_cv.pack()
+        px = self.PTR
+        ptr_cv.create_polygon(px - 11, 20, px + 11, 20, px, 4,
+                               fill="#ffd700", outline="#ffffff", width=1)
+        ptr_cv.create_line(0, 1, px - 13, 1, fill="#6b4a22", width=2)
+        ptr_cv.create_line(px + 13, 1, self.CW, 1, fill="#6b4a22", width=2)
+
+        # Status labels
+        self._lbl_spin = tk.Label(body, text="Opening the coffer…",
+                                  font=("Palatino Linotype", 10),
+                                  bg="#09070e", fg="#b09050",
+                                  wraplength=560, justify="center")
+        self._lbl_spin.pack(pady=(7, 0))
+
+        self._lbl_rarity = tk.Label(body, text="",
+                                    font=("Palatino Linotype", 17, "bold"),
+                                    bg="#09070e", fg="#ffffff")
+        self._lbl_rarity.pack()
+
+        self._lbl_prize = tk.Label(body, text="",
+                                   font=("Palatino Linotype", 11),
+                                   bg="#09070e", fg="#f0e4be",
+                                   wraplength=550, justify="center")
+        self._lbl_prize.pack()
+
+        # Mercy bar
+        mercy_row = tk.Frame(body, bg="#09070e")
+        mercy_row.pack(fill="x", pady=(4, 0))
+        tk.Label(mercy_row, text="Mercy:", bg="#09070e",
+                 fg="#5a4020", font=("Palatino Linotype", 8)).pack(side="left", padx=(2, 4))
+        self._mercy_bar = tk.Frame(mercy_row, bg="#09070e")
+        self._mercy_bar.pack(side="left")
+        self._free_lbl = tk.Label(mercy_row, text="",
+                                  bg="#09070e", fg="#ffd700",
+                                  font=("Palatino Linotype", 9))
+        self._free_lbl.pack(side="right", padx=8)
+        self._redraw_mercy()
+
+        # Buttons
+        btn_row = tk.Frame(body, bg="#09070e")
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._btn_collect = ttk.Button(btn_row, text="✔  Collect & Close",
+                                       style="MT.TButton",
+                                       command=self._on_collect,
+                                       state="disabled")
+        self._btn_collect.pack(side="left", padx=(0, 6))
+        self._btn_spin = tk.Button(btn_row, text="🎲  Spin Again  (200g)",
+                                   bg=T["bg_button"], fg=T["fg"],
+                                   activebackground=T["bg_button_act"],
+                                   activeforeground=T["fg"],
+                                   relief="flat", bd=1, padx=10, pady=4,
+                                   font=FONT_FANTASY_S, cursor="hand2",
+                                   command=self._on_spin_again,
+                                   state="disabled")
+        self._btn_spin.pack(side="left")
+
+        self._btn_fast = tk.Checkbutton(
+            btn_row, text="⚡  Fast Spin",
+            variable=self._fast_spin_var,
+            bg="#09070e", fg="#b09050",
+            activebackground="#09070e", activeforeground="#ffd700",
+            selectcolor="#09070e",
+            font=FONT_FANTASY_S, cursor="hand2",
+            relief="flat", bd=0,
+        )
+        self._btn_fast.pack(side="right", padx=(6, 0))
+
+        self._dx = self._dy = 0
+
+    def _redraw_mercy(self) -> None:
+        for w in self._mercy_bar.winfo_children():
+            w.destroy()
+        for i in range(15):
+            filled = i < self._mercy
+            col = "#c8900a" if filled else "#231a09"
+            tk.Frame(self._mercy_bar, bg=col,
+                     width=14, height=10).pack(side="left", padx=1)
+
+    # ── Dragging ──────────────────────────────────────────────────────────────
+
+    def _drag_start(self, e):
+        self._dx = e.x_root - self.winfo_x()
+        self._dy = e.y_root - self.winfo_y()
+
+    def _drag_move(self, e):
+        nx = e.x_root - self._dx
+        ny = e.y_root - self._dy
+        self.geometry(f"+{nx}+{ny}")
+        self._shadow.geometry(f"+{nx - 5}+{ny - 5}")
+
+    # ── Roll logic ────────────────────────────────────────────────────────────
+
+    def _pick_rarity(self) -> str:
+        pool = self._PROBS_FULL   # same odds always; mercy roll doubles all rewards
+        r    = random.random()
+        acc  = 0.0
+        for key, p in pool:
+            acc += p
+            if r < acc:
+                return key
+        return pool[-1][0]
+
+    def _random_strip_rarity(self) -> str:
+        r   = random.random()
+        acc = 0.0
+        for key, p in self._PROBS_FULL:
+            acc += p
+            if r < acc:
+                return key
+        return "C"
+
+    def _start_roll(self) -> None:
+        if self._spinning:
+            return
+        self._spinning = True
+        self._was_mercy_roll = (self._mercy >= 15)
+        self._btn_collect.config(state="disabled")
+        self._btn_spin.config(state="disabled")
+        if self._was_mercy_roll:
+            self._lbl_spin.config(text="⭐  MERCY SPIN  —  ×2 all rewards!", fg="#ffd700")
+        else:
+            self._lbl_spin.config(text="Opening the coffer…", fg="#b09050")
+        self._lbl_rarity.config(text="")
+        self._lbl_prize.config(text="")
+
+        self._winner = self._pick_rarity()
+        self._items  = [self._random_strip_rarity() for _ in range(self.N)]
+        self._items[self.WIN] = self._winner
+
+        ox_start = float(self.CW)
+        ox_final = self.PTR - self.WIN * self.STEP - self.BOX // 2
+        total    = ox_start - ox_final
+
+        def ease(i: int) -> float:
+            t = i / self.N_FRAMES
+            return total * (1.0 - (1.0 - t) ** 4)
+
+        self._deltas    = [ease(i + 1) - ease(i) for i in range(self.N_FRAMES)]
+        self._fidx      = 0
+        self._ox        = ox_start
+        self._animate()
+
+    def _animate(self) -> None:
+        if self._fidx < self.N_FRAMES:
+            self._ox  -= self._deltas[self._fidx]
+            self._fidx += 1
+            self._draw_reel(highlight=False)
+            self._after_id = self.after(
+                self.FRAME_MS // 2 if self._fast_spin_var.get() else self.FRAME_MS,
+                self._animate)
+        else:
+            self._ox = float(self.PTR - self.WIN * self.STEP - self.BOX // 2)
+            self._draw_reel(highlight=True)
+            self._spinning = False
+            self.after(80, self._on_landed)
+
+    def _draw_reel(self, highlight: bool = False) -> None:
+        cv  = self._reel
+        cv.delete("all")
+        is_mercy = getattr(self, '_was_mercy_roll', False)
+        bg_col   = "#100c00" if is_mercy else "#0c0c06"
+        cv.create_rectangle(0, 0, self.CW, self.CH, fill=bg_col, outline="")
+        # Subtle depth gradient
+        mid_col  = "#1a1200" if is_mercy else "#101008"
+        cv.create_rectangle(0, self.CH // 4, self.CW, 3 * self.CH // 4,
+                            fill=mid_col, outline="")
+
+        ox = int(self._ox)
+        by = (self.CH - self.BOX) // 2  # vertical centre
+
+        for idx, rarity in enumerate(self._items):
+            bx = ox + idx * self.STEP
+            if bx + self.BOX < -6 or bx > self.CW + 6:
+                continue
+
+            rd       = self._RARITY[rarity]
+            is_win   = highlight and idx == self.WIN
+
+            # Shadow
+            cv.create_rectangle(bx + 5, by + 5,
+                                 bx + self.BOX + 5, by + self.BOX + 5,
+                                 fill="#000000", outline="")
+
+            # Glow rings (LEGENDARY / SSS / winning box)
+            if rd["glow"] or is_win:
+                gc = rd["glow"] or rd["border"]
+                for g_off in (12, 8, 4):
+                    cv.create_rectangle(bx - g_off, by - g_off,
+                                        bx + self.BOX + g_off,
+                                        by + self.BOX + g_off,
+                                        fill="", outline=gc, width=1)
+
+            # Winner highlight ring
+            if is_win:
+                cv.create_rectangle(bx - 4, by - 4,
+                                    bx + self.BOX + 4, by + self.BOX + 4,
+                                    fill="", outline="#ffffff", width=3)
+
+            # Box background
+            cv.create_rectangle(bx, by, bx + self.BOX, by + self.BOX,
+                                 fill=rd["bg"], outline="")
+
+            # Top-shine strip (inner lighter sliver)
+            cv.create_rectangle(bx + 3, by + 3,
+                                 bx + self.BOX - 3, by + 14,
+                                 fill=rd["border"], outline="", stipple="gray25")
+
+            # Outer border
+            bw = 3 if is_win else 2
+            cv.create_rectangle(bx, by, bx + self.BOX, by + self.BOX,
+                                 fill="", outline=rd["border"], width=bw)
+
+            # Inner thin border (inset 1px)
+            cv.create_rectangle(bx + 1, by + 1,
+                                 bx + self.BOX - 1, by + self.BOX - 1,
+                                 fill="", outline="#000000", width=1)
+
+            # "?" symbol
+            cv.create_text(bx + self.BOX // 2, by + self.BOX // 2,
+                            text="?",
+                            font=("Palatino Linotype", 30, "bold"),
+                            fill=rd["sfg"])
+
+            # ×2 mercy badge
+            if is_mercy:
+                cv.create_text(bx + self.BOX - 6, by + self.BOX - 6,
+                                text="×2",
+                                font=("Consolas", 9, "bold"),
+                                fill="#ffd700", anchor="se")
+
+        # Left & right edge vignettes (fade-to-dark)
+        for x0, x1 in ((0, 70), (self.CW - 70, self.CW)):
+            cv.create_rectangle(x0, 0, x1, self.CH,
+                                fill=bg_col, outline="", stipple="gray75")
+        for x0, x1 in ((0, 36), (self.CW - 36, self.CW)):
+            cv.create_rectangle(x0, 0, x1, self.CH,
+                                fill=bg_col, outline="", stipple="gray50")
+        for x0, x1 in ((0, 12), (self.CW - 12, self.CW)):
+            cv.create_rectangle(x0, 0, x1, self.CH,
+                                fill=bg_col, outline="")
+
+        # Centre indicator guide line
+        ptr_col = "#ff9900" if is_mercy else "#ffd700"
+        cv.create_line(self.PTR, 0, self.PTR, self.CH,
+                       fill=ptr_col, width=2, dash=(5, 4))
+
+    # ── Prize award ───────────────────────────────────────────────────────────
+
+    def _on_landed(self) -> None:
+        rd    = self._RARITY[self._winner]
+        g     = self._game
+        prize = ""
+        spins = 0
+        mult  = 2 if self._was_mercy_roll else 1
+
+        if self._winner == "C":
+            qty  = random.randint(2, 3) * mult
+            item = random.choice(["salt", "fish"])
+            g.inventory.add(item, qty)
+            prize = f"{qty}× {ALL_ITEMS[item].name}"
+        elif self._winner == "UC":
+            qty  = random.randint(2, 3) * mult
+            item = random.choice(["spice", "exotic_fruit", "glassware"])
+            g.inventory.add(item, qty)
+            prize = f"{qty}× {ALL_ITEMS[item].name}"
+        elif self._winner == "R":
+            item = random.choice(["ivory", "gem", "silk"])
+            g.inventory.add(item, 2 * mult)
+            prize = f"{2 * mult}× {ALL_ITEMS[item].name}"
+        elif self._winner == "UR":
+            if random.random() < 0.5:
+                g.inventory.add("gem", 3 * mult)
+                prize = f"{3 * mult}× Gemstone"
+            else:
+                spins = 2 * mult
+                prize = f"{2 * mult} Free Spins!"
+        elif self._winner == "SR":
+            g.inventory.gold += 500.0 * mult
+            prize = f"{500 * mult:,} Gold!"
+        elif self._winner == "SSR":
+            if random.random() < 0.5:
+                g.inventory.add("silk", 5 * mult)
+                prize = f"{5 * mult}× Silk Cloth"
+            else:
+                spins = 4 * mult
+                prize = f"{4 * mult} Free Spins!"
+        elif self._winner == "SSS":
+            g.inventory.gold += 1000.0 * mult
+            prize = f"{1000 * mult:,} Gold!"
+        elif self._winner == "LEGENDARY":
+            g.inventory.gold += 5000.0 * mult
+            g.reputation = min(100, g.reputation + 10 * mult)
+            prize = f"{5000 * mult:,} Gold  +  {10 * mult} Reputation!"
+
+        # Mercy bookkeeping — builds on Common hits; resets only when consumed
+        if self._was_mercy_roll:
+            self._mercy = 0          # mercy spin was used — reset and start fresh
+        elif self._winner == "C":
+            self._mercy = min(15, self._mercy + 1)
+        g.settings.gamble_mercy = self._mercy
+        g.settings.save()
+        self._redraw_mercy()
+
+        # Free spins
+        if spins:
+            self._free_spins += spins
+
+        self._lbl_rarity.config(text=rd["label"], fg=rd["border"])
+        self._lbl_prize.config(text=prize, fg="#f0e4be")
+        mercy_note = "⭐ MERCY SPIN  ×2" if self._was_mercy_roll else ("⭐ MERCY READY!" if self._mercy >= 15 else "")
+        self._lbl_spin.config(
+            text=(f"{mercy_note}  —  " if mercy_note else "") + "You received:",
+            fg="#ffd700" if mercy_note else "#b09050",
+        )
+
+        self._btn_collect.config(state="normal")
+        self._update_spin_btn()
+
+    # ── Button state helper ───────────────────────────────────────────────────
+
+    def _update_spin_btn(self) -> None:
+        """Style and enable/disable the spin-again button based on current state."""
+        g = self._game
+        if self._mercy >= 15:
+            # Mercy roll ready — gold glow, FREE label
+            self._btn_spin.config(
+                state="normal",
+                text="⭐  Mercy Spin  —  FREE!",
+                bg="#8a6500", fg="#ffd700",
+                activebackground="#c8a000", activeforeground="#ffffff",
+                font=("Palatino Linotype", 10, "bold"),
+                relief="ridge", bd=2,
+            )
+            self._free_lbl.config(text="⭐ Mercy spin ready!", fg="#ffd700")
+        elif self._free_spins > 0:
+            self._btn_spin.config(
+                state="normal",
+                text=f"🎲  Spin Again  ({self._free_spins} free)",
+                bg=T["bg_button"], fg=T["fg"],
+                activebackground=T["bg_button_act"], activeforeground=T["fg"],
+                font=FONT_FANTASY_S, relief="flat", bd=1,
+            )
+            self._free_lbl.config(
+                text=f"★ {self._free_spins} free spin{'s' if self._free_spins != 1 else ''}",
+                fg=T["yellow"])
+        elif g.inventory.gold >= 200:
+            self._btn_spin.config(
+                state="normal",
+                text="🎲  Spin Again  (200g)",
+                bg=T["bg_button"], fg=T["fg"],
+                activebackground=T["bg_button_act"], activeforeground=T["fg"],
+                font=FONT_FANTASY_S, relief="flat", bd=1,
+            )
+            self._free_lbl.config(text="", fg=T["yellow"])
+        else:
+            self._btn_spin.config(
+                state="disabled",
+                text="🎲  Spin Again  (200g)",
+                bg=T["bg_button"], fg=T["grey"],
+                activebackground=T["bg_button_act"], activeforeground=T["fg"],
+                font=FONT_FANTASY_S, relief="flat", bd=1,
+            )
+            self._free_lbl.config(text="", fg=T["yellow"])
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+
+    def _on_collect(self) -> None:
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.destroy()
+
+    def _on_spin_again(self) -> None:
+        if self._spinning:
+            return
+        g = self._game
+        if self._mercy >= 15:
+            pass           # mercy spin is free — no gold deducted
+        elif self._free_spins > 0:
+            self._free_spins -= 1
+        elif g.inventory.gold >= 200:
+            g.inventory.gold -= 200.0
+        else:
+            self._free_lbl.config(text="Not enough gold!", fg=T["red"])
+            return
+        self._lbl_rarity.config(text="")
+        self._lbl_prize.config(text="")
+        self._lbl_spin.config(text="Opening the coffer…", fg="#b09050")
+        self._start_roll()
+
+    def _on_close(self) -> None:
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.destroy()
+
+    # ── Wait helper ───────────────────────────────────────────────────────────
+
+    def open_and_wait(self) -> None:
+        """Block until the dialog is closed."""
+        self.grab_set()
+        self.wait_window()
+
+    def destroy(self) -> None:
+        try:
+            if self._shadow and self._shadow.winfo_exists():
+                self._shadow.destroy()
+        except Exception:
+            pass
+        try:
+            super().destroy()
+        except Exception:
+            pass
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TUTORIAL DIALOG  —  step-by-step new-player walkthrough
@@ -2571,6 +3541,8 @@ class TradeScreen(Screen):
         self._buy_table = DataTable(buy_tab, self._BUY_COLS, height=13)
         self._buy_table.pack(fill="both", expand=True, padx=6, pady=4)
         self._buy_table.bind_select(self._on_buy_select)
+        self._buy_table.bind_double(self._on_dbl_buy)
+        self._buy_table.bind_right_click(self._on_rc_haggle)
 
         buy_act = ttk.Frame(buy_tab, style="MT.TFrame")
         buy_act.pack(fill="x", padx=6, pady=(2, 4))
@@ -2591,6 +3563,7 @@ class TradeScreen(Screen):
 
         self._sell_table = DataTable(sell_tab, self._SELL_COLS, height=13)
         self._sell_table.pack(fill="both", expand=True, padx=6, pady=4)
+        self._sell_table.bind_double(self._on_dbl_sell)
 
         sell_act = ttk.Frame(sell_tab, style="MT.TFrame")
         sell_act.pack(fill="x", padx=6, pady=(2, 4))
@@ -2933,6 +3906,23 @@ class TradeScreen(Screen):
 
     # ── Sell ──────────────────────────────────────────────────────────────────
 
+    # ── Double-click / right-click shortcut handlers ──────────────────────────
+
+    def _on_dbl_buy(self, _row) -> None:
+        """Double-click buy-table row → open the buy dialog for that item."""
+        if self.game.settings.double_click_action:
+            self._do_buy()
+
+    def _on_dbl_sell(self, _row) -> None:
+        """Double-click sell-table row → open the sell dialog for that item."""
+        if self.game.settings.double_click_action:
+            self._do_sell()
+
+    def _on_rc_haggle(self, _row) -> None:
+        """Right-click buy-table row → attempt to haggle on that item."""
+        if self.game.settings.right_click_haggle:
+            self._do_haggle()
+
     def _do_sell(self) -> None:
         row = self._sell_table.selected()
         if not row:
@@ -3070,6 +4060,40 @@ class TravelScreen(Screen):
         ("desc",  "Description",  260),
     ]
 
+    # Canvas map — positions scaled to approximate travel-day distances.
+    # Tundra=far north, Desert=far east, Coast/Farmland close to City (1d each),
+    # Forest between Farmland & Swamp (1d each), Mountain near Tundra (2d).
+    _MAP_VPOS: Dict[Area, Tuple[int, int]] = {
+        Area.TUNDRA:   (700,  65),   # far north  (4d from City, 2d from Mountain)
+        Area.MOUNTAIN: (620, 195),   # northeast  (2d from City, 2d from Tundra)
+        Area.CITY:     (450, 305),   # centre hub
+        Area.COAST:    (290, 260),   # west coast (1d from City)
+        Area.FARMLAND: (375, 430),   # south of City (1d from City)
+        Area.FOREST:   (210, 415),   # west  (1d from Farmland, 1d from Swamp)
+        Area.SWAMP:    (155, 548),   # far southwest (3d from City)
+        Area.DESERT:   (850, 375),   # far east  (3d from City, 6d from Tundra)
+    }
+    _MAP_FILL: Dict[Area, str] = {
+        Area.CITY:     "#6b5fa0",
+        Area.FARMLAND: "#4d8a30",
+        Area.MOUNTAIN: "#7a7060",
+        Area.COAST:    "#2e82aa",
+        Area.FOREST:   "#2a5e30",
+        Area.DESERT:   "#c47a2a",
+        Area.SWAMP:    "#4a7040",
+        Area.TUNDRA:   "#6090b8",
+    }
+    _MAP_SHORT: Dict[Area, str] = {
+        Area.CITY:     "Capital",
+        Area.FARMLAND: "Farmlands",
+        Area.MOUNTAIN: "Mountains",
+        Area.COAST:    "Coast",
+        Area.FOREST:   "Forest",
+        Area.DESERT:   "Desert",
+        Area.SWAMP:    "Swamp",
+        Area.TUNDRA:   "Tundra",
+    }
+
     def build(self) -> None:
         main = ttk.Frame(self, style="MT.TFrame")
         main.pack(fill="both", expand=True, padx=10, pady=8)
@@ -3086,10 +4110,47 @@ class TravelScreen(Screen):
                                   bg=T["bg"], fg=T["fg"], anchor="w", padx=10)
         self._info_lbl.pack(fill="x", pady=(0, 4))
 
-        # Destinations table
-        self._table = DataTable(main, self._COLS, height=10)
-        self._table.pack(fill="both", expand=True, padx=10, pady=4)
+        # Destinations table — full width
+        self._table = DataTable(main, self._COLS, height=7)
+        self._table.pack(fill="x", padx=10, pady=(0, 2))
         self._table.bind_select(self._on_select)
+        self._table.bind_double(self._on_dbl_travel)
+
+        # ── World Map ────────────────────────────────────────────────────
+        map_hdr = ttk.Frame(main, style="MT.TFrame")
+        map_hdr.pack(fill="x", padx=10, pady=(3, 1))
+        tk.Label(map_hdr, text="WORLD MAP", font=FONT_MONO_S,
+                 bg=T["bg"], fg=T["grey"]).pack(side="left")
+        tk.Label(map_hdr,
+                 text="  scroll to zoom  \u00b7  drag to pan  \u00b7  click node to select",
+                 font=FONT_MONO_S, bg=T["bg"], fg=T["fg_dim"]).pack(side="left")
+        ttk.Button(map_hdr, text=" Fit ",  style="Nav.TButton",
+                   command=self._map_reset_view).pack(side="right", padx=(2, 0))
+        ttk.Button(map_hdr, text=" \u2212 ", style="Nav.TButton",
+                   command=lambda: self._map_zoom_step(1 / 1.25)).pack(side="right", padx=2)
+        ttk.Button(map_hdr, text=" + ", style="Nav.TButton",
+                   command=lambda: self._map_zoom_step(1.25)).pack(side="right")
+
+        self._map_canvas = tk.Canvas(
+            main, bg="#0c0804", highlightthickness=1,
+            highlightbackground=T["border"],
+        )
+        self._map_canvas.pack(fill="both", expand=True, padx=10, pady=(1, 4))
+
+        # Map transform state
+        self._map_scale: float          = 1.0
+        self._map_ox:    float          = 0.0
+        self._map_oy:    float          = 0.0
+        self._map_drag:  Optional[tuple] = None
+        self._map_moved: bool           = False
+
+        self._map_canvas.bind("<Configure>",       lambda _e: self.after(30, self._map_reset_view))
+        self._map_canvas.bind("<ButtonPress-1>",   self._on_map_btn_down)
+        self._map_canvas.bind("<B1-Motion>",       self._on_map_drag)
+        self._map_canvas.bind("<ButtonRelease-1>", self._on_map_btn_up)
+        self._map_canvas.bind("<MouseWheel>",      self._on_map_scroll)  # Windows
+        self._map_canvas.bind("<Button-4>",        self._on_map_scroll)  # Linux up
+        self._map_canvas.bind("<Button-5>",        self._on_map_scroll)  # Linux down
 
         # Detail strip
         self._detail_lbl = tk.Label(
@@ -3156,11 +4217,15 @@ class TravelScreen(Screen):
         self._travel_btn.config(state="disabled")
         self._detail_lbl.config(text="Select a destination to see details.",
                                 fg=T["grey"])
+        if hasattr(self, "_map_canvas"):
+            self.after(20, self._map_reset_view)
 
     def _on_select(self, row: Optional[Dict]) -> None:
         if not row:
             self._selected_area = None
             self._travel_btn.config(state="disabled")
+            if hasattr(self, "_map_canvas"):
+                self._draw_map()
             return
         area_val = row.get("area", "")
         for a in Area:
@@ -3171,11 +4236,370 @@ class TravelScreen(Screen):
             self._selected_area = None
         if self._selected_area:
             self._travel_btn.config(state="normal")
+            base_items = AREA_INFO[self._selected_area].get("base_items", [])
+            prod_names = ", ".join(
+                ALL_ITEMS[k].name for k in base_items[:5] if k in ALL_ITEMS
+            )
+            guard     = AREA_INFO[self._selected_area].get("guard_strength", 0)
+            guard_txt = "  ·  Guard: " + ("★" * guard if guard else "—")
             self._detail_lbl.config(
                 text=(f"{row['area']}  ·  {row['days']} days  ·  risk {row['risk']}"
-                      f"  ·  cost ~{row['cost']}  ·  {row['desc']}"),
+                      f"  ·  cost ~{row['cost']}{guard_txt}\n"
+                      f"Produces: {prod_names}  ·  {row.get('desc', '')}"),
                 fg=T["fg"],
             )
+            if hasattr(self, "_map_canvas"):
+                self._draw_map()
+
+    def _on_dbl_travel(self, _row) -> None:
+        """Double-click a destination row to depart immediately (confirm dialog follows)."""
+        if self.game.settings.double_click_action:
+            self._do_travel()
+
+    # ── Map ──────────────────────────────────────────────────────────────────
+
+    def _map_v2s(self, vx: float, vy: float) -> Tuple[float, float]:
+        """Convert virtual map coordinates to canvas screen coordinates."""
+        return vx * self._map_scale + self._map_ox, vy * self._map_scale + self._map_oy
+
+    def _map_reset_view(self) -> None:
+        """Fit all nodes into the visible canvas with uniform margins."""
+        if not hasattr(self, "_map_canvas"):
+            return
+        c = self._map_canvas
+        W = c.winfo_width()
+        H = c.winfo_height()
+        if W < 20 or H < 20:
+            return
+        xs  = [vx for vx, _vy in self._MAP_VPOS.values()]
+        ys  = [vy for _vx, vy in self._MAP_VPOS.values()]
+        vw  = max(xs) - min(xs)
+        vh  = max(ys) - min(ys)
+        margin = 72
+        sx = (W - 2 * margin) / vw if vw > 0 else 1.0
+        sy = (H - 2 * margin) / vh if vh > 0 else 1.0
+        self._map_scale = min(sx, sy)
+        self._map_ox = (W - vw * self._map_scale) / 2 - min(xs) * self._map_scale
+        self._map_oy = (H - vh * self._map_scale) / 2 - min(ys) * self._map_scale
+        self._draw_map()
+
+    def _map_zoom_step(self, factor: float) -> None:
+        c = self._map_canvas
+        self._map_do_zoom(factor, c.winfo_width() / 2, c.winfo_height() / 2)
+
+    def _map_do_zoom(self, factor: float, cx: float, cy: float) -> None:
+        new_scale = max(0.22, min(6.0, self._map_scale * factor))
+        f = new_scale / self._map_scale
+        self._map_ox = cx - (cx - self._map_ox) * f
+        self._map_oy = cy - (cy - self._map_oy) * f
+        self._map_scale = new_scale
+        self._draw_map()
+
+    def _on_map_scroll(self, event) -> None:
+        if event.num == 4:
+            factor = 1.15
+        elif event.num == 5:
+            factor = 1 / 1.15
+        else:
+            factor = 1.15 if event.delta > 0 else 1 / 1.15
+        self._map_do_zoom(factor, event.x, event.y)
+
+    def _on_map_btn_down(self, event) -> None:
+        self._map_drag  = (event.x, event.y, self._map_ox, self._map_oy)
+        self._map_moved = False
+
+    def _on_map_drag(self, event) -> None:
+        if not self._map_drag:
+            return
+        dx = event.x - self._map_drag[0]
+        dy = event.y - self._map_drag[1]
+        if abs(dx) > 4 or abs(dy) > 4:
+            self._map_moved = True
+            self._map_canvas.config(cursor="fleur")
+        self._map_ox = self._map_drag[2] + dx
+        self._map_oy = self._map_drag[3] + dy
+        self._draw_map()
+
+    def _on_map_btn_up(self, event) -> None:
+        was_moved       = self._map_moved
+        self._map_drag  = None
+        self._map_moved = False
+        self._map_canvas.config(cursor="")
+        if not was_moved:
+            self._on_map_click(event)
+
+    def _on_map_click(self, event) -> None:
+        """Select/deselect area nodes on click."""
+        zoom = self._map_scale
+        hit  = max(18, min(32, round(24 * max(0.7, zoom)))) + 7
+        for area in Area:
+            sx, sy = self._map_v2s(*self._MAP_VPOS[area])
+            if (event.x - sx) ** 2 + (event.y - sy) ** 2 <= hit ** 2:
+                # Second click on the already-selected node — deselect
+                if area == self._selected_area:
+                    self._deselect_map()
+                    return
+                if area == self.game.current_area:
+                    # Focus current location: highlight its outgoing routes
+                    for iid in self._table.tree.get_children():
+                        self._table.tree.selection_remove(iid)
+                    self._travel_btn.config(state="disabled")
+                    self._selected_area = area
+                    n_routes = len(AREA_INFO[area]["travel_days"])
+                    self._detail_lbl.config(
+                        text=(f"\u2605  {area.value}  —  your current location"
+                              f"  ·  {n_routes} routes available"),
+                        fg=T["yellow"],
+                    )
+                    self._draw_map()
+                    return
+                self._select_area_in_table(area)
+                return
+        # Click on empty space — deselect
+        self._deselect_map()
+
+    def _deselect_map(self) -> None:
+        """Clear map selection and restore full-brightness view."""
+        self._selected_area = None
+        self._travel_btn.config(state="disabled")
+        self._detail_lbl.config(
+            text="Select a destination to see details.",
+            fg=T["grey"],
+        )
+        for iid in self._table.tree.get_children():
+            self._table.tree.selection_remove(iid)
+        self._draw_map()
+
+    @staticmethod
+    def _dim_color(hex_col: str, factor: float = 0.22) -> str:
+        """Return a darker/dimmed version of a hex colour for unrelated edges/nodes."""
+        r = int(hex_col[1:3], 16)
+        g = int(hex_col[3:5], 16)
+        b = int(hex_col[5:7], 16)
+        r = max(0, round(r * factor + 12))
+        g = max(0, round(g * factor + 8))
+        b = max(0, round(b * factor + 10))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_map(self) -> None:
+        """Redraw the world map canvas with current zoom/pan state."""
+        if not hasattr(self, "_map_canvas"):
+            return
+        c = self._map_canvas
+        c.delete("all")
+        W = c.winfo_width()
+        H = c.winfo_height()
+        if W < 20 or H < 20:
+            return
+        g       = self.game
+        cur     = g.current_area
+        excess  = max(0.0, g._current_weight() - g._max_carry_weight())
+        extra_d = int(excess / 15)
+        zoom    = self._map_scale
+        sel     = self._selected_area   # None or selected destination
+
+        # ── Focus sets ────────────────────────────────────────────────────
+        # When a destination is selected:
+        #   - only edges that directly touch sel are highlighted
+        #   - only sel and its direct neighbours are lit (cur is always shown
+        #     with its gold ring but NOT used to light extra edges/nodes)
+        # When nothing selected: everything is highlighted.
+        if sel is not None:
+            hi_nodes: set = {sel} | set(AREA_INFO[sel]["travel_days"].keys())
+        else:
+            hi_nodes = set(Area)   # all lit
+
+        def _edge_active(a1: Area, a2: Area) -> bool:
+            if sel is None:
+                return True
+            return sel in (a1, a2)   # only edges touching the selected node
+
+        # ── Background ───────────────────────────────────────────────────
+        c.create_rectangle(0, 0, W, H, fill="#0c0804", outline="")
+
+        # Subtle grid every 100 virtual units
+        for vx in range(0, 1001, 100):
+            sx1, sy1 = self._map_v2s(vx,   0)
+            sx2, sy2 = self._map_v2s(vx, 600)
+            c.create_line(sx1, sy1, sx2, sy2, fill="#181006", width=1)
+        for vy in range(0, 601, 100):
+            sx1, sy1 = self._map_v2s(  0, vy)
+            sx2, sy2 = self._map_v2s(1000, vy)
+            c.create_line(sx1, sy1, sx2, sy2, fill="#181006", width=1)
+
+        # ── Collect unique edges ──────────────────────────────────────────
+        def _ecol_lw(days: int):
+            if days <= 1:   return "#22c55e", 2.5
+            elif days <= 2: return "#86efac", 2.0
+            elif days <= 3: return "#fde047", 1.8
+            elif days <= 4: return "#fb923c", 1.8
+            else:           return "#f87171", 1.8
+
+        all_edges = []   # (a1, a2, days, active)
+        seen: set = set()
+        for a1 in Area:
+            for a2, base_d in AREA_INFO[a1]["travel_days"].items():
+                key = (min(a1.name, a2.name), max(a1.name, a2.name))
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_edges.append((a1, a2, base_d + extra_d, _edge_active(a1, a2)))
+
+        # ── Draw edges: dim pass first, active on top ─────────────────────
+        def _draw_edge(x1, y1, x2, y2, ecol, lw, active: bool) -> None:
+            pw = max(1.0, lw * max(0.85, zoom))
+            if active:
+                # 3-layer glow stack for smooth appearance
+                c.create_line(x1, y1, x2, y2,
+                              fill=self._dim_color(ecol, 0.45),
+                              width=max(3, round(pw * 2.6)),
+                              capstyle=tk.ROUND)
+                c.create_line(x1, y1, x2, y2,
+                              fill=self._dim_color(ecol, 0.72),
+                              width=max(2, round(pw * 1.5)),
+                              capstyle=tk.ROUND)
+                c.create_line(x1, y1, x2, y2, fill=ecol,
+                              width=max(1, round(pw)),
+                              capstyle=tk.ROUND)
+            else:
+                c.create_line(x1, y1, x2, y2,
+                              fill=self._dim_color(ecol, 0.15),
+                              width=max(1, round(pw * 0.65)),
+                              capstyle=tk.ROUND)
+
+        for a1, a2, days, active in all_edges:
+            if not active:
+                x1, y1 = self._map_v2s(*self._MAP_VPOS[a1])
+                x2, y2 = self._map_v2s(*self._MAP_VPOS[a2])
+                _draw_edge(x1, y1, x2, y2, *_ecol_lw(days), False)
+
+        for a1, a2, days, active in all_edges:
+            if active:
+                x1, y1 = self._map_v2s(*self._MAP_VPOS[a1])
+                x2, y2 = self._map_v2s(*self._MAP_VPOS[a2])
+                ecol, lw = _ecol_lw(days)
+                _draw_edge(x1, y1, x2, y2, ecol, lw, True)
+                if zoom >= 0.42:
+                    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                    fs_e   = max(7, min(12, round(9 * max(0.7, zoom))))
+                    pad    = max(2, round(3 * max(0.7, zoom)))
+                    c.create_rectangle(mx - pad * 2.4, my - pad * 1.5,
+                                       mx + pad * 2.4, my + pad * 1.5,
+                                       fill="#0c0804", outline="")
+                    c.create_text(mx, my, text=str(days), fill=ecol,
+                                  font=("Consolas", fs_e, "bold"))
+
+        # ── Nodes ─────────────────────────────────────────────────────────
+        nr    = max(16, min(32, round(24 * max(0.7, zoom))))
+        gap   = max(4, round(5 * max(0.7, zoom)))
+        fs_nm = max(8,  min(13, round(10 * max(0.75, zoom))))
+        fs_rk = max(7,  min(11, round( 9 * max(0.75, zoom))))
+        fs_pr = max(6,  min( 9, round( 7 * max(0.75, zoom))))
+
+        for area in Area:
+            x, y   = self._map_v2s(*self._MAP_VPOS[area])
+            fill   = self._MAP_FILL[area]
+            risk   = AREA_INFO[area]["travel_risk"]
+            is_cur = area == cur
+            is_sel = area == sel
+            is_dim = area not in hi_nodes
+
+            node_fill = fill if not is_dim else self._dim_color(fill, 0.28)
+            ol        = (T["border_light"] if (is_cur or is_sel)
+                         else self._dim_color(T["border"], 0.35) if is_dim
+                         else T["border"])
+            txt_col   = "#f5e8c8" if not is_dim else "#3a2c1c"
+
+            # Rings
+            if is_cur:
+                gr = nr + max(5, round(8 * max(0.8, zoom)))
+                ring_col = T["yellow"] if not is_dim else "#5a4008"
+                c.create_oval(x - gr, y - gr, x + gr, y + gr,
+                              fill="", outline=ring_col,
+                              width=max(2, round(3 * zoom)))
+            if is_sel and not is_cur:
+                sr = nr + max(3, round(5 * max(0.8, zoom)))
+                c.create_oval(x - sr, y - sr, x + sr, y + sr,
+                              fill="", outline="#e2e8f0",
+                              width=max(2, round(2 * zoom)))
+
+            c.create_oval(x - nr, y - nr, x + nr, y + nr,
+                          fill=node_fill, outline=ol,
+                          width=max(1, round(2 * zoom)))
+
+            if zoom >= 0.42:
+                short = self._MAP_SHORT[area]
+                ny    = y - nr - gap
+                # Name label above node (shadow only when visible)
+                if not is_dim:
+                    c.create_text(x + 1, ny + 1, text=short,
+                                  fill="#080504", font=("Consolas", fs_nm, "bold"))
+                c.create_text(x, ny, text=short,
+                              fill=txt_col, font=("Consolas", fs_nm, "bold"))
+
+                # Risk % centred in node (only when not dimmed)
+                if not is_dim:
+                    risk_col = ("#22c55e" if risk < 0.07
+                                else "#fde047" if risk < 0.13 else "#f87171")
+                    c.create_text(x + 1, y + 1, text=f"{risk * 100:.0f}%",
+                                  fill="#080504", font=("Consolas", fs_rk, "bold"))
+                    c.create_text(x, y, text=f"{risk * 100:.0f}%",
+                                  fill=risk_col, font=("Consolas", fs_rk, "bold"))
+
+            if zoom >= 0.72 and not is_dim:
+                base_items = AREA_INFO[area].get("base_items", [])
+                top = [ALL_ITEMS[k].name for k in base_items[:2] if k in ALL_ITEMS]
+                if top:
+                    ty = y + nr + gap + max(5, round(6 * zoom))
+                    lbl = ", ".join(top)
+                    c.create_text(x + 1, ty + 1, text=lbl,
+                                  fill="#080504", font=("Consolas", fs_pr))
+                    c.create_text(x, ty, text=lbl, fill="#c89444",
+                                  font=("Consolas", fs_pr))
+
+        # ── Legend (bottom-left) ──────────────────────────────────────────
+        fs_lg = max(7, min(9, round(8 * max(0.8, zoom))))
+        lx, ly = 8, H - 6
+        for lbl, col in [("1d", "#22c55e"), ("2d", "#86efac"),
+                         ("3d", "#fde047"), ("4d", "#fb923c"), ("5+d", "#f87171")]:
+            t  = c.create_text(lx, ly, text=f"━{lbl}", fill=col,
+                               anchor="sw", font=("Consolas", fs_lg, "bold"))
+            bb = c.bbox(t)
+            lx = (bb[2] + 8) if bb else (lx + 36)
+        # Current area label (bottom-right)
+        c.create_text(W - 6, H - 6, text=f"★ {cur.value}",
+                      fill=T["yellow"], anchor="se",
+                      font=("Consolas", fs_lg, "bold"))
+
+    def _select_area_in_table(self, area: Area) -> None:
+        """Programmatically select an area in the table and sync all state."""
+        for iid in self._table.tree.get_children():
+            vals = self._table.tree.item(iid, "values")
+            if vals and vals[0] == area.value:
+                self._table.tree.selection_set(iid)
+                self._table.tree.see(iid)
+                break
+        self._selected_area = area
+        self._travel_btn.config(state="normal")
+        g          = self.game
+        excess     = max(0.0, g._current_weight() - g._max_carry_weight())
+        extra_d    = int(excess / 15)
+        days       = AREA_INFO[g.current_area]["travel_days"].get(area, 3) + extra_d
+        risk       = AREA_INFO[area]["travel_risk"]
+        cost       = days * 3.0 * g.settings.cost_mult
+        guard      = AREA_INFO[area].get("guard_strength", 0)
+        guard_txt  = "  ·  Guard: " + ("★" * guard if guard else "—")
+        base_items = AREA_INFO[area].get("base_items", [])
+        prod_names = ", ".join(
+            ALL_ITEMS[k].name for k in base_items[:5] if k in ALL_ITEMS
+        )
+        self._detail_lbl.config(
+            text=(f"{area.value}  ·  {days} day(s)  ·  risk {risk * 100:.0f}%"
+                  f"  ·  cost ~{cost:.0f}g{guard_txt}\n"
+                  f"Produces: {prod_names}"),
+            fg=T["fg"],
+        )
+        self._draw_map()
 
     def _do_travel(self) -> None:
         if not self._selected_area:
@@ -4056,6 +5480,9 @@ class FinanceScreen(Screen):
         monthly = round(
             amt * (rate * (1 + rate) ** months) / ((1 + rate) ** months - 1), 2
         )
+        if not _maybe_sign(self, "loan",
+                           detail=f"{amt:.0f}g · {months} months · {rate*100:.2f}%/mo"):
+            return
         g.loans.append(LoanRecord(
             principal=amt, interest_rate=rate,
             months_remaining=months, monthly_payment=monthly,
@@ -4211,6 +5638,7 @@ class ContractsScreen(Screen):
 
         self._offer_table = DataTable(main, self._OFFER_COLS, height=5)
         self._offer_table.pack(fill="x", padx=10, pady=(4, 2))
+        self._offer_table.bind_double(self._on_dbl_accept)
 
         offer_act = ttk.Frame(main, style="MT.TFrame")
         offer_act.pack(fill="x", padx=10, pady=(2, 4))
@@ -4241,6 +5669,7 @@ class ContractsScreen(Screen):
 
         self._table = DataTable(main, self._ACTIVE_COLS, height=7)
         self._table.pack(fill="both", expand=True, padx=10, pady=(4, 2))
+        self._table.bind_double(self._on_dbl_fulfill)
 
         act = ttk.Frame(main, style="MT.TFrame")
         act.pack(fill="x", padx=10, pady=4)
@@ -4328,6 +5757,16 @@ class ContractsScreen(Screen):
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
+    def _on_dbl_accept(self, _row) -> None:
+        """Double-click a contract offer to accept it immediately."""
+        if self.game.settings.double_click_action:
+            self._do_accept()
+
+    def _on_dbl_fulfill(self, _row) -> None:
+        """Double-click an active contract to fulfill it if eligible."""
+        if self.game.settings.double_click_action:
+            self._do_fulfill()
+
     def _do_generate(self) -> None:
         import random
         g = self.game
@@ -4379,6 +5818,11 @@ class ContractsScreen(Screen):
         if not con:
             self.msg.warn("Could not find the selected offer.")
             return
+        _item = ALL_ITEMS.get(con.item_key)
+        _name = _item.name if _item else con.item_key
+        if not _maybe_sign(self, "contract",
+                           detail=f"{con.quantity}× {_name} → {con.destination.value}"):
+            return
         self._pending.remove(con)
         self.game.contracts.append(con)
         item = ALL_ITEMS.get(con.item_key)
@@ -4394,6 +5838,9 @@ class ContractsScreen(Screen):
             self.msg.warn("No pending offers to accept.")
             return
         n = len(self._pending)
+        if not _maybe_sign(self, "contract",
+                           detail=f"{n} contract offer(s)"):
+            return
         self.game.contracts.extend(self._pending)
         self._pending.clear()
         self.app.refresh()
@@ -4558,6 +6005,7 @@ class SkillsScreen(Screen):
         self._table = DataTable(main, self._COLS, height=8)
         self._table.pack(fill="x", padx=10, pady=4)
         self._table.bind_select(self._on_select)
+        self._table.bind_double(self._on_dbl_upgrade)
 
         self._detail_lbl = tk.Label(
             main, text="Select a skill to see details.",
@@ -4613,6 +6061,11 @@ class SkillsScreen(Screen):
                   f"  ·  {self._DESCS.get(skill, '')}"),
             fg=T["fg"],
         )
+
+    def _on_dbl_upgrade(self, _row) -> None:
+        """Double-click a skill row to upgrade it."""
+        if self.game.settings.double_click_action:
+            self._do_upgrade()
 
     def _do_upgrade(self) -> None:
         row = self._table.selected()
@@ -4689,6 +6142,7 @@ class SmugglingScreen(Screen):
                  ).pack(fill="x", pady=(0, 3))
         self._buy_table = DataTable(left, self._BUY_COLS, height=8)
         self._buy_table.pack(fill="both", expand=True)
+        self._buy_table.bind_double(self._on_dbl_smuggle_buy)
         buy_act = ttk.Frame(left, style="MT.TFrame")
         buy_act.pack(fill="x", pady=(5, 0))
         tk.Label(buy_act, text="Qty:", font=FONT_MONO_S,
@@ -4708,6 +6162,7 @@ class SmugglingScreen(Screen):
                  ).pack(fill="x", pady=(0, 3))
         self._sell_table = DataTable(right, self._SELL_COLS, height=8)
         self._sell_table.pack(fill="both", expand=True)
+        self._sell_table.bind_double(self._on_dbl_smuggle_sell)
         sell_act = ttk.Frame(right, style="MT.TFrame")
         sell_act.pack(fill="x", pady=(5, 0))
         tk.Label(sell_act, text="Qty:", font=FONT_MONO_S,
@@ -4954,6 +6409,28 @@ class SmugglingScreen(Screen):
         self.app.sound.play_coin_sfx()
         self.app.profit_flash(fence_total)
         self.app.refresh()
+
+    def _on_dbl_smuggle_buy(self, _row) -> None:
+        """Double-click a contraband row — prompts for quantity then buys."""
+        if not self.game.settings.double_click_action:
+            return
+        raw = InputDialog(self, "How many to buy?", "Buy Contraband", default="1").wait()
+        if raw is None:
+            return
+        try:
+            qty = int(raw)
+        except ValueError:
+            self.msg.err("Invalid quantity.")
+            return
+        if qty <= 0:
+            return
+        self._buy_qty.set(str(qty))
+        self._do_buy()
+
+    def _on_dbl_smuggle_sell(self, _row) -> None:
+        """Double-click a held contraband row to sell it to the fence."""
+        if self.game.settings.double_click_action:
+            self._do_sell()
 
     def _do_bribe(self) -> None:
         import random
@@ -5881,6 +7358,8 @@ class LicensesScreen(Screen):
         if not ConfirmDialog(self, f"Purchase {lt.value} for {cost}g?",
                              "Buy License").wait():
             return
+        if not _maybe_sign(self, "license", detail=f"{lt.value} for {cost}g"):
+            return
         g.inventory.gold -= cost
         g.licenses.add(lt)
         self.msg.ok(f"Licensed: {lt.value}.")
@@ -6522,7 +8001,8 @@ class FundManagementScreen(Screen):
             "Accept Client",
         ).wait():
             return
-
+        if not _maybe_sign(self, "fund_client", detail=p["name"]):
+            return
         g.inventory.gold += p["capital"]
         fc = FundClient(
             id=g.next_fund_client_id,
@@ -6957,6 +8437,7 @@ class RealEstateScreen(Screen):
 
         self._list_table = DataTable(parent, self._LIST_COLS, height=10)
         self._list_table.pack(fill="both", expand=True, padx=8, pady=4)
+        self._list_table.bind_double(self._on_dbl_buy_listing)
         self._listings_data: list = []   # raw listing dicts
 
         act = ttk.Frame(parent, style="MT.TFrame")
@@ -7056,7 +8537,9 @@ class RealEstateScreen(Screen):
         if LicenseType.REAL_ESTATE not in g.licenses:
             self.msg.err("Real Estate Charter required.")
             return
-
+        if not _maybe_sign(self, "real_estate",
+                           detail=f"{lst['name']} for {final_price:,.0f}g"):
+            return
         g.inventory.gold -= final_price
         new_prop = Property(
             id=g.next_property_id,
@@ -7079,6 +8562,11 @@ class RealEstateScreen(Screen):
         self.msg.ok(f"'{new_prop.name}' purchased for {final_price:,.0f}g!")
         g._check_achievements()
         self.app.refresh()
+
+    def _on_dbl_buy_listing(self, _row) -> None:
+        """Double-click a property listing to buy it at the asking price."""
+        if self.game.settings.double_click_action:
+            self._do_buy_listing(haggle=False)
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAB 3: Build on Land
@@ -7187,6 +8675,9 @@ class RealEstateScreen(Screen):
         if not ConfirmDialog(self, f"Buy {sz.title()} land plot in {area_enum.value} for {cost:,.0f}g?",
                              "Buy Land Plot").wait():
             return
+        if not _maybe_sign(self, "land",
+                           detail=f"{sz.title()} plot in {area_enum.value} for {cost:,.0f}g"):
+            return
         g.inventory.gold -= cost
         new_plot = LandPlot(
             id=g.next_plot_id, area=area_enum, size=sz,
@@ -7284,6 +8775,1032 @@ class RealEstateScreen(Screen):
                 self._list_area_var.set(g.current_area.value)
             if hasattr(self, "_plot_area_var"):
                 self._plot_area_var.set(g.current_area.value)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MANAGERS SCREEN  —  hire, manage, configure, and fire NPC managers
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ManagersScreen(Screen):
+    """Hire NPC managers to automate various game domains."""
+
+    # Level colour palette
+    _LVL_COLORS = {1: "#b89870", 2: "#7dd444", 3: "#ffd060",
+                   4: "#ffad3a", 5: "#e04848"}
+
+    # ── Layout ───────────────────────────────────────────────────────────────
+    def build(self) -> None:
+        outer = ttk.Frame(self, style="MT.TFrame")
+        outer.pack(fill="both", expand=True)
+
+        # ── Header ───────────────────────────────────────────────────────
+        hdr = ttk.Frame(outer, style="MT.TFrame")
+        hdr.pack(fill="x", padx=12, pady=(8, 2))
+        self.section_label(hdr, "MANAGERS & STAFF").pack(side="left")
+        self._wage_lbl = tk.Label(hdr, text="", font=FONT_MONO_S,
+                                  bg=T["bg"], fg=T["yellow"])
+        self._wage_lbl.pack(side="right")
+
+        # ── Main two-column layout ────────────────────────────────────────
+        body = ttk.Frame(outer, style="MT.TFrame")
+        body.pack(fill="both", expand=True, padx=12, pady=4)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        # LEFT: scrollable roster + hire panel
+        left = tk.Frame(body, bg=T["bg_panel"], bd=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        tk.Frame(left, bg=T["border_light"], height=2).pack(fill="x")
+        tk.Label(left, text="  YOUR STAFF", font=FONT_FANTASY_BOLD,
+                 bg=T["bg_panel"], fg=T["cyan"], anchor="w").pack(fill="x", pady=(6, 2))
+
+        self._roster_scroll = ScrollableFrame(left)
+        self._roster_scroll.pack(fill="both", expand=True, pady=(0, 4))
+        self._roster_inner = self._roster_scroll.inner
+
+        ttk.Separator(left, style="MT.TSeparator").pack(fill="x", pady=4)
+        ttk.Button(left, text="➕  Hire a Manager", style="OK.TButton",
+                   command=self._do_hire).pack(fill="x", padx=8, pady=(0, 8))
+
+        # RIGHT: detail panel
+        right = tk.Frame(body, bg=T["bg_panel"])
+        right.grid(row=0, column=1, sticky="nsew")
+        tk.Frame(right, bg=T["border_light"], height=2).pack(fill="x")
+        tk.Label(right, text="  MANAGER DETAILS", font=FONT_FANTASY_BOLD,
+                 bg=T["bg_panel"], fg=T["cyan"], anchor="w").pack(fill="x", pady=(6, 2))
+
+        self._detail_frame = tk.Frame(right, bg=T["bg_panel"])
+        self._detail_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        self._no_sel_lbl = tk.Label(self._detail_frame,
+                                    text="Select a manager from the left panel\n"
+                                         "to see details, stats, and configuration.",
+                                    font=FONT_FANTASY_S, bg=T["bg_panel"],
+                                    fg=T["fg_dim"], justify="center")
+        self._no_sel_lbl.pack(expand=True)
+
+        # ── Action log (bottom strip) ─────────────────────────────────────
+        log_frame = tk.Frame(outer, bg=T["bg_panel"])
+        log_frame.pack(fill="x", padx=12, pady=(4, 0))
+        tk.Frame(log_frame, bg=T["border_light"], height=1).pack(fill="x")
+        tk.Label(log_frame, text="  Recent Manager Activity",
+                 font=FONT_FANTASY_S, bg=T["bg_panel"],
+                 fg=T["border_light"], anchor="w").pack(fill="x")
+        self._log_text = tk.Text(log_frame, height=4, font=FONT_MONO_S,
+                                 bg="#1a1206", fg=T["fg_dim"],
+                                 state="disabled", relief="flat",
+                                 selectbackground=T["bg_hover"])
+        self._log_text.pack(fill="x", padx=4, pady=(0, 4))
+
+        # ── Back ──────────────────────────────────────────────────────────
+        ttk.Separator(outer, style="MT.TSeparator").pack(fill="x", padx=12, pady=(4, 2))
+        self.back_button(outer).pack(anchor="w", padx=12, pady=(0, 8))
+
+        self._selected_mgr_idx: int = -1
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        if not hasattr(self, "_roster_inner"):
+            return
+        g = self.game
+        # Weekly wage total
+        total_wage = sum(m.weekly_wage for m in g.hired_managers if m.is_active)
+        self._wage_lbl.config(text=f"Weekly payroll: {total_wage:.0f}g/wk")
+
+        self._rebuild_roster()
+        self._refresh_log()
+        if self._selected_mgr_idx >= 0:
+            if self._selected_mgr_idx < len(g.hired_managers):
+                self._show_detail(g.hired_managers[self._selected_mgr_idx],
+                                   self._selected_mgr_idx)
+            else:
+                self._selected_mgr_idx = -1
+                self._show_no_selection()
+
+    def _rebuild_roster(self) -> None:
+        """Rebuild the scrollable manager list."""
+        for w in self._roster_inner.winfo_children():
+            w.destroy()
+        g = self.game
+        if not g.hired_managers:
+            tk.Label(self._roster_inner,
+                     text="No managers hired yet.\nPress ➕ Hire to recruit staff.",
+                     font=FONT_FANTASY_S, bg=T["bg"], fg=T["fg_dim"],
+                     justify="center").pack(pady=20)
+            return
+        for idx, mgr in enumerate(g.hired_managers):
+            card = self._make_roster_card(self._roster_inner, mgr, idx)
+            card.pack(fill="x", pady=2, padx=4)
+
+    def _make_roster_card(self, parent: tk.Widget,
+                          mgr: "HiredManager", idx: int) -> tk.Frame:
+        """Create a compact manager card for the roster panel."""
+        defn   = MANAGER_DEFS.get(mgr.type_enum(), {})
+        icon   = defn.get("icon", "⚙")
+        lvl_c  = self._LVL_COLORS.get(mgr.level, T["fg"])
+        xp_nxt = mgr.xp_to_next()
+        xp_bar = self._xp_bar_text(mgr)
+        is_sel = (idx == self._selected_mgr_idx)
+        bg     = T["bg_hover"] if is_sel else T["bg_panel"]
+
+        border = tk.Frame(parent, bg=T["border_light"] if is_sel else T["border"],
+                          cursor="hand2")
+        inner  = tk.Frame(border, bg=bg)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        row1 = tk.Frame(inner, bg=bg)
+        row1.pack(fill="x", padx=8, pady=(6, 1))
+        tk.Label(row1, text=f"{icon}  {mgr.name}", font=FONT_FANTASY_BOLD,
+                 bg=bg, fg=T["cyan"] if is_sel else T["fg"]).pack(side="left")
+        tk.Label(row1, text=f"Lv{mgr.level}", font=FONT_FANTASY_BOLD,
+                 bg=bg, fg=lvl_c).pack(side="right")
+
+        row2 = tk.Frame(inner, bg=bg)
+        row2.pack(fill="x", padx=8)
+        tk.Label(row2, text=mgr.manager_type, font=FONT_FANTASY_S,
+                 bg=bg, fg=T["fg_dim"]).pack(side="left")
+        tk.Label(row2, text=f"{mgr.weekly_wage:.0f}g/wk",
+                 font=FONT_MONO_S, bg=bg, fg=T["yellow"]).pack(side="right")
+
+        row3 = tk.Frame(inner, bg=bg)
+        row3.pack(fill="x", padx=8, pady=(1, 6))
+        tk.Label(row3, text=xp_bar, font=FONT_MONO_S,
+                 bg=bg, fg=T["fg_dim"]).pack(side="left")
+        eff_text = f"{mgr.efficiency*100:.0f}% eff"
+        tk.Label(row3, text=eff_text, font=FONT_MONO_S,
+                 bg=bg, fg=T["green"]).pack(side="right")
+
+        def _click(_e=None):
+            self._selected_mgr_idx = idx
+            self._rebuild_roster()
+            self._show_detail(mgr, idx)
+
+        for w in [border, inner, row1, row2, row3]:
+            w.bind("<Button-1>", _click)
+        for child in inner.winfo_children():
+            for sub in child.winfo_children():
+                sub.bind("<Button-1>", _click)
+
+        return border
+
+    def _xp_bar_text(self, mgr: "HiredManager") -> str:
+        if mgr.level >= 5:
+            return "Max level ★★★★★"
+        threshold = MANAGER_XP_THRESHOLDS[mgr.level]
+        pct       = min(1.0, mgr.xp / max(threshold, 1))
+        bars      = int(pct * 12)
+        return f"XP: {'█' * bars}{'░' * (12 - bars)}  {mgr.xp}/{threshold}"
+
+    def _show_no_selection(self) -> None:
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+        self._no_sel_lbl = tk.Label(self._detail_frame,
+                                    text="Select a manager from the left panel\n"
+                                         "to see details, stats, and configuration.",
+                                    font=FONT_FANTASY_S, bg=T["bg_panel"],
+                                    fg=T["fg_dim"], justify="center")
+        self._no_sel_lbl.pack(expand=True)
+
+    def _show_detail(self, mgr: "HiredManager", idx: int) -> None:
+        """Populate the right-side detail panel for a manager."""
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+        defn  = MANAGER_DEFS.get(mgr.type_enum(), {})
+        icon  = defn.get("icon", "⚙")
+        lvl_c = self._LVL_COLORS.get(mgr.level, T["fg"])
+
+        # ── Name / level strip ────────────────────────────────────────────
+        top = tk.Frame(self._detail_frame, bg=T["bg_panel"])
+        top.pack(fill="x", pady=(0, 8))
+        tk.Label(top, text=f"{icon}  {mgr.name}", font=FONT_FANTASY_TITLE,
+                 bg=T["bg_panel"], fg=T["cyan"]).pack(side="left")
+        lvl_frame = tk.Frame(top, bg=T["bg_panel"])
+        lvl_frame.pack(side="right")
+        tk.Label(lvl_frame, text=f"LEVEL {mgr.level}",
+                 font=FONT_FANTASY_BOLD, bg=T["bg_panel"], fg=lvl_c).pack(side="right")
+
+        # ── Description ───────────────────────────────────────────────────
+        tk.Label(self._detail_frame, text=defn.get("desc", ""),
+                 font=FONT_FANTASY_S, bg=T["bg_panel"], fg=T["fg"],
+                 wraplength=440, justify="left", anchor="w").pack(fill="x", pady=(0, 4))
+        tk.Label(self._detail_frame, text=defn.get("detail", ""),
+                 font=FONT_FANTASY_S, bg=T["bg_panel"], fg=T["fg_dim"],
+                 wraplength=440, justify="left", anchor="w").pack(fill="x", pady=(0, 8))
+
+        # ── XP Progress ───────────────────────────────────────────────────
+        if mgr.level < 5:
+            threshold = MANAGER_XP_THRESHOLDS[mgr.level]
+            pct       = min(1.0, mgr.xp / max(threshold, 1))
+            xp_row    = tk.Frame(self._detail_frame, bg=T["bg_panel"])
+            xp_row.pack(fill="x", pady=(0, 6))
+            tk.Label(xp_row, text=f"XP to Lv{mgr.level + 1}:",
+                     font=FONT_MONO_S, bg=T["bg_panel"], fg=T["fg_dim"]).pack(side="left")
+            # Draw a canvas progress bar
+            bar_w = 220
+            bar_c = tk.Canvas(xp_row, width=bar_w, height=14,
+                              bg=T["bg_panel"], highlightthickness=0)
+            bar_c.pack(side="left", padx=(8, 0))
+            bar_c.create_rectangle(0, 2, bar_w, 12, fill="#2a1f0e", outline=T["border"])
+            fill_w = int(bar_w * pct)
+            if fill_w > 0:
+                bar_c.create_rectangle(0, 2, fill_w, 12,
+                                       fill=T["green"] if pct < 0.7 else T["yellow"],
+                                       outline="")
+            tk.Label(xp_row, text=f"{mgr.xp}/{threshold}",
+                     font=FONT_MONO_S, bg=T["bg_panel"], fg=T["fg_dim"]).pack(side="left", padx=(8, 0))
+        else:
+            tk.Label(self._detail_frame,
+                     text="★ MAX LEVEL — perfectly efficient manager ★",
+                     font=FONT_FANTASY_BOLD, bg=T["bg_panel"], fg=T["yellow"]).pack(pady=(0, 6))
+
+        # ── Stats ─────────────────────────────────────────────────────────
+        tk.Frame(self._detail_frame, bg=T["border"], height=1).pack(fill="x", pady=4)
+        stats_frame = tk.Frame(self._detail_frame, bg=T["bg_panel"])
+        stats_frame.pack(fill="x", pady=(0, 8))
+        s = mgr.stats
+        stat_items = [
+            ("Days employed",    str(mgr.days_employed)),
+            ("Actions taken",    str(s.get("total_actions", 0))),
+            ("Gold generated",   f"{s.get('total_gold_generated', 0.0):,.0f}g"),
+            ("Wages paid",       f"{s.get('total_wages_paid', 0.0):,.0f}g"),
+            ("Op. costs",        f"{s.get('total_gold_cost', 0.0):,.0f}g"),
+            ("Mistakes",         str(s.get("mistakes", 0))),
+            ("Efficiency",       f"{mgr.efficiency*100:.0f}%"),
+            ("XP earned",        str(mgr.xp)),
+            ("Level-ups",        str(s.get("level_ups", 0))),
+        ]
+        last_act = s.get("last_action_desc", "")
+        if last_act:
+            stat_items.append(("Last action", last_act[:55]))
+        # Trade Steward: show current location / in-transit status
+        if mgr.manager_type == ManagerType.TRADE_STEWARD.value:
+            dest      = s.get("travel_dest")
+            days_left = s.get("travel_days_left", 0)
+            loc       = s.get("mgr_area") or "—"
+            if dest and days_left > 0:
+                stat_items.append(("Steward location",
+                                   f"In transit \u2192 {dest} ({days_left}d left)"))
+            elif loc and loc != "None":
+                stat_items.append(("Steward location", loc))
+        cols = 2
+        for i, (label, value) in enumerate(stat_items):
+            r, c = divmod(i, cols)
+            cell = tk.Frame(stats_frame, bg=T["bg_row_alt"] if r % 2 else T["bg_panel"])
+            cell.grid(row=r, column=c, sticky="ew", padx=4, pady=1)
+            stats_frame.columnconfigure(c, weight=1)
+            tk.Label(cell, text=label + ":", font=FONT_MONO_S,
+                     bg=cell["bg"], fg=T["fg_dim"], anchor="w").pack(side="left", padx=(4, 0))
+            tk.Label(cell, text=value, font=FONT_MONO_S,
+                     bg=cell["bg"], fg=T["cyan"], anchor="e").pack(side="right", padx=(0, 4))
+
+        # ── Configuration ─────────────────────────────────────────────────
+        tk.Frame(self._detail_frame, bg=T["border"], height=1).pack(fill="x", pady=4)
+        cfg_hdr = tk.Frame(self._detail_frame, bg=T["bg_panel"])
+        cfg_hdr.pack(fill="x")
+        tk.Label(cfg_hdr, text="Configuration", font=FONT_FANTASY_BOLD,
+                 bg=T["bg_panel"], fg=T["border_light"]).pack(side="left")
+        ttk.Button(cfg_hdr, text="⚙  Edit Config",
+                   style="MT.TButton",
+                   command=lambda m=mgr, i=idx: self._do_configure(m, i)).pack(
+                       side="right", padx=(4, 0))
+
+        cfg_text = "  ·  ".join(
+            f"{k}: {v}" for k, v in list(mgr.config.items())[:6]
+        ) or "Default settings"
+        tk.Label(self._detail_frame, text=cfg_text,
+                 font=FONT_MONO_S, bg=T["bg_panel"], fg=T["fg_dim"],
+                 wraplength=440, justify="left", anchor="w").pack(fill="x", pady=(4, 8))
+
+        # ── Action buttons ────────────────────────────────────────────────
+        tk.Frame(self._detail_frame, bg=T["border"], height=1).pack(fill="x", pady=4)
+        act = tk.Frame(self._detail_frame, bg=T["bg_panel"])
+        act.pack(fill="x", pady=(4, 0))
+        ttk.Button(act, text="🔥  Fire Manager", style="Danger.TButton",
+                   command=lambda m=mgr, i=idx: self._do_fire(m, i)).pack(side="right")
+
+    def _refresh_log(self) -> None:
+        """Update the action log text widget."""
+        g    = self.game
+        logs = list(g._manager_action_log)[:20]
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+        if logs:
+            self._log_text.insert("end", "\n".join(logs))
+        else:
+            self._log_text.insert("end", "No manager activity yet.")
+        self._log_text.config(state="disabled")
+
+    # ── Manager name generator ────────────────────────────────────────────────
+
+    _MGR_FIRST = [
+        "Aldric","Benedict","Cassius","Dorian","Edmund","Flavian","Gerald","Humphrey",
+        "Isolde","Jasmine","Kira","Leopold","Mabel","Neville","Octavia","Percival",
+        "Quincy","Rosalind","Seward","Tilda","Upton","Viola","Weston","Ysabel","Zorn",
+        "Agnes","Bertram","Constance","Draven","Elspeth","Fiona","Gregory","Helena",
+    ]
+    _MGR_LAST = [
+        "the Able","the Bold","Ironhand","Silverquill","the Shrewd","of Ashford",
+        "Coldwater","Emberstone","of the Guilds","Goldsworth","Farsight","Briarwick",
+        "Copperlock","of the Watch","Saltmarsh","Blackledger","Fairweather","the Keen",
+    ]
+
+    def _random_name(self) -> str:
+        import random
+        return (f"{random.choice(self._MGR_FIRST)} "
+                f"{random.choice(self._MGR_LAST)}")
+
+    # ── Hire dialog ───────────────────────────────────────────────────────────
+
+    def _do_hire(self) -> None:
+        g = self.game
+        # Build a list of available manager types (license check)
+        available = []
+        for mt, defn in MANAGER_DEFS.items():
+            req   = defn.get("license")
+            owned = (req is None or req in g.licenses)
+            # Only one manager of each type at a time
+            already = any(m.manager_type == mt.value for m in g.hired_managers)
+            available.append((mt, defn, owned, already))
+
+        choices = []
+        for mt, defn, owned, already in available:
+            status = ("✓ Hired" if already
+                      else ("🔒 Need license" if not owned else "Available"))
+            color_note = "" if already or owned else " [Locked]"
+            choices.append(
+                f"{defn['icon']}  {mt.value}  —  {defn['wage']:.0f}g/wk  "
+                f"[{status}]{color_note}"
+            )
+
+        idx = ChoiceDialog(self, "Choose a manager type to hire:", choices,
+                           "Hire Manager").wait()
+        if idx is None:
+            return
+        mt, defn, owned, already = available[idx]
+        if already:
+            self.msg.warn(f"You already have a {mt.value} hired.")
+            return
+        if not owned:
+            req = defn.get("license")
+            self.msg.err(f"You need a {req.value} to hire this manager.")
+            return
+
+        wage = defn["wage"]
+        # Ask confirmation
+        name = self._random_name()
+        confirm_text = (
+            f"Hire {name} as {mt.value}?\n\n"
+            f"Weekly wage: {wage:.0f}g/week\n"
+            f"Starting efficiency: 65% (Lv1)\n\n"
+            f"They will earn XP from actions and level up automatically.\n"
+            f"You can fire them at any time."
+        )
+        if not ConfirmDialog(self, confirm_text, "Hire Manager").wait():
+            return
+
+        cfg = dict(_MANAGER_DEFAULT_CONFIGS.get(mt.value, {}))
+        mgr = HiredManager(
+            manager_type = mt.value,
+            name         = name,
+            weekly_wage  = wage,
+            config       = cfg,
+        )
+        g.hired_managers.append(mgr)
+        g._log_trade(f"Hired {name} as {mt.value} at {wage:.0f}g/wk")
+        self.msg.ok(f"Hired {name} as {mt.value}.")
+        self._selected_mgr_idx = len(g.hired_managers) - 1
+        self.app.refresh()
+
+    # ── Fire ─────────────────────────────────────────────────────────────────
+
+    def _do_fire(self, mgr: "HiredManager", idx: int) -> None:
+        if not ConfirmDialog(self,
+                             f"Fire {mgr.name}?\n\nThey will stop working immediately.\n"
+                             "XP and history will be lost.",
+                             "Fire Manager").wait():
+            return
+        g = self.game
+        if 0 <= idx < len(g.hired_managers):
+            g.hired_managers.pop(idx)
+            g._log_trade(f"Fired manager {mgr.name} ({mgr.manager_type})")
+        self._selected_mgr_idx = -1
+        self.msg.ok(f"Fired {mgr.name}.")
+        self.app.refresh()
+
+    # ── Configure ────────────────────────────────────────────────────────────
+
+    def _do_configure(self, mgr: "HiredManager", idx: int) -> None:
+        """Open a configuration dialog for a specific manager type."""
+        mt = mgr.type_enum()
+        if   mt == ManagerType.BUSINESS_FOREMAN:   self._cfg_business_foreman(mgr)
+        elif mt == ManagerType.TRADE_STEWARD:       self._cfg_trade_steward(mgr)
+        elif mt == ManagerType.PROPERTY_STEWARD:    self._cfg_property_steward(mgr)
+        elif mt == ManagerType.CONTRACT_AGENT:      self._cfg_contract_agent(mgr)
+        elif mt == ManagerType.LENDING_ADVISOR:     self._cfg_lending_advisor(mgr)
+        elif mt == ManagerType.INVESTMENT_BROKER:   self._cfg_investment_broker(mgr)
+        elif mt == ManagerType.FUND_CUSTODIAN:      self._cfg_fund_custodian(mgr)
+        elif mt == ManagerType.CAMPAIGN_HANDLER:    self._cfg_campaign_handler(mgr)
+        elif mt == ManagerType.SMUGGLING_HANDLER:   self._cfg_smuggling_handler(mgr)
+        self.app.refresh()
+
+    def _cfg_business_foreman(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg               = mgr.config
+        repair_var        = tk.BooleanVar(value=cfg.get("auto_repair", True))
+        hire_var          = tk.BooleanVar(value=cfg.get("auto_hire", True))
+        fire_lazy_var     = tk.BooleanVar(value=cfg.get("auto_fire_lazy", False))
+        threshold_var     = tk.StringVar(value=str(cfg.get("repair_threshold", 500)))
+        min_prod_var      = tk.StringVar(value=str(cfg.get("min_worker_productivity", 0.3)))
+        max_wage_var      = tk.StringVar(value=str(cfg.get("max_wage_per_worker", 50.0)))
+
+        tk.Label(dlg, text="Business Foreman — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        tk.Checkbutton(body, text="Auto-repair broken businesses",
+                       variable=repair_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=0, column=0, columnspan=3, sticky="w")
+        tk.Checkbutton(body, text="Auto-hire workers to fill slots",
+                       variable=hire_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=1, column=0, columnspan=3, sticky="w")
+        tk.Checkbutton(body, text="Auto-fire lazy / overpaid workers",
+                       variable=fire_lazy_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=2, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Max repair cost (g):",          threshold_var, ""),
+            ("Min worker productivity (0–1):", min_prod_var,  "fire below this value"),
+            ("Max wage per worker (g):",       max_wage_var,  "fire above this value"),
+        ], start=3):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_repair"]             = repair_var.get()
+                cfg["auto_hire"]               = hire_var.get()
+                cfg["auto_fire_lazy"]          = fire_lazy_var.get()
+                cfg["repair_threshold"]        = float(threshold_var.get())
+                cfg["min_worker_productivity"] = max(0.0, min(1.0, float(min_prod_var.get())))
+                cfg["max_wage_per_worker"]     = float(max_wage_var.get())
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_trade_steward(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg              = mgr.config
+        min_q_var        = tk.StringVar(value=str(cfg.get("sell_min_quantity", 1)))
+        keep_var         = tk.StringVar(value=str(cfg.get("keep_quantity", 0)))
+        max_buy_var      = tk.StringVar(value=str(cfg.get("max_buy_gold", 200.0)))
+        profit_var       = tk.StringVar(value=str(cfg.get("min_profit_pct", 0.08)))
+        patience_var     = tk.StringVar(value=str(cfg.get("patience_days", 5)))
+        max_travel_var   = tk.StringVar(value=str(cfg.get("max_travel_days", 2)))
+        sell_biz_var     = tk.BooleanVar(value=cfg.get("sell_business_output", True))
+        sell_purch_var   = tk.BooleanVar(value=cfg.get("sell_purchased_goods", True))
+        buy_resale_var   = tk.BooleanVar(value=cfg.get("auto_buy_for_resale", False))
+        allow_travel_var = tk.BooleanVar(value=cfg.get("allow_travel", False))
+
+        tk.Label(dlg, text="Trade Steward — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+
+        # ── Numeric fields ────────────────────────────────────────────────
+        numeric_rows = [
+            ("Min quantity to sell:",                       min_q_var,    "items"),
+            ("Always keep at least:",                       keep_var,     "items"),
+            ("Max gold to spend buying for resale:",        max_buy_var,  "g/day"),
+            ("Target profit above cost (e.g. 0.08 = 8%):", profit_var,   ""),
+            ("Days to hold before accepting break-even:",   patience_var, "days"),
+            ("Max travel distance (days):",                 max_travel_var, "days"),
+        ]
+        for r, (lbl, var, unit) in enumerate(numeric_rows):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(
+                         row=r, column=0, sticky="w", pady=3)
+            tk.Entry(body, textvariable=var, width=8,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if unit:
+                tk.Label(body, text=unit, bg=_DIALOG_BG,
+                         fg=T["grey"], font=FONT_FANTASY_S).grid(row=r, column=2, sticky="w")
+
+        row_off = len(numeric_rows)
+        # ── Boolean flags ─────────────────────────────────────────────────
+        bool_rows = [
+            (sell_biz_var,     "Sell business-produced goods (recommended on)"),
+            (sell_purch_var,   "Sell manually purchased goods via P&L rules"),
+            (buy_resale_var,   "Auto-buy cheap goods for resale"),
+            (allow_travel_var, "Allow steward to travel independently to better markets"),
+        ]
+        for i, (var, text) in enumerate(bool_rows):
+            tk.Checkbutton(body, text=text, variable=var,
+                           bg=_DIALOG_BG, fg=T["fg"],
+                           selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                           font=FONT_FANTASY_S).grid(
+                               row=row_off + i, column=0, columnspan=3, sticky="w")
+
+        # ── Hint ──────────────────────────────────────────────────────────
+        hint = ("With travel enabled the steward moves independently to sell\n"
+                "goods at better prices.  Travel costs (3g\u00d7days) come from\n"
+                "your gold, and the steward is exposed to road risks.\n"
+                "At L1 the steward covers wages+travel; higher levels profit.")
+        tk.Label(body, text=hint, bg=_DIALOG_BG, fg=T["fg_dim"],
+                 font=FONT_SMALL, justify="left").grid(
+                     row=row_off + len(bool_rows), column=0, columnspan=3,
+                     sticky="w", pady=(6, 0))
+
+        def _save():
+            try:
+                cfg["sell_min_quantity"]    = int(min_q_var.get())
+                cfg["keep_quantity"]        = int(keep_var.get())
+                cfg["max_buy_gold"]         = float(max_buy_var.get())
+                cfg["min_profit_pct"]       = float(profit_var.get())
+                cfg["patience_days"]        = int(patience_var.get())
+                cfg["max_travel_days"]      = int(max_travel_var.get())
+                cfg["sell_business_output"] = sell_biz_var.get()
+                cfg["sell_purchased_goods"] = sell_purch_var.get()
+                cfg["auto_buy_for_resale"]  = buy_resale_var.get()
+                cfg["allow_travel"]         = allow_travel_var.get()
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_property_steward(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg             = mgr.config
+        auto_lease_var  = tk.BooleanVar(value=cfg.get("auto_lease", True))
+        reject_risk_v   = tk.BooleanVar(value=cfg.get("reject_risky_tenants", False))
+        auto_repair_var = tk.BooleanVar(value=cfg.get("auto_repair", True))
+        evict_var       = tk.BooleanVar(value=cfg.get("auto_evict_low_condition", False))
+        min_cond_var    = tk.StringVar(value=str(cfg.get("min_condition_to_repair", 0.55)))
+        max_repair_var  = tk.StringVar(value=str(cfg.get("max_repair_cost", 1000.0)))
+        evict_thr_var   = tk.StringVar(value=str(cfg.get("evict_condition_threshold", 0.30)))
+
+        tk.Label(dlg, text="Property Steward — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        for r, (txt, var) in enumerate([
+            ("Auto-lease vacant properties",           auto_lease_var),
+            ("Reject risky tenants (safer income)",    reject_risk_v),
+            ("Auto-repair low-condition properties",   auto_repair_var),
+            ("Auto-evict tenants to allow repairs",    evict_var),
+        ]):
+            tk.Checkbutton(body, text=txt, variable=var,
+                           bg=_DIALOG_BG, fg=T["fg"],
+                           selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                           font=FONT_FANTASY_S).grid(row=r, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Repair when condition below (0–1):",   min_cond_var,   "e.g. 0.55 = 55%"),
+            ("Max repair cost (g):",                  max_repair_var, "skip costlier repairs"),
+            ("Evict if condition below (0–1):",       evict_thr_var,  "needs auto-evict enabled"),
+        ], start=4):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_lease"]                = auto_lease_var.get()
+                cfg["reject_risky_tenants"]      = reject_risk_v.get()
+                cfg["auto_repair"]               = auto_repair_var.get()
+                cfg["auto_evict_low_condition"]  = evict_var.get()
+                cfg["min_condition_to_repair"]   = max(0.0, min(1.0, float(min_cond_var.get())))
+                cfg["max_repair_cost"]           = float(max_repair_var.get())
+                cfg["evict_condition_threshold"] = max(0.0, min(1.0, float(evict_thr_var.get())))
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_contract_agent(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg              = mgr.config
+        fulfill_var      = tk.BooleanVar(value=cfg.get("auto_fulfill", True))
+        procure_var      = tk.BooleanVar(value=cfg.get("auto_procure", True))
+        min_profit_var   = tk.StringVar(value=str(cfg.get("min_profit_per_unit", 0.5)))
+        max_days_var     = tk.StringVar(value=str(cfg.get("max_deadline_days", 999)))
+        max_procure_var  = tk.StringVar(value=str(cfg.get("max_procure_gold", 300.0)))
+
+        tk.Label(dlg, text="Contract Agent — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        tk.Checkbutton(body, text="Auto-fulfill contracts from inventory",
+                       variable=fulfill_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=0, column=0, columnspan=3, sticky="w")
+        tk.Checkbutton(body, text="Auto-procure missing goods from market",
+                       variable=procure_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=1, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Min profit per unit (g):",    min_profit_var, ""),
+            ("Only work contracts ≤ days:",  max_days_var,   "999 = all contracts"),
+            ("Max procurement budget (g):", max_procure_var, "per procurement event"),
+        ], start=2):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_fulfill"]        = fulfill_var.get()
+                cfg["auto_procure"]        = procure_var.get()
+                cfg["min_profit_per_unit"] = float(min_profit_var.get())
+                cfg["max_deadline_days"]   = int(max_days_var.get())
+                cfg["max_procure_gold"]    = float(max_procure_var.get())
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_lending_advisor(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg               = mgr.config
+        auto_var          = tk.BooleanVar(value=cfg.get("auto_issue", True))
+        prefer_short_var  = tk.BooleanVar(value=cfg.get("prefer_short_loans", False))
+        write_off_var     = tk.BooleanVar(value=cfg.get("auto_write_off", False))
+        min_cw_var        = tk.StringVar(value=str(cfg.get("min_creditworthiness", 0.7)))
+        max_gold_var      = tk.StringVar(value=str(cfg.get("max_loan_amount", 300)))
+        max_loans_var     = tk.StringVar(value=str(cfg.get("max_active_loans", 5)))
+        max_total_var     = tk.StringVar(value=str(cfg.get("max_total_loaned", 1000.0)))
+
+        tk.Label(dlg, text="Lending Advisor — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        for r, (txt, var) in enumerate([
+            ("Auto-issue loans to qualified applicants",  auto_var),
+            ("Prefer short loans (≤8 weeks only)",        prefer_short_var),
+            ("Auto write-off fully defaulted old loans",  write_off_var),
+        ]):
+            tk.Checkbutton(body, text=txt, variable=var,
+                           bg=_DIALOG_BG, fg=T["fg"],
+                           selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                           font=FONT_FANTASY_S).grid(row=r, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Min creditworthiness:",        min_cw_var,    "0.5=risky, 1.5=safe"),
+            ("Max amount per loan (g):",     max_gold_var,  ""),
+            ("Max active loans at once:",    max_loans_var, ""),
+            ("Max total outstanding (g):",   max_total_var, "across all active loans"),
+        ], start=3):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_issue"]           = auto_var.get()
+                cfg["prefer_short_loans"]   = prefer_short_var.get()
+                cfg["auto_write_off"]       = write_off_var.get()
+                cfg["min_creditworthiness"] = max(0.5, min(1.5, float(min_cw_var.get())))
+                cfg["max_loan_amount"]      = float(max_gold_var.get())
+                cfg["max_active_loans"]     = int(max_loans_var.get())
+                cfg["max_total_loaned"]     = float(max_total_var.get())
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_investment_broker(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg           = mgr.config
+        auto_buy_var  = tk.BooleanVar(value=cfg.get("auto_buy", True))
+        auto_sell_var = tk.BooleanVar(value=cfg.get("auto_sell", True))
+        max_per       = tk.StringVar(value=str(cfg.get("max_investment_per_stock", 200)))
+        max_total     = tk.StringVar(value=str(cfg.get("max_portfolio_value", 1000)))
+        risk          = tk.StringVar(value=str(cfg.get("risk_tolerance", 0.5)))
+        min_gain      = tk.StringVar(value=str(cfg.get("min_gain_to_sell", 0.15)))
+        stop_loss     = tk.StringVar(value=str(cfg.get("stop_loss_pct", 0.20)))
+
+        tk.Label(dlg, text="Investment Broker — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        tk.Checkbutton(body, text="Auto-buy stocks on positive signal",
+                       variable=auto_buy_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=0, column=0, columnspan=3, sticky="w")
+        tk.Checkbutton(body, text="Auto-sell stocks on profit/loss signal",
+                       variable=auto_sell_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=1, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Max invest per stock (g):",  max_per,   ""),
+            ("Max portfolio total (g):",   max_total, ""),
+            ("Risk tolerance (0–1):",      risk,      "0=conservative, 1=aggressive"),
+            ("Min gain % to sell:",        min_gain,  "e.g. 0.15 = sell at +15%"),
+            ("Stop-loss % (sell on loss):",stop_loss,  "e.g. 0.20 = cut at −20%"),
+        ], start=2):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_buy"]                 = auto_buy_var.get()
+                cfg["auto_sell"]                = auto_sell_var.get()
+                cfg["max_investment_per_stock"] = float(max_per.get())
+                cfg["max_portfolio_value"]      = float(max_total.get())
+                cfg["risk_tolerance"]           = max(0.0, min(1.0, float(risk.get())))
+                cfg["min_gain_to_sell"]         = max(0.0, float(min_gain.get()))
+                cfg["stop_loss_pct"]            = max(0.0, float(stop_loss.get()))
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_fund_custodian(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg           = mgr.config
+        auto_var      = tk.BooleanVar(value=cfg.get("auto_accept", True))
+        max_cl_var    = tk.StringVar(value=str(cfg.get("max_clients", 4)))
+        min_cp_var    = tk.StringVar(value=str(cfg.get("min_client_capital", 300)))
+        min_fee_var   = tk.StringVar(value=str(cfg.get("min_fee_rate", 0.01)))
+        min_dur_var   = tk.StringVar(value=str(cfg.get("min_duration_days", 30)))
+
+        tk.Label(dlg, text="Fund Custodian — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        tk.Checkbutton(body, text="Auto-accept fund clients",
+                       variable=auto_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=0, column=0, columnspan=3, sticky="w")
+        for r, (lbl, var, tip) in enumerate([
+            ("Max active clients:",          max_cl_var,  ""),
+            ("Min client capital (g):",      min_cp_var,  ""),
+            ("Min fee rate (%):",            min_fee_var, "e.g. 0.01 = 1%/month"),
+            ("Min contract duration (days):",min_dur_var, "reject short-term clients"),
+        ], start=1):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+
+        def _save():
+            try:
+                cfg["auto_accept"]        = auto_var.get()
+                cfg["max_clients"]        = int(max_cl_var.get())
+                cfg["min_client_capital"] = float(min_cp_var.get())
+                cfg["min_fee_rate"]       = max(0.0, float(min_fee_var.get()))
+                cfg["min_duration_days"]  = max(0, int(min_dur_var.get()))
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_campaign_handler(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg            = mgr.config
+        freq_var       = tk.StringVar(value=str(cfg.get("campaign_frequency_days", 14)))
+        area_var       = tk.StringVar(value=cfg.get("preferred_area", "CITY"))
+        max_cost_var   = tk.StringVar(value=str(cfg.get("max_campaign_cost", 50.0)))
+        skip_loss_var  = tk.BooleanVar(value=cfg.get("skip_if_last_loss", False))
+
+        tk.Label(dlg, text="Campaign Handler — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        tk.Label(body, text="Campaign frequency (days):", bg=_DIALOG_BG,
+                 fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=0, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=freq_var, width=10,
+                 bg=T["bg_button"], fg=T["fg"],
+                 insertbackground=T["fg"]).grid(row=0, column=1, sticky="w", padx=8)
+        tk.Label(body, text="Max campaign cost (g):", bg=_DIALOG_BG,
+                 fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=1, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=max_cost_var, width=10,
+                 bg=T["bg_button"], fg=T["fg"],
+                 insertbackground=T["fg"]).grid(row=1, column=1, sticky="w", padx=8)
+        tk.Label(body, text="Target area:", bg=_DIALOG_BG,
+                 fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=2, column=0, sticky="w", pady=4)
+        area_choices = [a.name for a in Area]
+        area_combo = ttk.Combobox(body, textvariable=area_var,
+                                  values=area_choices, state="readonly", width=14)
+        area_combo.grid(row=2, column=1, sticky="w", padx=8)
+        tk.Checkbutton(body, text="Skip campaign if last run was a net loss",
+                       variable=skip_loss_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+
+        def _save():
+            try:
+                cfg["campaign_frequency_days"] = max(1, int(freq_var.get()))
+                cfg["max_campaign_cost"]       = float(max_cost_var.get())
+                cfg["preferred_area"]          = area_var.get()
+                cfg["skip_if_last_loss"]       = skip_loss_var.get()
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
+
+    def _cfg_smuggling_handler(self, mgr: "HiredManager") -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure {mgr.name}")
+        dlg.configure(bg=_DIALOG_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        cfg            = mgr.config
+        heat_var       = tk.StringVar(value=str(cfg.get("max_heat", 60)))
+        freq_var       = tk.StringVar(value=str(cfg.get("ops_frequency_days", 7)))
+        max_risk_var   = tk.StringVar(value=str(cfg.get("max_bust_risk", 0.25)))
+        min_profit_var = tk.StringVar(value=str(cfg.get("min_net_profit", 0.0)))
+        pause_var      = tk.BooleanVar(value=cfg.get("heat_pause_after_bust", True))
+
+        tk.Label(dlg, text="Smuggling Handler — Config",
+                 font=FONT_FANTASY_BOLD, bg=_DIALOG_BG, fg=T["cyan"]).pack(padx=20, pady=(12, 4))
+        tk.Frame(dlg, bg=T["border_light"], height=1).pack(fill="x", padx=10)
+        body = tk.Frame(dlg, bg=_DIALOG_BG)
+        body.pack(padx=20, pady=8)
+        for r, (lbl, var, tip) in enumerate([
+            ("Max heat to operate (0–100):",      heat_var,       "pause above this level"),
+            ("Operations frequency (days):",       freq_var,       ""),
+            ("Max bust risk (0–1):",               max_risk_var,   "e.g. 0.25 = 25% chance"),
+            ("Min expected net profit (g):",       min_profit_var, "skip unprofitable runs"),
+        ]):
+            tk.Label(body, text=lbl, bg=_DIALOG_BG,
+                     fg=T["fg_dim"], font=FONT_FANTASY_S).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var, width=10,
+                     bg=T["bg_button"], fg=T["fg"],
+                     insertbackground=T["fg"]).grid(row=r, column=1, sticky="w", padx=8)
+            if tip:
+                tk.Label(body, text=tip, bg=_DIALOG_BG,
+                         fg=T["fg_dim"], font=FONT_SMALL).grid(row=r, column=2, sticky="w", padx=4)
+        tk.Checkbutton(body, text="Pause 3 days after a bust",
+                       variable=pause_var, bg=_DIALOG_BG, fg=T["fg"],
+                       selectcolor=T["bg_button"], activebackground=_DIALOG_BG,
+                       font=FONT_FANTASY_S).grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+
+        def _save():
+            try:
+                cfg["max_heat"]             = max(0, min(100, int(heat_var.get())))
+                cfg["ops_frequency_days"]   = max(1, int(freq_var.get()))
+                cfg["max_bust_risk"]        = max(0.0, min(1.0, float(max_risk_var.get())))
+                cfg["min_net_profit"]       = float(min_profit_var.get())
+                cfg["heat_pause_after_bust"] = pause_var.get()
+            except ValueError:
+                pass
+            dlg.destroy()
+
+        tk.Frame(dlg, bg=T["border"], height=1).pack(fill="x", padx=10, pady=6)
+        btn_row = tk.Frame(dlg, bg=_DIALOG_BG)
+        btn_row.pack(padx=20, pady=(0, 12))
+        ttk.Button(btn_row, text="Save", style="OK.TButton",
+                   command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", style="MT.TButton",
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.wait_window()
 
 
 class HelpScreen(Screen):
@@ -7639,6 +10156,41 @@ class SettingsScreen(Screen):
                  font=FONT_MONO_S, bg=T["bg"], fg=T["grey"]).pack(anchor="w", padx=20, pady=(0, 4))
 
         _sep()
+        # ── INTERACTIONS section ──────────────────────────────────────────────
+        _head("\U0001f5b1  Interactions")
+        self._dbl_var = tk.BooleanVar()
+        tk.Checkbutton(
+            main, text="Double-click rows to perform primary action  (buy, sell, accept, travel…)",
+            variable=self._dbl_var, command=self._on_dbl_change,
+            bg=T["bg"], fg=T["fg_header"], selectcolor=T["bg_panel"],
+            activebackground=T["bg_hover"], font=FONT_BOLD,
+        ).pack(anchor="w", padx=12, pady=3)
+        tk.Label(main,
+                 text="  Trade: buy or sell · Contracts: accept / fulfill · Travel: depart · Listings: buy · Smuggling: buy / sell",
+                 font=FONT_MONO_S, bg=T["bg"], fg=T["grey"]).pack(anchor="w", padx=20, pady=(0, 2))
+        self._haggle_rc_var = tk.BooleanVar()
+        tk.Checkbutton(
+            main, text="Right-click an item in the Trade Buy table to haggle on it",
+            variable=self._haggle_rc_var, command=self._on_haggle_rc_change,
+            bg=T["bg"], fg=T["fg_header"], selectcolor=T["bg_panel"],
+            activebackground=T["bg_hover"], font=FONT_BOLD,
+        ).pack(anchor="w", padx=12, pady=3)
+        tk.Label(main,
+                 text="  Right-click selects the item and triggers an instant haggle attempt for a price discount",
+                 font=FONT_MONO_S, bg=T["bg"], fg=T["grey"]).pack(anchor="w", padx=20, pady=(0, 4))
+
+        self._sig_var = tk.BooleanVar()
+        tk.Checkbutton(
+            main, text="Show signing document when accepting licenses, loans, contracts, and real estate",
+            variable=self._sig_var, command=self._on_sig_change,
+            bg=T["bg"], fg=T["fg_header"], selectcolor=T["bg_panel"],
+            activebackground=T["bg_hover"], font=FONT_BOLD,
+        ).pack(anchor="w", padx=12, pady=3)
+        tk.Label(main,
+                 text="  Parchment popup with quill cursor — draw your signature or just click Sign & Accept",
+                 font=FONT_MONO_S, bg=T["bg"], fg=T["grey"]).pack(anchor="w", padx=20, pady=(0, 4))
+
+        _sep()
         # ── AUDIO section ─────────────────────────────────────────────────
         _head("\U0001f50a  Audio")
         self._audio_status = tk.Label(main, text="", font=FONT_MONO_S,
@@ -7765,6 +10317,12 @@ class SettingsScreen(Screen):
         self._scale_lbl.config(text=f"{int(_UI_SCALE * 100)}%")
         if hasattr(self, "_anim_var"):
             self._anim_var.set(s.profit_flash)
+        if hasattr(self, "_dbl_var"):
+            self._dbl_var.set(s.double_click_action)
+        if hasattr(self, "_haggle_rc_var"):
+            self._haggle_rc_var.set(s.right_click_haggle)
+        if hasattr(self, "_sig_var"):
+            self._sig_var.set(s.enable_signatures)
         snd = self.app.sound
         self._audio_status.config(text=f"  {snd.status_string()}")
         self._music_enabled_var.set(s.music_enabled)
@@ -7804,6 +10362,24 @@ class SettingsScreen(Screen):
         self.app.profit_animations = self.game.settings.profit_flash
         self.game.settings.save()
         self.msg.ok(f"Profit animations {'ON' if self.app.profit_animations else 'OFF'}.")
+
+    def _on_dbl_change(self) -> None:
+        self.game.settings.double_click_action = bool(self._dbl_var.get())
+        self.game.settings.save()
+        state = "ON" if self.game.settings.double_click_action else "OFF"
+        self.msg.ok(f"Double-click quick action {state}.")
+
+    def _on_haggle_rc_change(self) -> None:
+        self.game.settings.right_click_haggle = bool(self._haggle_rc_var.get())
+        self.game.settings.save()
+        state = "ON" if self.game.settings.right_click_haggle else "OFF"
+        self.msg.ok(f"Right-click haggle {state}.")
+
+    def _on_sig_change(self) -> None:
+        self.game.settings.enable_signatures = bool(self._sig_var.get())
+        self.game.settings.save()
+        state = "ON" if self.game.settings.enable_signatures else "OFF"
+        self.msg.ok(f"Signature documents {state}.")
 
     def _on_scale_move(self, val: str) -> None:
         v = round(float(val) * 4) / 4   # snap to 0.25 steps
@@ -7873,6 +10449,195 @@ class SettingsScreen(Screen):
                 self.game.settings.hotkeys.get(action, "")))
         self.msg.ok("All keybindings reset to defaults.")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAMBLE SCREEN  —  gambling hub; currently hosts the Mystery Coffer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GambleScreen(Screen):
+    """
+    Gambling hub screen.  Currently offers the Mystery Coffer (125g/spin).
+    The animated loot-reel popup is handled by MysteriousCofferDialog.
+    """
+
+    def build(self) -> None:
+        outer = ttk.Frame(self, style="MT.TFrame")
+        outer.pack(fill="both", expand=True)
+
+        # Header
+        hdr = tk.Frame(outer, bg=T["bg_panel"])
+        hdr.pack(fill="x")
+        tk.Frame(outer, bg=T["border_light"], height=2).pack(fill="x")
+        tk.Label(hdr, text="🎲  Gambling Den",
+                 font=FONT_FANTASY_TITLE,
+                 bg=T["bg_panel"], fg=T["yellow"],
+                 padx=16, pady=10).pack(side="left")
+        ttk.Button(hdr, text="◀  Back", style="MT.TButton",
+                   command=self.app.go_back).pack(side="right", padx=12, pady=8)
+
+        body = ScrollableFrame(outer)
+        body.pack(fill="both", expand=True)
+        inner = body.inner
+
+        # Status row (gold / mercy counter)
+        status_row = tk.Frame(inner, bg=T["bg"])
+        status_row.pack(fill="x", padx=20, pady=(12, 0))
+        self._gold_lbl = tk.Label(status_row, text="",
+                                  font=FONT_FANTASY_BOLD,
+                                  bg=T["bg"], fg=T["yellow"], anchor="w")
+        self._gold_lbl.pack(side="left")
+        self._mercy_lbl = tk.Label(status_row, text="",
+                                   font=FONT_FANTASY_S,
+                                   bg=T["bg"], fg=T["grey"], anchor="e")
+        self._mercy_lbl.pack(side="right")
+
+        # Mystery Coffer card
+        self._build_coffer_card(inner)
+
+        # Rarity odds reference table
+        self._build_odds_table(inner)
+
+    # ── Card widget ───────────────────────────────────────────────────────────
+
+    def _build_coffer_card(self, parent: tk.Widget) -> None:
+        wrapper = tk.Frame(parent, bg=T["bg"])
+        wrapper.pack(fill="x", padx=50, pady=18)
+
+        # Load coffer image (thumbnail for the card)
+        self._card_img = None
+        cpath = os.path.join(_HERE, "LootCoffer.png")
+        if os.path.isfile(cpath):
+            try:
+                raw = tk.PhotoImage(file=cpath)
+                w, h = raw.width(), raw.height()
+                sx = max(1, w // 110)
+                sy = max(1, h // 100)
+                s  = max(sx, sy)
+                self._card_img = raw.subsample(s, s)
+            except Exception:
+                self._card_img = None
+
+        bord  = tk.Frame(wrapper, bg="#8b6914")
+        bord.pack(fill="x")
+        card  = tk.Frame(bord, bg=T["bg_panel"])
+        card.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Left accent bar
+        tk.Frame(card, bg="#ffd700", width=5).pack(side="left", fill="y")
+
+        cody = tk.Frame(card, bg=T["bg_panel"])
+        cody.pack(side="left", fill="both", expand=True, padx=18, pady=14)
+
+        top_row = tk.Frame(cody, bg=T["bg_panel"])
+        top_row.pack(anchor="w")
+
+        if self._card_img:
+            tk.Label(top_row, image=self._card_img,
+                     bg=T["bg_panel"], bd=0).pack(side="left", padx=(0, 14))
+
+        title_col = tk.Frame(top_row, bg=T["bg_panel"])
+        title_col.pack(side="left", anchor="w")
+        tk.Label(title_col, text="Mystery Coffer",
+                 font=FONT_FANTASY_TITLE,
+                 bg=T["bg_panel"], fg=T["yellow"],
+                 anchor="w").pack(anchor="w")
+        tk.Label(title_col,
+                 text="Spin the wheel — rare treasures await the bold!",
+                 font=FONT_FANTASY_S,
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 anchor="w").pack(anchor="w", pady=(2, 0))
+        tk.Label(title_col,
+                 text="Cost: 200 Gold per spin  (mercy spin: FREE)",
+                 font=FONT_FANTASY_BOLD,
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 anchor="w").pack(anchor="w", pady=(4, 0))
+
+        ttk.Button(cody,
+                   text="🎲  Open the Coffer  (200g)",
+                   style="MT.TButton",
+                   command=self._open_coffer).pack(anchor="w", pady=(10, 4))
+
+    # ── Odds reference table ──────────────────────────────────────────────────
+
+    def _build_odds_table(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg=T["bg_panel"])
+        frame.pack(fill="x", padx=20, pady=(0, 20))
+
+        tk.Label(frame, text="  Drop Chances & Prizes",
+                 font=FONT_FANTASY_BOLD,
+                 bg=T["bg_panel"], fg=T["fg_header"],
+                 pady=6).pack(anchor="w")
+        tk.Frame(frame, bg=T["border"], height=1).pack(fill="x")
+
+        rows = [
+            ("Common",            "51.4%",  "#777777", "2–3× Salt  or  Salted Fish"),
+            ("Uncommon",          "22.0%",  "#28c434", "2–3× Rare Spices, Exotic Fruit, or Fine Glassware"),
+            ("Rare",              "12.0%",  "#3068ff", "2× Ivory, Gemstone, or Silk Cloth"),
+            ("Ultra Rare",        " 6.5%",  "#9e28f0", "3× Gemstone  or  2 Free Spins"),
+            ("Super Rare",        " 4.0%",  "#ff14a0", "500 Gold"),
+            ("Super Super Rare",  " 2.5%",  "#00c8ff", "5× Silk Cloth  or  4 Free Spins"),
+            ("Triple Super Rare", " 1.5%",  "#ff1a1a", "1,000 Gold"),
+            ("LEGENDARY",         " 0.1%",  "#ffd700", "5,000 Gold  +  10 Reputation"),
+        ]
+        for i, (name, pct, col, prize) in enumerate(rows):
+            rbg = T["bg_panel"] if i % 2 == 0 else T["bg_row_alt"]
+            row = tk.Frame(frame, bg=rbg)
+            row.pack(fill="x")
+            tk.Frame(row, bg=col, width=6).pack(side="left", fill="y")
+            tk.Label(row, text=f"  {name}",
+                     font=FONT_FANTASY_S, bg=rbg, fg=col,
+                     width=20, anchor="w").pack(side="left", pady=3)
+            tk.Label(row, text=pct, font=FONT_MONO,
+                     bg=rbg, fg=T["fg"], width=7, anchor="e").pack(side="left")
+            tk.Label(row, text=f"   {prize}",
+                     font=FONT_FANTASY_S, bg=rbg, fg=T["fg_dim"],
+                     anchor="w").pack(side="left", fill="x")
+
+        tk.Frame(frame, bg=T["border"], height=1).pack(fill="x")
+        note = (
+            "★ Mercy system: every Common result adds 1 to your mercy counter.  "
+            "At 15 the next spin is FREE and doubles ALL prizes (×2 rewards, same odds).  "
+            "Mercy only resets after being consumed — good rolls never reset it."
+        )
+        tk.Label(frame, text=note,
+                 font=FONT_FANTASY_S, bg=T["bg_panel"], fg=T["fg_dim"],
+                 wraplength=700, justify="left", padx=8, pady=6,
+                 anchor="w").pack(anchor="w")
+
+    # ── Screen lifecycle ──────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        g     = self.game
+        mercy = g.settings.gamble_mercy
+        if hasattr(self, "_gold_lbl"):
+            self._gold_lbl.config(text=f"◆  {g.inventory.gold:,.0f} Gold")
+        if hasattr(self, "_mercy_lbl"):
+            if mercy >= 15:
+                self._mercy_lbl.config(
+                    text="⭐ MERCY ACTIVE — next roll: no common drops!",
+                    fg=T["yellow"])
+            elif mercy > 0:
+                self._mercy_lbl.config(
+                    text=f"Mercy: {mercy}/15",
+                    fg=T["grey"])
+            else:
+                self._mercy_lbl.config(text="Mercy: 0/15", fg=T["grey"])
+
+    def _open_coffer(self) -> None:
+        g     = self.game
+        mercy = g.settings.gamble_mercy
+        if mercy >= 15:
+            pass          # mercy spin is free
+        elif g.inventory.gold < 200:
+            self.msg.err("Not enough gold — you need 200g to spin the coffer.")
+            return
+        else:
+            g.inventory.gold -= 200.0
+        dlg = MysteriousCofferDialog(self.app, g, mercy)
+        dlg.open_and_wait()
+        self.app.refresh()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN MENU SCREEN  —  first fully implemented screen
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7892,6 +10657,7 @@ class MainMenuScreen(Screen):
         ("Inventory",     "inventory",  "ACTIONS",      "🎒", "Manage your cargo"),
         ("Rest & Wait",   "wait",       "ACTIONS",      "⌛", "Pass time & recover"),
         ("Businesses",    "businesses", "OPERATIONS",   "🏭", "Manage production"),
+        ("Managers",      "managers",   "OPERATIONS",   "👔", "Hire & manage NPC staff"),
         ("Finance",       "finance",    "OPERATIONS",   "🏦", "Banking & loans"),
         ("Contracts",     "contracts",  "OPERATIONS",   "📜", "Delivery orders"),
         ("Lending",       "lending",    "OPERATIONS",   "⊛",  "Issue citizen loans"),
@@ -7900,6 +10666,7 @@ class MainMenuScreen(Screen):
         ("Real Estate",   "real_estate","OPERATIONS",   "🏠", "Buy, build & lease property"),
         ("Skills",        "skills",     "OPERATIONS",   "⚡", "Improve your character"),
         ("Smuggling Den", "smuggling",  "OPERATIONS",   "🦝", "Black market deals"),
+        ("Gamble",        "gamble",     "OPERATIONS",   "🎲", "Try your luck at the Mystery Coffer"),
         ("Market Info",   "market",     "INTELLIGENCE", "📊", "Prices & trade routes"),
         ("News & Events", "news",       "INTELLIGENCE", "📰", "World events & impacts"),
         ("Progress",      "progress",   "PLAYER",       "🏆", "Stats & achievements"),
@@ -7938,8 +10705,9 @@ class MainMenuScreen(Screen):
         self._dash_alert.pack(anchor="e", fill="both", expand=True)
 
         # ── Card grid ─────────────────────────────────────────────────────
-        grid_frame = ttk.Frame(outer, style="MT.TFrame")
-        grid_frame.pack(fill="both", expand=True, padx=14, pady=(8, 4))
+        _scroll = ScrollableFrame(outer)
+        _scroll.pack(fill="both", expand=True, padx=14, pady=(8, 4))
+        grid_frame = _scroll.inner
 
         COL_N = 4
         for c in range(COL_N):
@@ -8140,15 +10908,16 @@ class GameApp(tk.Tk):
         "funds":      FundManagementScreen,
         "real_estate": RealEstateScreen,
         "reputation": InfluenceScreen,
+        "managers":   ManagersScreen,
         "help":       HelpScreen,
         "settings":   SettingsScreen,
+        "gamble":     GambleScreen,
     }
 
     def __init__(self) -> None:
         super().__init__()
         # ── Window setup ──────────────────────────────────────────────────
         self.title("Merchant Tycoon — Expanded Edition")
-        self.geometry(f"{self.WIN_W}x{self.WIN_H}")
         self.minsize(self.MIN_W, self.MIN_H)
         self.configure(bg=T["bg"])
 
@@ -8162,12 +10931,17 @@ class GameApp(tk.Tk):
             if hwnd_console:
                 ctypes.windll.user32.ShowWindow(hwnd_console, 0)  # SW_HIDE
 
-        # Centre on screen — deferred so the window is fully realized first
-        self.after(1, self._center_on_screen)
+        # Centre on screen immediately (after overrideredirect so position sticks).
+        # winfo_screenwidth/height are always available regardless of map state.
+        _sw = self.winfo_screenwidth()
+        _sh = self.winfo_screenheight()
+        _cx = max(0, (_sw - self.WIN_W) // 2)
+        _cy = max(0, (_sh - self.WIN_H) // 2)
+        self.geometry(f"{self.WIN_W}x{self.WIN_H}+{_cx}+{_cy}")
 
-        # Register window in taskbar (deferred so Win32 HWND is ready)
+        # Register window in taskbar (deferred so Win32 HWND is fully mapped)
         if sys.platform == "win32":
-            self.after(50, self._set_appwindow)
+            self.after(200, self._set_appwindow)
 
         # Apply theme
         apply_dark_theme(ttk.Style(self))
@@ -8301,10 +11075,14 @@ class GameApp(tk.Tk):
         self.message_bar.ok("Game saved.")
 
     def _minimize_window(self) -> None:
-        """Minimize using Win32 SW_MINIMIZE (works with overrideredirect)."""
+        """Minimize to taskbar (works with overrideredirect)."""
         if sys.platform == "win32":
             import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            # GetAncestor(GA_ROOT=2) walks up to the outermost top-level HWND
+            # that the shell tracks — more reliable than GetParent for
+            # overrideredirect windows where GetParent may return 0.
+            GA_ROOT = 2
+            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), GA_ROOT) or self.winfo_id()
             ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
         else:
             self.iconify()
@@ -8369,28 +11147,31 @@ class GameApp(tk.Tk):
 
     def _set_appwindow(self) -> None:
         """
-        Apply WS_EX_APPWINDOW extended style so the borderless window
-        still shows in the Windows taskbar and can be minimised via it.
+        Apply WS_EX_APPWINDOW so the borderless window appears in the taskbar
+        and minimises normally.
+
+        SetWindowPos(SWP_FRAMECHANGED) alone is insufficient — the Windows
+        shell only re-reads the extended style when the window is hidden then
+        shown again (withdraw + deiconify).
+        GetAncestor(GA_ROOT=2) is used instead of GetParent because Tkinter’s
+        winfo_id() returns the inner wrapper HWND; GetParent of that can be 0
+        for overrideredirect windows, while GetAncestor reliably walks to the
+        outermost top-level frame that the shell tracks.
         """
         import ctypes
         GWL_EXSTYLE      = -20
         WS_EX_APPWINDOW  = 0x00040000
         WS_EX_TOOLWINDOW = 0x00000080
-        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+        GA_ROOT          = 2
+        hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), GA_ROOT) or self.winfo_id()
         if hwnd:
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-            # Refresh style without hiding the window
-            SWP_NOMOVE      = 0x0002
-            SWP_NOSIZE      = 0x0001
-            SWP_NOZORDER    = 0x0004
-            SWP_NOACTIVATE  = 0x0010
-            SWP_FRAMECHANGED = 0x0020
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, 0, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-            )
+            # withdraw + deiconify forces the shell to re-register the window
+            # under its new extended style — SetWindowPos alone is not enough.
+            self.withdraw()
+            self.deiconify()
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

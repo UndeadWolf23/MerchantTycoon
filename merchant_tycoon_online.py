@@ -775,27 +775,56 @@ class CloudSaveManager:
 
 class LeaderboardManager:
     """
-    Global leaderboard — one row per player, upserted on each submission.
+    Global leaderboard — one row per player, ranked by net worth.
 
-    Required Supabase SQL:
-    ─────────────────────
+    Required Supabase SQL (migration from old schema):
+    ──────────────────────────────────────────────────
+        -- Add new columns (safe to run on existing table)
+        alter table leaderboard
+            add column if not exists net_worth   float  not null default 0.0,
+            add column if not exists player_name text   not null default '',
+            add column if not exists guild_name  text   not null default '',
+            add column if not exists title       text   not null default '',
+            add column if not exists lifetime_gold float not null default 0.0;
+
+        -- Performance index for ranking queries
+        create index if not exists leaderboard_net_worth_idx
+            on leaderboard (net_worth desc nulls last);
+
+        -- RLS (unchanged)
+        alter table leaderboard enable row level security;
+        create policy "read all"   on leaderboard for select using (true);
+        create policy "insert own" on leaderboard for insert
+            with check (auth.uid() = user_id);
+        create policy "update own" on leaderboard for update
+            using (auth.uid() = user_id);
+
+    Full schema (fresh install):
+    ────────────────────────────
         create table leaderboard (
-            id           uuid primary key default gen_random_uuid(),
-            user_id      uuid references auth.users not null unique,
-            username     text   not null,
-            score        bigint not null default 0,
-            day          int    not null default 0,
-            gold         float  not null default 0.0,
-            reputation   int    not null default 0,
-            area         text   not null default '',
-            updated_at   timestamptz default now()
+            id            uuid primary key default gen_random_uuid(),
+            user_id       uuid references auth.users not null unique,
+            username      text   not null default '',
+            player_name   text   not null default '',
+            title         text   not null default '',
+            guild_name    text   not null default '',
+            net_worth     float  not null default 0.0,
+            score         bigint not null default 0,
+            day           int    not null default 0,
+            gold          float  not null default 0.0,
+            lifetime_gold float  not null default 0.0,
+            reputation    int    not null default 0,
+            area          text   not null default '',
+            updated_at    timestamptz not null default now()
         );
         alter table leaderboard enable row level security;
-        create policy "read all"      on leaderboard for select using (true);
-        create policy "insert own"    on leaderboard for insert
+        create policy "read all"   on leaderboard for select using (true);
+        create policy "insert own" on leaderboard for insert
             with check (auth.uid() = user_id);
-        create policy "update own"    on leaderboard for update
+        create policy "update own" on leaderboard for update
             using (auth.uid() = user_id);
+        create index leaderboard_net_worth_idx
+            on leaderboard (net_worth desc nulls last);
     """
 
     def __init__(self, client: OnlineClient, auth: AuthManager) -> None:
@@ -816,16 +845,21 @@ class LeaderboardManager:
         gold: float,
         reputation: int,
         day: int,
+        net_worth: float = 0.0,
         lifetime_gold: float = 0.0,
         title: str = "",
+        player_name: str = "",
+        guild_name: str = "",
         area: str = "",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
         """
         Upsert the player's entry on the global leaderboard.
-        lifetime_gold  — total gold ever earned (monotonically increasing);
-                         used as the primary sort key.
-        title          — the player's currently equipped earned title.
+        net_worth     — primary ranking metric (total assets − liabilities).
+        lifetime_gold — monotonically increasing, used for secondary score.
+        title         — currently equipped earned title (display name).
+        player_name   — in-game merchant name (may differ from login username).
+        guild_name    — display name of the player's current guild, or "".
         """
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
@@ -835,13 +869,17 @@ class LeaderboardManager:
             payload  = {
                 "user_id":       self._auth.user_id,
                 "username":      username,
+                "player_name":   player_name or username,
                 "title":         title,
+                "guild_name":    guild_name,
+                "net_worth":     net_worth,
                 "score":         score,
                 "day":           day,
                 "gold":          gold,
                 "lifetime_gold": lifetime_gold,
                 "reputation":    reputation,
                 "area":          area,
+                "updated_at":    "now()",
             }
             result = self._client.post(
                 "/rest/v1/leaderboard",
@@ -850,7 +888,7 @@ class LeaderboardManager:
                 extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"},
             )
             if result.success:
-                result.data = {"score": score, "action": "submitted"}
+                result.data = {"score": score, "net_worth": net_worth, "action": "submitted"}
             return result
 
         if callback is None:
@@ -860,16 +898,17 @@ class LeaderboardManager:
 
     def fetch_top_scores(
         self,
-        limit: int = 50,
+        limit: int = 100,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Fetch the top *limit* entries ordered by lifetime_gold descending."""
+        """Fetch the top *limit* entries ordered by net_worth descending."""
         def _do() -> OnlineResult:
             return self._client.get(
                 "/rest/v1/leaderboard",
                 params={
-                    "select": "username,title,score,lifetime_gold,day,gold,reputation,area,updated_at",
-                    "order":  "lifetime_gold.desc",
+                    "select": "user_id,username,player_name,title,guild_name,"
+                              "net_worth,score,lifetime_gold,day,reputation,area,updated_at",
+                    "order":  "net_worth.desc.nullsfirst",
                     "limit":  str(limit),
                 },
             )
@@ -882,14 +921,14 @@ class LeaderboardManager:
     def fetch_my_rank(
         self, callback: Optional[Callable] = None
     ) -> Optional[OnlineResult]:
-        """Return {"rank": int, "lifetime_gold": float} for the current player."""
+        """Return {"rank": int, "net_worth": float} for the current player."""
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
 
             my_result = self._client.get(
                 "/rest/v1/leaderboard",
-                params={"select": "lifetime_gold",
+                params={"select": "net_worth",
                         "user_id": f"eq.{self._auth.user_id}", "limit": "1"},
             )
             if not my_result.success:
@@ -897,18 +936,18 @@ class LeaderboardManager:
             rows = my_result.data if isinstance(my_result.data, list) else []
             if not rows:
                 return OnlineResult(success=False, error="No leaderboard entry found.")
-            my_lg = rows[0].get("lifetime_gold", 0.0)
+            my_nw = rows[0].get("net_worth", 0.0)
 
             above_result = self._client.get(
                 "/rest/v1/leaderboard",
-                params={"select": "user_id", "lifetime_gold": f"gt.{my_lg}"},
+                params={"select": "user_id", "net_worth": f"gt.{my_nw}"},
             )
             if not above_result.success:
                 return above_result
 
             above_count = len(above_result.data) if isinstance(above_result.data, list) else 0
             return OnlineResult(success=True,
-                                data={"rank": above_count + 1, "lifetime_gold": my_lg})
+                                data={"rank": above_count + 1, "net_worth": my_nw})
 
         if callback is None:
             return _do()
@@ -1728,7 +1767,7 @@ class FriendsManager:
             return self._client.get(
                 "/rest/v1/friends",
                 params={
-                    "select":       "requester_id,created_at,profiles(username,title,discriminator)",
+                    "select":       "requester_id,created_at,profiles(username,discriminator,last_networth)",
                     "addressee_id": f"eq.{self._auth.user_id}",
                     "status":       "eq.pending",
                 },
@@ -1807,6 +1846,249 @@ class FriendsManager:
                 for row, fid in zip(rows, friend_ids)
             ]
             return OnlineResult(success=True, data=combined)
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INBOX MANAGER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class InboxManager:
+    """
+    Player inbox: system mail, admin rewards, seasonal rewards, notifications.
+    Only service-role / admins can INSERT messages; players may read, mark,
+    claim, and delete their own messages.
+
+    Required Supabase SQL:
+    ───────────────────
+        create table inbox_messages (
+            id                 bigserial   primary key,
+            recipient_id       uuid        references auth.users on delete cascade not null,
+            sender_id          uuid        references auth.users on delete set null,
+            msg_type           text        not null default 'mail',
+            -- 'mail' | 'notification' | 'reward' | 'maintenance' | 'seasonal'
+            subject            text        not null default '',
+            body               text        not null default '',
+            reward_gold        numeric     not null default 0,
+            reward_items       jsonb       not null default '{}',
+            reward_title       text        not null default '',
+            reward_description text        not null default '',
+            is_read            boolean     not null default false,
+            reward_claimed     boolean     not null default false,
+            created_at         timestamptz not null default now(),
+            expires_at         timestamptz
+        );
+        alter table inbox_messages enable row level security;
+        create policy "read own"   on inbox_messages for select
+            using  (auth.uid() = recipient_id);
+        create policy "update own" on inbox_messages for update
+            using  (auth.uid() = recipient_id);
+        create policy "delete own" on inbox_messages for delete
+            using  (auth.uid() = recipient_id);
+        -- INSERT requires the service-role key (admin-only).
+        -- Use the Supabase Dashboard or a server function with the
+        -- service-role key to send in-game messages to players.
+    """
+
+    def __init__(self, client: "OnlineClient", auth: "AuthManager") -> None:
+        self._client = client
+        self._auth   = auth
+
+    # ── Fetch ──────────────────────────────────────────────────────────────────
+
+    def list_messages(
+        self,
+        limit: int = 50,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Fetch up to *limit* inbox messages for the current player, newest first."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            result = self._client.get(
+                "/rest/v1/inbox_messages",
+                params={
+                    "recipient_id": f"eq.{self._auth.user_id}",
+                    "order":        "created_at.desc",
+                    "limit":        str(limit),
+                    "select": (
+                        "id,msg_type,subject,body,reward_gold,"
+                        "reward_items,reward_title,reward_description,"
+                        "is_read,reward_claimed,created_at,expires_at"
+                    ),
+                },
+            )
+            if result.success:
+                result.data = result.data if isinstance(result.data, list) else []
+            return result
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def get_unread_count(
+        self,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Return the number of unread messages as OnlineResult.data (int)."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=True, data=0)
+            result = self._client.get(
+                "/rest/v1/inbox_messages",
+                params={
+                    "recipient_id": f"eq.{self._auth.user_id}",
+                    "is_read":      "eq.false",
+                    "select":       "id",
+                    "limit":        "100",
+                },
+            )
+            count = (len(result.data)
+                     if (result.success and isinstance(result.data, list))
+                     else 0)
+            return OnlineResult(success=result.success, data=count,
+                                error=result.error)
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    # ── Mark ──────────────────────────────────────────────────────────────────
+
+    def mark_read(
+        self,
+        msg_id: int,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Mark a single message as read."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            return self._client.patch(
+                "/rest/v1/inbox_messages",
+                body={"is_read": True},
+                params={
+                    "id":           f"eq.{msg_id}",
+                    "recipient_id": f"eq.{self._auth.user_id}",
+                },
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def mark_all_read(
+        self,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Mark all unread messages as read for the current player."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            return self._client.patch(
+                "/rest/v1/inbox_messages",
+                body={"is_read": True},
+                params={
+                    "recipient_id": f"eq.{self._auth.user_id}",
+                    "is_read":      "eq.false",
+                },
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    # ── Claim Reward ──────────────────────────────────────────────────────────
+
+    def claim_reward(
+        self,
+        msg_id: int,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """
+        Mark a reward message as claimed and return its reward payload.
+        Returns OnlineResult.data = {
+            reward_gold, reward_items, reward_title, reward_description
+        } on success.  Returns success=False if already claimed or not found.
+        """
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            uid = self._auth.user_id
+            # Fetch to verify ownership and unclaimed state
+            fetch = self._client.get(
+                "/rest/v1/inbox_messages",
+                params={
+                    "id":           f"eq.{msg_id}",
+                    "recipient_id": f"eq.{uid}",
+                    "select": (
+                        "reward_gold,reward_items,reward_title,"
+                        "reward_description,reward_claimed"
+                    ),
+                    "limit": "1",
+                },
+            )
+            if not fetch.success:
+                return fetch
+            rows = fetch.data if isinstance(fetch.data, list) else []
+            if not rows:
+                return OnlineResult(success=False, error="Message not found.")
+            row = rows[0]
+            if row.get("reward_claimed"):
+                return OnlineResult(
+                    success=False,
+                    error="Reward already claimed.",
+                    data={"already_claimed": True},
+                )
+            # Mark claimed + read atomically
+            patch = self._client.patch(
+                "/rest/v1/inbox_messages",
+                body={"reward_claimed": True, "is_read": True},
+                params={
+                    "id":           f"eq.{msg_id}",
+                    "recipient_id": f"eq.{uid}",
+                },
+            )
+            if not patch.success:
+                return patch
+            return OnlineResult(success=True, data={
+                "reward_gold":        float(row.get("reward_gold")        or 0),
+                "reward_items":       dict(row.get("reward_items")        or {}),
+                "reward_title":       str(row.get("reward_title")         or ""),
+                "reward_description": str(row.get("reward_description")   or ""),
+            })
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
+    def delete_message(
+        self,
+        msg_id: int,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Permanently delete an inbox message owned by the current player."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            return self._client.delete(
+                "/rest/v1/inbox_messages",
+                params={
+                    "id":           f"eq.{msg_id}",
+                    "recipient_id": f"eq.{self._auth.user_id}",
+                },
+            )
 
         if callback is None:
             return _do()
@@ -1899,6 +2181,7 @@ class OnlineServices:
         app.online.leaderboard  — LeaderboardManager
         app.online.friends      — FriendsManager
         app.online.guilds       — GuildManager
+        app.online.inbox        — InboxManager (mail, rewards, notifications)
 
     All callbacks receive OnlineResult on a daemon thread.
     Wrap with  app.after(0, ...)  before touching Tkinter widgets.
@@ -1913,6 +2196,7 @@ class OnlineServices:
         self.leaderboard  = LeaderboardManager(self._http, self.auth)
         self.friends      = FriendsManager(self._http, self.auth)
         self.guilds       = GuildManager(self._http, self.auth)
+        self.inbox        = InboxManager(self._http, self.auth)
         self.verification = VerificationServer()
 
     def startup(self) -> bool:

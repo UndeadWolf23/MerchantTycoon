@@ -3721,6 +3721,25 @@ class CustomTitleBar(tk.Frame):
         self.profile_btn.bind("<Leave>",
             lambda e: e.widget.config(bg=T["bg_panel"], fg=T["fg_dim"]))
 
+        # Inbox button with notification badge overlay
+        _iw = tk.Frame(inner, bg=T["bg_panel"], cursor="hand2")
+        _iw.pack(side="right", padx=(2, 4))
+        self.inbox_btn = tk.Label(_iw, text=" ✉ ",
+                                  bg=T["bg_panel"], fg=T["fg_dim"],
+                                  font=FONT_FANTASY_S, cursor="hand2", padx=4)
+        self.inbox_btn.pack()
+        self._inbox_badge = tk.Label(_iw, text="",
+                                     bg="#c0392b", fg="white",
+                                     font=("Palatino Linotype", 7, "bold"),
+                                     padx=3, pady=0)
+        # Badge shown via place(); hidden until unread count > 0
+        for _w in (_iw, self.inbox_btn, self._inbox_badge):
+            _w.bind("<Button-1>", lambda _: app.toggle_inbox_panel())
+        self.inbox_btn.bind("<Enter>",
+            lambda e: e.widget.config(bg=T["bg_button_act"], fg=T["fg"]))
+        self.inbox_btn.bind("<Leave>",
+            lambda e: e.widget.config(bg=T["bg_panel"], fg=T["fg_dim"]))
+
         # Cloud sync status indicator
         self.sync_lbl = tk.Label(inner, text="",
                                  bg=T["bg_panel"], fg=T["fg_dim"],
@@ -3734,6 +3753,17 @@ class CustomTitleBar(tk.Frame):
         for widget in (self, inner):
             widget.bind("<ButtonPress-1>",  self._on_drag_start)
             widget.bind("<B1-Motion>",      self._on_drag_move)
+
+    def update_inbox_badge(self, count: int) -> None:
+        """Show/hide the red notification badge on the inbox button."""
+        try:
+            if count > 0:
+                self._inbox_badge.config(text=str(min(count, 99)))
+                self._inbox_badge.place(relx=1.0, rely=0, anchor="ne", x=-2, y=2)
+            else:
+                self._inbox_badge.place_forget()
+        except tk.TclError:
+            pass
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self._drag_x = event.x_root - self.app.winfo_x()
@@ -11529,6 +11559,936 @@ class VoyageScreen(Screen):
         self.app.refresh()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SOCIAL SCREEN  —  Leaderboard, Friends, and Guilds hub
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SocialScreen(Screen):
+    """
+    Social hub with three tabs:
+        🏆 Leaderboard  — top 100 players ranked by net worth; own rank pinned
+        👥 Friends      — friend list, pending requests, add-friend UI
+        ⚔  Guilds       — current guild, guild browser, create / join / leave
+    """
+
+    # Rank 1/2/3 colours: border, row bg, text
+    _MEDAL_BORDER = ("#e8c31a", "#b0b8c8", "#bf7030")
+    _MEDAL_BG     = ("#252008", "#191d25", "#231408")
+    _MEDAL_RANK   = ("🥇", "🥈", "🥉")
+
+    _LB_REFRESH_S = 60   # seconds between automatic leaderboard refreshes
+    _COL_W = (50, 185, 155, 130, 115)  # pixel widths: rank, merchant, title, guild, net worth
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def on_show(self) -> None:
+        self._schedule_lb_refresh()
+        # Trigger a data load for whichever tab is active
+        if self._active_tab == "leaderboard":
+            # Push fresh player data first, then fetch so the DB row is current
+            try:
+                self.app._push_leaderboard(
+                    done_callback=lambda: self._load_leaderboard(force=True))
+            except Exception:
+                self._load_leaderboard(force=True)
+        elif self._active_tab == "friends":
+            self._load_friends()
+        elif self._active_tab == "guilds":
+            self._load_guilds()
+
+    def on_hide(self) -> None:
+        if getattr(self, "_lb_timer", None):
+            try:
+                self.after_cancel(self._lb_timer)
+            except Exception:
+                pass
+            self._lb_timer = None
+
+    # ── Build ──────────────────────────────────────────────────────────────────
+
+    def build(self) -> None:
+        self._lb_timer:       Optional[str] = None
+        self._lb_data:        List[Dict]    = []
+        self._my_rank:        int           = 0
+        self._lb_last_fetch:  float         = 0.0
+        self._active_tab:     str           = "leaderboard"
+        self._pending_data:   List[Dict]    = []
+        self._friends_data:   List[Dict]    = []
+        self._my_guild_data:  Optional[Dict] = None
+        self._guild_list_data: Optional[List[Dict]] = None
+
+        outer = ttk.Frame(self, style="MT.TFrame")
+        outer.pack(fill="both", expand=True)
+
+        # ── Nav row ────────────────────────────────────────────────────────
+        nav = tk.Frame(outer, bg=T["bg"])
+        nav.pack(fill="x", padx=14, pady=(10, 0))
+        self.back_button(nav).pack(side="left")
+        tk.Label(nav, text="🌐  Social Hub",
+                 bg=T["bg"], fg=T["cyan"],
+                 font=FONT_FANTASY_TITLE).pack(side="left", padx=16)
+
+        ttk.Separator(outer, style="MT.TSeparator").pack(fill="x", padx=14, pady=(6, 0))
+
+        # ── Tab bar ────────────────────────────────────────────────────────
+        self._tab_bar = tk.Frame(outer, bg=T["bg_panel"])
+        self._tab_bar.pack(fill="x")
+        tk.Frame(outer, bg=T["border_light"], height=2).pack(fill="x")
+
+        self._tab_btns: Dict[str, tk.Label] = {}
+        for key, icon, label in [
+            ("leaderboard", "🏆", "Leaderboard"),
+            ("friends",     "👥", "Friends"),
+            ("guilds",      "⚔",  "Guilds"),
+        ]:
+            btn = tk.Label(self._tab_bar,
+                           text=f"  {icon}  {label}  ",
+                           bg=T["bg_panel"], fg=T["fg_dim"],
+                           font=FONT_FANTASY_BOLD, cursor="hand2",
+                           padx=8, pady=7)
+            btn.pack(side="left")
+            btn.bind("<Button-1>", lambda _e, k=key: self._switch_tab(k))
+            btn.bind("<Enter>",
+                     lambda e, k=key: e.widget.config(
+                         fg=T["fg"] if self._active_tab != k else T["cyan"]))
+            btn.bind("<Leave>",
+                     lambda e, k=key: e.widget.config(
+                         fg=T["cyan"] if self._active_tab == k else T["fg_dim"]))
+            self._tab_btns[key] = btn
+
+        # ── Tab content area ───────────────────────────────────────────────
+        self._tab_area = tk.Frame(outer, bg=T["bg"])
+        self._tab_area.pack(fill="both", expand=True)
+
+        self._frames: Dict[str, tk.Frame] = {}
+        self._build_leaderboard_tab()
+        self._build_friends_tab()
+        self._build_guilds_tab()
+
+        self._switch_tab("leaderboard")
+
+    # ── Tab switching ──────────────────────────────────────────────────────────
+
+    def _switch_tab(self, key: str) -> None:
+        self._active_tab = key
+        for k, frm in self._frames.items():
+            if k == key:
+                frm.pack(fill="both", expand=True)
+            else:
+                frm.pack_forget()
+        for k, btn in self._tab_btns.items():
+            btn.config(bg=T["bg"] if k == key else T["bg_panel"],
+                       fg=T["cyan"] if k == key else T["fg_dim"])
+        if key == "leaderboard":
+            self._load_leaderboard()
+        elif key == "friends":
+            self._load_friends()
+        elif key == "guilds":
+            self._load_guilds()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LEADERBOARD TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_leaderboard_tab(self) -> None:
+        f = tk.Frame(self._tab_area, bg=T["bg"])
+        self._frames["leaderboard"] = f
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = tk.Frame(f, bg=T["bg_panel"])
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", side="bottom")
+
+        tk.Label(hdr, text="  🏆  Global Leaderboard  —  Net Worth",
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, pady=7).pack(side="left", padx=8)
+
+        self._lb_status_lbl = tk.Label(hdr, text="",
+                                       bg=T["bg_panel"], fg=T["fg_dim"],
+                                       font=FONT_FANTASY_S, pady=7)
+        self._lb_status_lbl.pack(side="right", padx=16)
+
+        ref_lbl = tk.Label(hdr, text=" ↻  Refresh ",
+                           bg=T["bg_panel"], fg=T["border_light"],
+                           font=FONT_FANTASY_S, cursor="hand2", pady=7, padx=6)
+        ref_lbl.pack(side="right", padx=4)
+        ref_lbl.bind("<Button-1>", lambda _: self._load_leaderboard(force=True))
+        ref_lbl.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        ref_lbl.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # ── Column headers ────────────────────────────────────────────────
+        col_hdr = tk.Frame(f, bg="#1c1208")
+        col_hdr.pack(fill="x")
+        for i, (txt, anch) in enumerate([
+            ("#", "center"), ("Merchant", "w"), ("Title", "w"),
+            ("Guild", "w"), ("Net Worth", "e"),
+        ]):
+            col_hdr.columnconfigure(i, minsize=self._COL_W[i])
+            tk.Label(col_hdr, text=txt,
+                     bg="#1c1208", fg=T["fg_dim"],
+                     font=FONT_MONO_S,
+                     anchor=anch, padx=6, pady=4
+                     ).grid(row=0, column=i, sticky="ew")
+        # separator lives outside col_hdr to avoid pack+grid conflict
+        tk.Frame(f, bg=T["border"], height=1).pack(fill="x")
+
+        # ── Scrollable list ───────────────────────────────────────────────
+        list_wrap = tk.Frame(f, bg=T["bg"])
+        list_wrap.pack(fill="both", expand=True)
+        sf = ScrollableFrame(list_wrap)
+        sf.pack(fill="both", expand=True)
+        self._lb_list = sf.inner
+
+        # ── Sticky rank footer ────────────────────────────────────────────
+        self._lb_footer = tk.Frame(f, bg="#0a1828")
+        tk.Frame(self._lb_footer, bg=T["cyan"], height=2).pack(fill="x")
+        self._lb_footer_lbl = tk.Label(
+            self._lb_footer,
+            text="  Your rank will appear here once you submit a score.",
+            bg="#0a1828", fg=T["cyan"],
+            font=FONT_FANTASY_BOLD, anchor="w",
+            padx=14, pady=7)
+        self._lb_footer_lbl.pack(fill="x")
+        self._lb_footer.pack(fill="x", side="bottom")
+
+    # ── Data loading ───────────────────────────────────────────────────────────
+
+    def _load_leaderboard(self, force: bool = False) -> None:
+        import time as _t
+        if not force and (_t.time() - self._lb_last_fetch < 30) and self._lb_data:
+            return
+        if not (self.app.online and self.app.online.is_online):
+            self._lb_set_status("Sign in to view the global leaderboard.", T["fg_dim"])
+            self._render_lb_offline()
+            return
+        self._lb_set_status("Loading…", T["fg_dim"])
+
+        def _cb_top(res):
+            self.app.after(0, lambda r=res: self._on_lb_fetched(r))
+
+        def _cb_rank(res):
+            self.app.after(0, lambda r=res: self._on_rank_fetched(r))
+
+        self.app.online.leaderboard.fetch_top_scores(limit=100, callback=_cb_top)
+        self.app.online.leaderboard.fetch_my_rank(callback=_cb_rank)
+
+    def _on_lb_fetched(self, res) -> None:
+        import time as _t
+        try:
+            if not res.success:
+                self._lb_set_status(f"⚠  {res.error}", T["red"])
+                return
+            rows = res.data if isinstance(res.data, list) else []
+            self._lb_data       = rows
+            self._lb_last_fetch = _t.time()
+            self._lb_set_status(
+                f"Top {len(rows)} merchants  ·  updated just now", T["fg_dim"])
+            self._render_leaderboard()
+        except tk.TclError:
+            pass
+
+    def _on_rank_fetched(self, res) -> None:
+        try:
+            if res.success and isinstance(res.data, dict):
+                self._my_rank = res.data.get("rank", 0)
+            self._render_my_rank_footer()
+        except tk.TclError:
+            pass
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+
+    def _render_lb_offline(self) -> None:
+        try:
+            for w in list(self._lb_list.winfo_children()):
+                w.destroy()
+            tk.Label(self._lb_list,
+                     text="Sign in to access the global leaderboard.",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, anchor="center", pady=60).pack(expand=True)
+        except tk.TclError:
+            pass
+
+    def _render_leaderboard(self) -> None:
+        try:
+            for w in list(self._lb_list.winfo_children()):
+                w.destroy()
+        except tk.TclError:
+            return
+
+        if not self._lb_data:
+            tk.Label(self._lb_list,
+                     text="No entries yet — be the first on the board!",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, anchor="center", pady=60).pack(expand=True)
+            return
+
+        my_uid = self.app.online.auth.user_id if self.app.online else ""
+
+        for i, row in enumerate(self._lb_data):
+            rank   = i + 1
+            is_me  = (row.get("user_id", "") == my_uid)
+            is_top = rank <= 3
+
+            if is_top:
+                bdr   = self._MEDAL_BORDER[rank - 1]
+                bg    = self._MEDAL_BG    [rank - 1]
+                fg    = bdr
+                pad_v = 6
+            else:
+                bdr   = T["cyan"]   if is_me else T["border"]
+                bg    = "#2a2010"   if is_me else (T["bg_panel"] if rank % 2 == 0 else T["bg"])
+                fg    = T["cyan"]   if is_me else T["fg"]
+                pad_v = 3
+
+            # Outer border frame
+            border_f = tk.Frame(self._lb_list, bg=bdr)
+            border_f.pack(fill="x", padx=4, pady=(2 if is_top else 1))
+
+            inner_f = tk.Frame(border_f, bg=bg)
+            # top-3: 5px left padding so medal colour shows through as accent bar
+            inner_f.pack(fill="x", padx=((5, 1) if is_top else 1), pady=1)
+            for i, cw in enumerate(self._COL_W):
+                inner_f.columnconfigure(i, minsize=cw)
+
+            # ── Rank badge (Ⅰ)
+            rank_txt = self._MEDAL_RANK[rank - 1] if is_top else f"#{rank}"
+            tk.Label(inner_f, text=rank_txt,
+                     bg=bg, fg=fg,
+                     font=FONT_FANTASY_BOLD if is_top else FONT_MONO_S,
+                     anchor="center", pady=pad_v
+                     ).grid(row=0, column=0, sticky="ew")
+
+            # ── Merchant name (Ⅱ)
+            name = row.get("player_name") or row.get("username") or "Unknown"
+            tk.Label(inner_f, text=name,
+                     bg=bg, fg=fg,
+                     font=FONT_FANTASY_BOLD if is_top else FONT_FANTASY_S,
+                     anchor="w", pady=pad_v, padx=6
+                     ).grid(row=0, column=1, sticky="ew")
+
+            # ── Title (Ⅲ)
+            _t_raw = row.get("title") or ""
+            if _t_raw:
+                _td = TITLES_BY_ID.get(_t_raw)
+                title = _td["name"] if _td else _t_raw
+            else:
+                title = "—"
+            tk.Label(inner_f, text=title,
+                     bg=bg, fg=T["yellow"] if is_top else T["fg_dim"],
+                     font=FONT_FANTASY_S,
+                     anchor="w", padx=6
+                     ).grid(row=0, column=2, sticky="ew")
+
+            # ── Guild (Ⅳ)
+            guild = row.get("guild_name") or "—"
+            tk.Label(inner_f, text=guild,
+                     bg=bg, fg=T["border_light"] if is_top else T["fg_dim"],
+                     font=FONT_FANTASY_S,
+                     anchor="w", padx=6
+                     ).grid(row=0, column=3, sticky="ew")
+
+            # ── Net worth (Ⅴ)
+            nw = row.get("net_worth") or row.get("lifetime_gold") or 0.0
+            tk.Label(inner_f, text=f"{nw:,.0f}g",
+                     bg=bg, fg=fg,
+                     font=FONT_MONO_S,
+                     anchor="e", padx=8, pady=pad_v
+                     ).grid(row=0, column=4, sticky="ew")
+
+    def _render_my_rank_footer(self) -> None:
+        try:
+            g    = self.game
+            rank = self._my_rank
+            if rank <= 0:
+                self._lb_footer_lbl.config(
+                    text="  Submit a score to appear on the leaderboard.")
+                return
+            name      = g.player_name or (self.app.online.auth.username if self.app.online else "") or "You"
+            nw        = g._net_worth()
+            medal     = self._MEDAL_RANK[rank - 1] if rank <= 3 else f"#{rank:,}"
+            td        = None
+            if getattr(g, "active_title", None):
+                from merchant_tycoon import TITLES_BY_ID as _TBID
+                td = _TBID.get(g.active_title)
+            title_suf = f"  ✦  {td['name']}" if td else ""
+            guild_name = getattr(self.app, "_cached_guild_name", "")
+            guild_suf  = f"  ⚔  {guild_name}" if guild_name else ""
+            self._lb_footer_lbl.config(
+                text=f"  Your rank: {medal}  {name}{title_suf}{guild_suf}  ·  {nw:,.0f}g net worth")
+        except tk.TclError:
+            pass
+
+    def _lb_set_status(self, text: str, color: str) -> None:
+        try:
+            self._lb_status_lbl.config(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+    def _schedule_lb_refresh(self) -> None:
+        """Re-arm a 60 s auto-refresh; cancels any existing timer first."""
+        if getattr(self, "_lb_timer", None):
+            try:
+                self.after_cancel(self._lb_timer)
+            except Exception:
+                pass
+            self._lb_timer = None
+
+        def _tick():
+            self._lb_timer = None
+            if self._active_tab == "leaderboard":
+                self._load_leaderboard(force=True)
+            self._schedule_lb_refresh()
+
+        self._lb_timer = self.after(self._LB_REFRESH_S * 1000, _tick)
+
+    def refresh(self) -> None:
+        """Called every time the screen is shown."""
+        self._render_my_rank_footer()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FRIENDS TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _online_dot(last_seen: str):
+        """Return (dot_char, colour) based on last_seen ISO timestamp."""
+        if not last_seen:
+            return "○", T["grey"]
+        try:
+            import datetime
+            ls  = last_seen.replace("Z", "+00:00")
+            dt  = datetime.datetime.fromisoformat(ls)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            age = (now - dt).total_seconds()
+            if age < 300:
+                return "●", T["green"]
+            if age < 1800:
+                return "◑", T["yellow"]
+        except Exception:
+            pass
+        return "○", T["grey"]
+
+    def _build_friends_tab(self) -> None:
+        f = tk.Frame(self._tab_area, bg=T["bg"])
+        self._frames["friends"] = f
+
+        # Header
+        hdr = tk.Frame(f, bg=T["bg_panel"])
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", side="bottom")
+        tk.Label(hdr, text="  👥  Friends",
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, pady=7).pack(side="left", padx=8)
+        self._friends_status = tk.Label(hdr, text="",
+                                        bg=T["bg_panel"], fg=T["fg_dim"],
+                                        font=FONT_FANTASY_S)
+        self._friends_status.pack(side="right", padx=16)
+
+        ref2 = tk.Label(hdr, text=" ↻ ",
+                        bg=T["bg_panel"], fg=T["border_light"],
+                        font=FONT_FANTASY_S, cursor="hand2", padx=4)
+        ref2.pack(side="right", padx=4)
+        ref2.bind("<Button-1>", lambda _: self._load_friends(force=True))
+        ref2.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        ref2.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # Add-friend row
+        add_row = tk.Frame(f, bg=T["bg_panel"])
+        add_row.pack(fill="x")
+        tk.Frame(add_row, bg=T["border"], height=1).pack(fill="x", side="bottom")
+
+        tk.Label(add_row, text="  Add friend:",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S, pady=6).pack(side="left", padx=(8, 4))
+
+        self._add_friend_var = tk.StringVar()
+        _ent = tk.Entry(add_row, textvariable=self._add_friend_var,
+                        bg=T["bg"], fg=T["fg"],
+                        insertbackground=T["fg"],
+                        font=FONT_FANTASY_S, relief="flat", bd=0,
+                        highlightthickness=1,
+                        highlightcolor=T["border_light"],
+                        highlightbackground=T["border"],
+                        width=24)
+        _ent.pack(side="left", ipady=4, pady=5)
+        _ent.bind("<Return>", lambda _: self._do_send_friend_request())
+
+        _send = tk.Label(add_row, text=" ✉  Send Request ",
+                         bg=T["bg_button"], fg=T["cyan"],
+                         font=FONT_FANTASY_S, cursor="hand2", padx=6, pady=5)
+        _send.pack(side="left", padx=8)
+        _send.bind("<Button-1>", lambda _: self._do_send_friend_request())
+        _send.bind("<Enter>",    lambda e: e.widget.config(bg=T["bg_button_act"]))
+        _send.bind("<Leave>",    lambda e: e.widget.config(bg=T["bg_button"]))
+
+        tk.Label(add_row, text="Search by  Name #1234  or by UUID",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=("Palatino Linotype", 9)).pack(side="left")
+
+        # Scrollable content
+        sf = ScrollableFrame(f)
+        sf.pack(fill="both", expand=True)
+        self._friends_list_frame = sf.inner
+
+    def _load_friends(self, force: bool = False) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            for w in list(self._friends_list_frame.winfo_children()):
+                w.destroy()
+            tk.Label(self._friends_list_frame,
+                     text="Sign in to see your friends.",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, pady=40).pack()
+            return
+        self._friends_status.config(text="Loading…", fg=T["fg_dim"])
+
+        def _cb_p(res):
+            self.app.after(0, lambda r=res: self._on_pending_loaded(r))
+
+        def _cb_f(res):
+            self.app.after(0, lambda r=res: self._on_friends_loaded(r))
+
+        self.app.online.friends.list_pending_requests(callback=_cb_p)
+        self.app.online.friends.list_friends_with_profiles(callback=_cb_f)
+
+    def _on_pending_loaded(self, res) -> None:
+        self._pending_data = res.data if (res.success and isinstance(res.data, list)) else []
+        self._render_friends_list()
+
+    def _on_friends_loaded(self, res) -> None:
+        self._friends_data = res.data if (res.success and isinstance(res.data, list)) else []
+        n = len(self._friends_data)
+        try:
+            self._friends_status.config(
+                text=f"{n} friend{'s' if n != 1 else ''}", fg=T["fg_dim"])
+        except tk.TclError:
+            pass
+        self._render_friends_list()
+
+    def _render_friends_list(self) -> None:
+        try:
+            for w in list(self._friends_list_frame.winfo_children()):
+                w.destroy()
+        except tk.TclError:
+            return
+
+        pending = self._pending_data
+        friends = self._friends_data
+
+        if pending:
+            self._sec_hdr(self._friends_list_frame,
+                          f"  ↓  Pending Requests  ({len(pending)})")
+            for row in pending:
+                prof   = row.get("profiles") or {}
+                uname  = prof.get("username") or "Unknown"
+                disc   = prof.get("discriminator") or "0000"
+                nw     = prof.get("last_networth") or 0.0
+                req_id = row.get("requester_id", "")
+                label  = f"{uname}#{disc:04d}" if isinstance(disc, int) else f"{uname}#{disc}"
+                self._make_pending_row(self._friends_list_frame, req_id, label, nw)
+
+        self._sec_hdr(self._friends_list_frame,
+                      f"  ✦  Your Friends  ({len(friends)})")
+        if not friends:
+            tk.Label(self._friends_list_frame,
+                     text="  No friends yet — search for a merchant above.",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, pady=14, padx=12).pack(anchor="w")
+        else:
+            for item in friends:
+                self._make_friend_row(self._friends_list_frame, item)
+
+    def _sec_hdr(self, parent: tk.Widget, text: str) -> None:
+        frm = tk.Frame(parent, bg=T["bg"])
+        frm.pack(fill="x", pady=(8, 2))
+        tk.Label(frm, text=text,
+                 bg=T["bg"], fg=T["border_light"],
+                 font=FONT_FANTASY_S, anchor="w", padx=12).pack(fill="x")
+        tk.Frame(frm, bg=T["border"], height=1).pack(fill="x")
+
+    def _make_pending_row(self, parent: tk.Widget,
+                          req_id: str, label: str, nw: float) -> None:
+        row = tk.Frame(parent, bg=T["bg_panel"])
+        row.pack(fill="x", padx=10, pady=2)
+        tk.Frame(row, bg=T["yellow"], width=3).pack(side="left", fill="y")
+        tk.Label(row, text=f"  {label}",
+                 bg=T["bg_panel"], fg=T["fg"],
+                 font=FONT_FANTASY, anchor="w").pack(side="left", padx=4, pady=4)
+        if nw > 0:
+            tk.Label(row, text=f"  {nw:,.0f}g NW",
+                     bg=T["bg_panel"], fg=T["yellow"],
+                     font=FONT_FANTASY_S).pack(side="left")
+
+        ttk.Button(row, text="✗", style="Danger.TButton",
+                   command=lambda r=req_id, n=label: self._do_respond(r, False, n)
+                   ).pack(side="right", padx=(2, 8), pady=3)
+        ttk.Button(row, text="✓", style="OK.TButton",
+                   command=lambda r=req_id, n=label: self._do_respond(r, True, n)
+                   ).pack(side="right", padx=(2, 2), pady=3)
+
+    def _make_friend_row(self, parent: tk.Widget, item: Dict) -> None:
+        prof     = item.get("profile") or {}
+        fid      = item.get("friend_id", "")
+        uname    = prof.get("username") or "Unknown"
+        disc     = prof.get("discriminator") or "0000"
+        nw       = prof.get("last_networth") or 0.0
+        flast    = prof.get("last_seen") or ""
+        disc_str = f"#{disc:04d}" if isinstance(disc, int) else f"#{disc}"
+        label    = f"{uname}{disc_str}"
+        dot, dot_col = self._online_dot(flast)
+
+        row = tk.Frame(parent, bg=T["bg_panel"])
+        row.pack(fill="x", padx=10, pady=2)
+        tk.Frame(row, bg=T["border_light"], width=2).pack(side="left", fill="y")
+
+        tk.Label(row, text=dot, bg=T["bg_panel"], fg=dot_col,
+                 font=FONT_MONO_S, width=2).pack(side="left", padx=(4, 0))
+        tk.Label(row, text=label,
+                 bg=T["bg_panel"], fg=T["fg"],
+                 font=FONT_FANTASY, anchor="w").pack(side="left", padx=4, pady=4)
+        if nw > 0:
+            tk.Label(row, text=f"  {nw:,.0f}g NW",
+                     bg=T["bg_panel"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S).pack(side="left")
+
+        rem = tk.Label(row, text="  ✕  ",
+                       bg=T["bg_panel"], fg=T["grey"],
+                       font=FONT_FANTASY_S, cursor="hand2")
+        rem.pack(side="right", padx=(2, 8), pady=3)
+        rem.bind("<Button-1>",
+                 lambda _, f=fid, n=label: self._do_remove_friend(f, n))
+        rem.bind("<Enter>", lambda e: e.widget.config(fg=T["red"]))
+        rem.bind("<Leave>", lambda e: e.widget.config(fg=T["grey"]))
+
+    # ── Friend actions ─────────────────────────────────────────────────────────
+
+    def _do_send_friend_request(self) -> None:
+        query = self._add_friend_var.get().strip()
+        if not query:
+            self.msg.warn("Enter a merchant name (Name #1234) or UUID to search.")
+            return
+        if not (self.app.online and self.app.online.is_online):
+            self.msg.warn("Sign in to send friend requests.")
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda r=res, q=query: self._on_player_found(r, q))
+
+        self.app.online.profile.search_players(query, callback=_cb)
+
+    def _on_player_found(self, res, query: str) -> None:
+        if not res.success or not res.data:
+            self.msg.err(f"No merchant found matching '{query}'.")
+            return
+        players = res.data if isinstance(res.data, list) else [res.data]
+        if not players:
+            self.msg.err(f"No merchant found matching '{query}'.")
+            return
+        p    = players[0]
+        pid  = p.get("id") or p.get("user_id", "")
+        name = p.get("username", "Unknown")
+        disc = p.get("discriminator", 0)
+        if pid == (self.app.online.auth.user_id if self.app.online else ""):
+            self.msg.warn("That's you!")
+            return
+        disc_str = f"#{disc:04d}" if isinstance(disc, int) and disc else f"#{disc}" if disc else ""
+        if not pid:
+            self.msg.err("Could not resolve player ID.")
+            return
+
+        def _cb2(res2):
+            self.app.after(0, lambda r=res2, n=f"{name}{disc_str}": self._on_request_sent(r, n))
+
+        self.app.online.friends.send_request(pid, callback=_cb2)
+
+    def _on_request_sent(self, res, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"Friend request sent to {name}!")
+            self._add_friend_var.set("")
+        else:
+            msg = res.error or "Failed to send request."
+            if "duplicate" in msg.lower() or "unique" in msg.lower():
+                msg = f"A pending request with {name} already exists."
+            self.msg.err(msg)
+
+    def _do_respond(self, req_id: str, accept: bool, name: str) -> None:
+        def _cb(res):
+            self.app.after(0, lambda r=res: self._on_responded(r, accept, name))
+        self.app.online.friends.respond_to_request(req_id, accept, callback=_cb)
+
+    def _on_responded(self, res, accept: bool, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"Friend request from {name} accepted!" if accept
+                        else "Request declined.")
+            self._load_friends(force=True)
+        else:
+            self.msg.err(res.error or "Failed to respond.")
+
+    def _do_remove_friend(self, fid: str, name: str) -> None:
+        if not ConfirmDialog(self.app, f"Remove {name} from friends?",
+                             "Remove Friend").wait():
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda r=res: self._on_friend_removed(r, name))
+
+        self.app.online.friends.remove_friend(fid, callback=_cb)
+
+    def _on_friend_removed(self, res, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"{name} removed from your friends list.")
+            self._load_friends(force=True)
+        else:
+            self.msg.err(res.error or "Failed to remove friend.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # GUILDS TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_guilds_tab(self) -> None:
+        f = tk.Frame(self._tab_area, bg=T["bg"])
+        self._frames["guilds"] = f
+
+        # Header
+        hdr = tk.Frame(f, bg=T["bg_panel"])
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", side="bottom")
+        tk.Label(hdr, text="  ⚔  Guilds",
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, pady=7).pack(side="left", padx=8)
+        self._guilds_status = tk.Label(hdr, text="",
+                                       bg=T["bg_panel"], fg=T["fg_dim"],
+                                       font=FONT_FANTASY_S)
+        self._guilds_status.pack(side="right", padx=16)
+
+        ref3 = tk.Label(hdr, text=" ↻ ",
+                        bg=T["bg_panel"], fg=T["border_light"],
+                        font=FONT_FANTASY_S, cursor="hand2", padx=4)
+        ref3.pack(side="right", padx=4)
+        ref3.bind("<Button-1>", lambda _: self._load_guilds(force=True))
+        ref3.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        ref3.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # Scrollable content
+        sf = ScrollableFrame(f)
+        sf.pack(fill="both", expand=True)
+        self._guilds_frame = sf.inner
+
+    def _load_guilds(self, force: bool = False) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            for w in list(self._guilds_frame.winfo_children()):
+                w.destroy()
+            tk.Label(self._guilds_frame,
+                     text="Sign in to access guilds.",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, pady=40).pack()
+            return
+        self._guilds_status.config(text="Loading…", fg=T["fg_dim"])
+        self._my_guild_data   = None
+        self._guild_list_data = None
+
+        def _cb_mine(res):
+            self.app.after(0, lambda r=res: self._on_my_guild_loaded(r))
+
+        def _cb_list(res):
+            self.app.after(0, lambda r=res: self._on_guild_list_loaded(r))
+
+        self.app.online.guilds.get_my_guild(callback=_cb_mine)
+        self.app.online.guilds.list_guilds(limit=25, callback=_cb_list)
+
+    def _on_my_guild_loaded(self, res) -> None:
+        self._my_guild_data = res.data if res.success else None
+        # Cache guild name for leaderboard submissions
+        if self._my_guild_data and isinstance(self._my_guild_data, dict):
+            self.app._cached_guild_name = self._my_guild_data.get("name", "")
+        else:
+            self.app._cached_guild_name = ""
+        self._render_guilds()
+
+    def _on_guild_list_loaded(self, res) -> None:
+        self._guild_list_data = (res.data if (res.success and isinstance(res.data, list))
+                                 else [])
+        self._render_guilds()
+
+    def _render_guilds(self) -> None:
+        try:
+            for w in list(self._guilds_frame.winfo_children()):
+                w.destroy()
+        except tk.TclError:
+            return
+
+        my_guild   = self._my_guild_data
+        guild_list = self._guild_list_data
+        if guild_list is None:
+            return  # still waiting for one of the two responses
+
+        n = len(guild_list)
+        try:
+            self._guilds_status.config(text=f"{n} guild{'s' if n != 1 else ''} found",
+                                       fg=T["fg_dim"])
+        except tk.TclError:
+            pass
+
+        # ── Your guild ────────────────────────────────────────────────────
+        self._sec_hdr(self._guilds_frame, "  ✦  Your Guild")
+        if my_guild:
+            self._render_my_guild_card(my_guild)
+        else:
+            tk.Label(self._guilds_frame,
+                     text="  You are not a member of any guild.",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, pady=8, padx=12).pack(anchor="w")
+            found_btn = tk.Label(self._guilds_frame,
+                                 text="  ✦  Found a New Guild  ",
+                                 bg=T["bg_button"], fg=T["cyan"],
+                                 font=FONT_FANTASY_BOLD, cursor="hand2",
+                                 padx=10, pady=6)
+            found_btn.pack(anchor="w", padx=14, pady=(4, 10))
+            found_btn.bind("<Button-1>", lambda _: self._do_create_guild())
+            found_btn.bind("<Enter>",    lambda e: e.widget.config(bg=T["bg_button_act"]))
+            found_btn.bind("<Leave>",    lambda e: e.widget.config(bg=T["bg_button"]))
+
+        # ── Browse guilds ─────────────────────────────────────────────────
+        self._sec_hdr(self._guilds_frame, f"  ✦  Browse Guilds  ({n})")
+        if not guild_list:
+            tk.Label(self._guilds_frame,
+                     text="  No guilds yet — be the first to found one!",
+                     bg=T["bg"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, pady=8, padx=12).pack(anchor="w")
+        else:
+            for g in guild_list:
+                self._make_guild_row(g, my_guild)
+
+    def _render_my_guild_card(self, guild: Dict) -> None:
+        card = tk.Frame(self._guilds_frame, bg=T["bg_panel"])
+        card.pack(fill="x", padx=12, pady=6)
+        tk.Frame(card, bg=T["cyan"], width=4).pack(side="left", fill="y")
+
+        body = tk.Frame(card, bg=T["bg_panel"])
+        body.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+
+        tk.Label(body, text=guild.get("name", "Unknown"),
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_TITLE, anchor="w").pack(anchor="w")
+
+        desc = guild.get("description") or "No description."
+        tk.Label(body, text=desc,
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S, anchor="w",
+                 wraplength=520).pack(anchor="w", pady=(2, 0))
+
+        cnt = guild.get("member_count", 0)
+        tk.Label(body, text=f"👥  {cnt} member{'s' if cnt != 1 else ''}",
+                 bg=T["bg_panel"], fg=T["fg"],
+                 font=FONT_FANTASY_S, anchor="w").pack(anchor="w", pady=(4, 0))
+
+        gid = guild.get("id", "")
+        leave = tk.Label(body, text="  Leave Guild  ",
+                         bg="#3a1010", fg=T["red"],
+                         font=FONT_FANTASY_S, cursor="hand2",
+                         padx=6, pady=3)
+        leave.pack(anchor="w", pady=(8, 0))
+        leave.bind("<Button-1>",
+                   lambda _, g=gid, n=guild.get("name", ""): self._do_leave_guild(g, n))
+        leave.bind("<Enter>", lambda e: e.widget.config(bg="#5a1010"))
+        leave.bind("<Leave>", lambda e: e.widget.config(bg="#3a1010"))
+
+    def _make_guild_row(self, guild: Dict, my_guild: Optional[Dict]) -> None:
+        gid     = guild.get("id", "")
+        name    = guild.get("name", "?")
+        desc    = guild.get("description") or ""
+        cnt     = guild.get("member_count", 0)
+        is_mine = my_guild and my_guild.get("id") == gid
+
+        row = tk.Frame(self._guilds_frame, bg=T["bg_panel"])
+        row.pack(fill="x", padx=12, pady=2)
+        tk.Frame(row, bg=T["cyan"] if is_mine else T["border"],
+                 width=2).pack(side="left", fill="y")
+
+        body = tk.Frame(row, bg=T["bg_panel"])
+        body.pack(side="left", fill="both", expand=True, padx=10, pady=6)
+
+        tk.Label(body, text=name,
+                 bg=T["bg_panel"], fg=T["cyan"] if is_mine else T["fg"],
+                 font=FONT_FANTASY_BOLD, anchor="w").pack(anchor="w")
+        if desc:
+            tk.Label(body, text=desc[:90] + ("…" if len(desc) > 90 else ""),
+                     bg=T["bg_panel"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, anchor="w").pack(anchor="w")
+        tk.Label(body, text=f"👥  {cnt}",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S, anchor="w").pack(anchor="w")
+
+        if not is_mine and not my_guild:
+            jb = tk.Label(row, text="  Join  ",
+                          bg=T["bg_button"], fg=T["cyan"],
+                          font=FONT_FANTASY_S, cursor="hand2",
+                          padx=6, pady=4)
+            jb.pack(side="right", padx=(4, 10), pady=6)
+            jb.bind("<Button-1>",
+                    lambda _, g=gid, n=name: self._do_join_guild(g, n))
+            jb.bind("<Enter>", lambda e: e.widget.config(bg=T["bg_button_act"]))
+            jb.bind("<Leave>", lambda e: e.widget.config(bg=T["bg_button"]))
+
+    # ── Guild actions ──────────────────────────────────────────────────────────
+
+    def _do_create_guild(self) -> None:
+        name = InputDialog(self.app, "Guild name:", title="Found a Guild").wait()
+        if not name:
+            return
+        name = name.strip()
+        if len(name) < 3:
+            self.msg.warn("Guild name must be at least 3 characters.")
+            return
+        desc = InputDialog(self.app, "Brief description (optional):",
+                           title="Guild Description").wait() or ""
+        self.msg.info(f"Founding '{name}'…")
+
+        def _cb(res):
+            self.app.after(0, lambda r=res, n=name: self._on_guild_created(r, n))
+
+        self.app.online.guilds.create_guild(name, desc, callback=_cb)
+
+    def _on_guild_created(self, res, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"'{name}' founded! Welcome, Guild Master.")
+            self._load_guilds(force=True)
+        else:
+            self.msg.err(res.error or "Failed to create guild.")
+
+    def _do_join_guild(self, guild_id: str, name: str) -> None:
+        if not ConfirmDialog(self.app, f"Join guild '{name}'?", "Join Guild").wait():
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda r=res, n=name: self._on_guild_joined(r, n))
+
+        self.app.online.guilds.join_guild(guild_id, callback=_cb)
+
+    def _on_guild_joined(self, res, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"Joined '{name}'! Welcome to the guild.")
+            self._load_guilds(force=True)
+        else:
+            self.msg.err(res.error or "Failed to join guild.")
+
+    def _do_leave_guild(self, guild_id: str, name: str) -> None:
+        if not ConfirmDialog(self.app, f"Leave guild '{name}'?", "Leave Guild").wait():
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda r=res, n=name: self._on_guild_left(r, n))
+
+        self.app.online.guilds.leave_guild(guild_id, callback=_cb)
+
+    def _on_guild_left(self, res, name: str) -> None:
+        if res.success:
+            self.msg.ok(f"You have left '{name}'.")
+            self.app._cached_guild_name = ""
+            self._load_guilds(force=True)
+        else:
+            self.msg.err(res.error or "Failed to leave guild.")
+
+
 # MAIN MENU SCREEN  —  first fully implemented screen
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -11560,6 +12520,7 @@ class MainMenuScreen(Screen):
         ("Voyage",        "voyage",     "OPERATIONS",   "⛵", "Send cargo on international sea voyages"),
         ("Market Info",   "market",     "INTELLIGENCE", "📊", "Prices & trade routes"),
         ("News & Events", "news",       "INTELLIGENCE", "📰", "World events & impacts"),
+        ("Social Hub",    "social",     "SOCIAL",       "🌐", "Leaderboard, friends & guilds"),
         ("Influence",     "influence",  "PLAYER",       "⭐", "Reputation & market power"),
         ("Licenses",      "licenses",   "PLAYER",       "📋", "Permits & certifications"),
         ("Settings",      "settings",   "PLAYER",       "⚙", "Options, audio & keybindings"),
@@ -11569,29 +12530,18 @@ class MainMenuScreen(Screen):
         outer = ttk.Frame(self, style="MT.TFrame")
         outer.pack(fill="both", expand=True)
 
-        # ── Dashboard strip ───────────────────────────────────────────────
+        # ── Alert strip (stats duplicated in persistent StatusBar, omitted here) ──
         dash = tk.Frame(outer, bg=T["bg_panel"])
         dash.pack(fill="x")
         tk.Frame(outer, bg=T["border_light"], height=2).pack(fill="x")
 
-        dl = tk.Frame(dash, bg=T["bg_panel"])
-        dl.pack(side="left", fill="y", expand=True)
+        self._dash_alert = tk.Label(dash, text="", font=FONT_FANTASY_S,
+                                    bg=T["bg_panel"], fg=T["yellow"],
+                                    padx=16, pady=4, anchor="w", justify="left")
+        self._dash_alert.pack(side="left", fill="both", expand=True)
+
         dr = tk.Frame(dash, bg=T["bg_panel"])
         dr.pack(side="right")
-
-        self._dash_gold   = tk.Label(dl, text="", font=FONT_FANTASY_BOLD,
-                                     bg=T["bg_panel"], fg=T["yellow"],
-                                     padx=16, pady=5, anchor="w")
-        self._dash_gold.pack(anchor="w")
-        self._dash_status = tk.Label(dl, text="", font=FONT_FANTASY_S,
-                                     bg=T["bg_panel"], fg=T["fg_dim"],
-                                     padx=16, pady=1, anchor="w")
-        self._dash_status.pack(anchor="w")
-
-        self._dash_alert = tk.Label(dr, text="", font=FONT_FANTASY_S,
-                                    bg=T["bg_panel"], fg=T["yellow"],
-                                    padx=16, pady=6, anchor="e", justify="right")
-        self._dash_alert.pack(anchor="e", fill="both", expand=True)
 
         # ── Debug buttons (testing aids) ──────────────────────────────────
         tk.Button(dr, text="🗑 Purge Saves",
@@ -11615,6 +12565,13 @@ class MainMenuScreen(Screen):
                   padx=6, pady=2,
                   cursor="hand2",
                   command=self._debug_add_gold).pack(side="right", padx=(0, 4), pady=4)
+        tk.Button(dr, text="✉ Send Mail",
+                  font=FONT_FANTASY_S,
+                  bg="#1a1a3a", fg="#aaaaee",
+                  relief="flat", bd=0,
+                  padx=6, pady=2,
+                  cursor="hand2",
+                  command=self._debug_send_mail).pack(side="right", padx=(0, 4), pady=4)
 
         # ── Card grid ─────────────────────────────────────────────────────
         _scroll = ScrollableFrame(outer)
@@ -11715,27 +12672,11 @@ class MainMenuScreen(Screen):
         return border
 
     def refresh(self) -> None:
-        if not hasattr(self, "_dash_gold"):
+        if not hasattr(self, "_dash_alert"):
             return
         g = self.game
 
-        # ── Left dashboard ────────────────────────────────────────────────
-        self._dash_gold.config(
-            text=f"◆  {g.inventory.gold:,.0f}g    🏦 Bank: {g.bank_balance:,.0f}g"
-                 f"    📈 Net Worth: {g._net_worth():,.0f}g"
-        )
-        left    = g.DAILY_TIME_UNITS - g.daily_time_units
-        used    = g.daily_time_units
-        slot_col = T["red"] if left == 0 else (T["yellow"] if left <= 2 else T["cyan"])
-        wt_str  = f"{g._current_weight():.0f} / {g._max_carry_weight():.0f} wt"
-        self._dash_status.config(
-            text=(f"{'●' * used}{'○' * left}  ·  {left} action{'s' if left != 1 else ''} left  ·  "
-                  f"🎒 {wt_str}  ·  📍 {g.current_area.value}  ·  "
-                  f"Year {g.year}, Day {g.day} — {g.season.value}"),
-            fg=slot_col,
-        )
-
-        # ── Right alert badges ────────────────────────────────────────────
+        # ── Alert strip ───────────────────────────────────────────────────
         alerts: List[str] = []
         active_con = [c for c in g.contracts if not c.fulfilled]
         if active_con:
@@ -11772,6 +12713,89 @@ class MainMenuScreen(Screen):
         self.game.inventory.gold += 5000
         self.app.refresh()
         self.msg.ok("+5000g added (debug).")
+
+    def _debug_send_mail(self) -> None:
+        """
+        Debug: inject three fake inbox messages locally so the full inbox
+        UI flow can be tested without a service-role DB insert.
+        Messages are pushed directly into the InboxPanel's _populate() method.
+        """
+        import datetime as _dt
+        now = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake_msgs = [
+            {
+                "id":                 99001,
+                "msg_type":           "notification",
+                "subject":            "New Friend Request",
+                "body":               (
+                    "GoldMerchant #4291 has sent you a friend request!\n"
+                    "Open your Friends list in the Profile panel to accept or decline."
+                ),
+                "reward_gold":        0,
+                "reward_items":       {},
+                "reward_title":       "",
+                "reward_description": "",
+                "is_read":            False,
+                "reward_claimed":     False,
+                "created_at":         now,
+                "expires_at":         None,
+            },
+            {
+                "id":                 99002,
+                "msg_type":           "reward",
+                "subject":            "🎁  Seasonal Harvest Festival Reward",
+                "body":               (
+                    "Thank you for participating in the Harvest Festival event!\n"
+                    "As a reward for your contributions to the merchant community, "
+                    "we are delighted to send you this seasonal gift."
+                ),
+                "reward_gold":        2500,
+                "reward_items":       {"spice": 10, "silk": 5},
+                "reward_title":       "",
+                "reward_description": "2,500g  ·  10x Spice  ·  5x Silk",
+                "is_read":            False,
+                "reward_claimed":     False,
+                "created_at":         now,
+                "expires_at":         None,
+            },
+            {
+                "id":                 99003,
+                "msg_type":           "maintenance",
+                "subject":            "⚙  Scheduled Maintenance Notice",
+                "body":               (
+                    "Merchant Tycoon servers will undergo scheduled maintenance on "
+                    "Sunday, April 5th from 02:00–04:00 UTC.\n\n"
+                    "Cloud saves and online features will be unavailable during this "
+                    "window. Your local save is always accessible offline.\n\n"
+                    "As compensation for any inconvenience, all players who log in "
+                    "within 7 days of maintenance will receive a Maintenance Reward "
+                    "in their inbox."
+                ),
+                "reward_gold":        0,
+                "reward_items":       {},
+                "reward_title":       "",
+                "reward_description": "",
+                "is_read":            False,
+                "reward_claimed":     False,
+                "created_at":         now,
+                "expires_at":         None,
+            },
+        ]
+
+        class _FakeResult:
+            success = True
+            data    = fake_msgs
+            error   = ""
+
+        inbox = getattr(self.app, "inbox_panel", None)
+        if not inbox:
+            self.msg.warn("Inbox panel not found.")
+            return
+        # Stage messages — shown when the user opens the inbox manually
+        inbox._debug_messages = fake_msgs
+        # Update badge counter; do NOT auto-open the panel
+        self.app._update_inbox_badge(3)
+        self.msg.ok("Debug: 3 fake inbox messages ready — click ✉ to view.")
 
     def _debug_cloud_restore(self) -> None:
         """Manually pull the cloud save and restore it (overwrites local)."""
@@ -13042,6 +14066,7 @@ class ProfileSidePanel(tk.Frame):
                 p     = req.get("profiles") or {}
                 rname = p.get("username",      "Unknown")
                 rdisc = p.get("discriminator", 0)
+                rnet  = float(p.get("last_networth", 0) or 0)
                 rid   = req.get("requester_id", "")
                 disc_str = f" #{rdisc:04d}" if rdisc else ""
 
@@ -13050,6 +14075,9 @@ class ProfileSidePanel(tk.Frame):
                 tk.Label(row, text=f"{rname}{disc_str}",
                          bg=T["bg_panel"], fg=T["fg"],
                          font=FONT_FANTASY_S, anchor="w").pack(side="left")
+                tk.Label(row, text=f"  {rnet:,.0f}g NW",
+                         bg=T["bg_panel"], fg=T["yellow"],
+                         font=FONT_SMALL).pack(side="left")
                 ttk.Button(row, text="✓", style="OK.TButton",
                            command=lambda r=rid, n=rname:
                                self._do_respond(r, True, n)
@@ -13260,6 +14288,366 @@ class ProfileSidePanel(tk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# INBOX PANEL  —  slide-in panel for mail, rewards, and notifications
+# ══════════════════════════════════════════════════════════════════════════════
+
+class InboxPanel(tk.Frame):
+    """
+    Animated slide-in inbox panel anchored to the right edge of the game window.
+    Mutually exclusive with ProfileSidePanel — opening one closes the other.
+    Toggle via GameApp.toggle_inbox_panel().
+    """
+
+    WIDTH    = 420
+    _STEPS   = 14
+    _STEP_MS = 15
+
+    # Type badge colors
+    _TYPE_COLOURS = {
+        "reward":       "#ffad3a",
+        "seasonal":     "#ffad3a",
+        "maintenance":  "#ffd060",
+        "notification": "#a89878",
+        "mail":         "#b89870",
+    }
+
+    def __init__(self, app: "GameApp") -> None:
+        super().__init__(app, bg=T["bg_panel"])
+        self.app      = app
+        self._visible = False
+        self._anim_id: Optional[str] = None
+
+        self._build()
+
+        app.update_idletasks()
+        off = max(app.winfo_width(), app.WIN_W) + 1
+        self.place(x=off, y=0, width=self.WIDTH, relheight=1.0)
+        self.lift()
+        app.bind("<Configure>", self._on_resize, add="+")
+
+    # ── Resize ────────────────────────────────────────────────────────────────
+
+    def _on_resize(self, _e: tk.Event = None) -> None:
+        w = self.app.winfo_width()
+        if w < 10:
+            return
+        if self._visible:
+            self.place(x=w - self.WIDTH, y=0, width=self.WIDTH, relheight=1.0)
+        else:
+            self.place(x=w + 1, y=0, width=self.WIDTH, relheight=1.0)
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        tk.Frame(self, bg=T["border_light"], width=2).pack(side="left", fill="y")
+
+        main = tk.Frame(self, bg=T["bg_panel"])
+        main.pack(side="left", fill="both", expand=True)
+
+        # Header
+        hdr_bg = "#1c1410"
+        hdr = tk.Frame(main, bg=hdr_bg)
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=T["border_light"], height=2).pack(fill="x", side="top")
+
+        hdr_inner = tk.Frame(hdr, bg=hdr_bg)
+        hdr_inner.pack(fill="x")
+
+        tk.Label(hdr_inner, text="✉  Inbox",
+                 bg=hdr_bg, fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, anchor="w",
+                 padx=12, pady=8).pack(side="left")
+
+        close_lbl = tk.Label(hdr_inner, text=" ✕ ",
+                             bg=hdr_bg, fg=T["grey"],
+                             font=FONT_FANTASY_BOLD, cursor="hand2",
+                             padx=6, pady=8)
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda _: self.app.toggle_inbox_panel())
+        close_lbl.bind("<Enter>",    lambda e: e.widget.config(bg="#5a1010", fg=T["fg_header"]))
+        close_lbl.bind("<Leave>",    lambda e: e.widget.config(bg=hdr_bg,    fg=T["grey"]))
+
+        mark_all = tk.Label(hdr_inner, text="✓ All Read",
+                            bg=hdr_bg, fg=T["fg_dim"],
+                            font=FONT_FANTASY_S, cursor="hand2", padx=8)
+        mark_all.pack(side="right", pady=4)
+        mark_all.bind("<Button-1>", lambda _: self._do_mark_all_read())
+        mark_all.bind("<Enter>",    lambda e: e.widget.config(fg=T["green"]))
+        mark_all.bind("<Leave>",    lambda e: e.widget.config(fg=T["fg_dim"]))
+
+        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", side="bottom")
+
+        # Scrollable message list
+        sf = ScrollableFrame(main)
+        sf.pack(fill="both", expand=True)
+        self._list_frame = sf.inner
+        self._debug_messages: list | None = None   # staged by debug button
+
+    # ── Toggle / Animate ──────────────────────────────────────────────────────
+
+    def toggle(self) -> None:
+        if self._visible:
+            self._animate_out()
+        else:
+            self._visible = True
+            self.lift()
+            self._animate_in()
+            self.refresh()
+
+    def _animate_in(self) -> None:
+        self._animate_to(self.app.winfo_width() - self.WIDTH)
+
+    def _animate_out(self) -> None:
+        def _done():
+            self._visible = False
+        self._animate_to(self.app.winfo_width() + 1, on_done=_done)
+
+    def _animate_to(self, target_x: int, on_done=None) -> None:
+        if self._anim_id:
+            self.app.after_cancel(self._anim_id)
+            self._anim_id = None
+        try:
+            start_x = self.winfo_x()
+        except tk.TclError:
+            start_x = self.app.winfo_width()
+        steps = self._STEPS
+        dx    = target_x - start_x
+
+        def _step(n: int) -> None:
+            if n <= 0:
+                try:
+                    self.place(x=target_x, y=0, width=self.WIDTH, relheight=1.0)
+                except tk.TclError:
+                    pass
+                if on_done:
+                    on_done()
+                return
+            t       = 1.0 - n / steps
+            t_eased = t * t * (3.0 - 2.0 * t)
+            nx = int(start_x + dx * t_eased)
+            try:
+                self.place(x=nx, y=0, width=self.WIDTH, relheight=1.0)
+            except tk.TclError:
+                return
+            self._anim_id = self.app.after(self._STEP_MS, lambda: _step(n - 1))
+
+        _step(steps)
+
+    # ── Data refresh ──────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        """Fetch and display inbox messages."""
+        # Debug path: consume staged messages without any API call
+        if self._debug_messages is not None:
+            staged = self._debug_messages
+            self._debug_messages = None
+
+            class _R:
+                success = True
+                data    = staged
+                error   = ""
+
+            self._populate(_R())
+            return
+
+        if not (self.app.online and self.app.online.is_online):
+            self._clear_list()
+            try:
+                tk.Label(self._list_frame,
+                         text="Sign in to access your inbox.",
+                         bg=T["bg_panel"], fg=T["fg_dim"],
+                         font=FONT_FANTASY_S, anchor="center", pady=40).pack()
+            except tk.TclError:
+                pass
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda: self._populate(res))
+        self.app.online.inbox.list_messages(callback=_cb)
+
+    def _clear_list(self) -> None:
+        try:
+            for w in list(self._list_frame.winfo_children()):
+                w.destroy()
+        except tk.TclError:
+            pass
+
+    def _populate(self, res) -> None:
+        self._clear_list()
+        msgs = res.data if (res.success and isinstance(res.data, list)) else []
+        if not msgs:
+            try:
+                tk.Label(self._list_frame,
+                         text="Your inbox is empty.",
+                         bg=T["bg_panel"], fg=T["fg_dim"],
+                         font=FONT_FANTASY_S, anchor="center", pady=40).pack()
+            except tk.TclError:
+                pass
+            return
+        for msg in msgs:
+            self._build_card(msg)
+        # After displaying, do a poll to update badge with fresh count
+        def _bc(br):
+            if br and br.success:
+                self.app.after(0, lambda: self.app._update_inbox_badge(br.data or 0))
+        self.app.online.inbox.get_unread_count(callback=_bc)
+
+    def _build_card(self, msg: dict) -> None:
+        try:
+            msg_id  = msg.get("id", 0)
+            is_read = bool(msg.get("is_read", False))
+            claimed = bool(msg.get("reward_claimed", False))
+            mtype   = str(msg.get("msg_type", "mail"))
+            subject = str(msg.get("subject", "(No subject)"))
+            body    = str(msg.get("body", ""))
+            created = str(msg.get("created_at", ""))[:10]
+            r_gold  = float(msg.get("reward_gold", 0) or 0)
+            r_title = str(msg.get("reward_title", "") or "")
+            r_items = dict(msg.get("reward_items", {}) or {})
+            r_desc  = str(msg.get("reward_description", "") or "")
+            has_reward = bool(r_gold or r_title or r_items)
+
+            card_bg = T["bg_panel"] if is_read else "#2a1f0e"
+            card = tk.Frame(self._list_frame, bg=card_bg, padx=10, pady=8)
+            card.pack(fill="x", padx=4, pady=(2, 0))
+
+            # ── Top row: unread dot + subject + type badge ─────────────
+            top = tk.Frame(card, bg=card_bg)
+            top.pack(fill="x")
+
+            dot_col = T["yellow"] if not is_read else T["fg_dim"]
+            tk.Label(top, text="●" if not is_read else "○",
+                     bg=card_bg, fg=dot_col,
+                     font=FONT_MONO_S, width=2).pack(side="left")
+
+            subj_font = FONT_FANTASY_BOLD if not is_read else FONT_FANTASY_S
+            subj_col  = T["fg_header"] if not is_read else T["fg"]
+            tk.Label(top, text=subject,
+                     bg=card_bg, fg=subj_col,
+                     font=subj_font, anchor="w").pack(side="left", fill="x", expand=True)
+
+            badge_col = self._TYPE_COLOURS.get(mtype, T["fg_dim"])
+            tk.Label(top, text=mtype.upper(),
+                     bg=card_bg, fg=badge_col,
+                     font=FONT_SMALL, padx=4).pack(side="right")
+
+            # ── Date ───────────────────────────────────────────────────
+            tk.Label(card, text=created,
+                     bg=card_bg, fg=T["fg_dim"],
+                     font=FONT_SMALL, anchor="w", padx=14).pack(fill="x")
+
+            # ── Body text ──────────────────────────────────────────────
+            if body:
+                preview = body if len(body) <= 180 else body[:177] + "…"
+                tk.Label(card, text=preview,
+                         bg=card_bg, fg=T["fg"],
+                         font=FONT_SMALL, anchor="w", padx=14,
+                         justify="left", wraplength=380).pack(fill="x", pady=(2, 0))
+
+            # ── Reward description ─────────────────────────────────────
+            if has_reward and r_desc:
+                tk.Label(card, text=f"🎁  {r_desc}",
+                         bg=card_bg, fg=T["yellow"],
+                         font=FONT_FANTASY_S, anchor="w", padx=14).pack(fill="x", pady=(3, 0))
+
+            # ── Action row ─────────────────────────────────────────────
+            act = tk.Frame(card, bg=card_bg)
+            act.pack(fill="x", pady=(6, 0))
+
+            if has_reward and not claimed:
+                ttk.Button(act, text="🎁  Claim Reward",
+                           style="OK.TButton",
+                           command=lambda m=msg_id: self._do_claim(m)
+                           ).pack(side="left", padx=(14, 4))
+            elif has_reward and claimed:
+                tk.Label(act, text="✓ Claimed",
+                         bg=card_bg, fg=T["green"],
+                         font=FONT_FANTASY_S, padx=14).pack(side="left")
+
+            del_lbl = tk.Label(act, text=" 🗑 ",
+                               bg=card_bg, fg=T["grey"],
+                               font=FONT_SMALL, cursor="hand2")
+            del_lbl.pack(side="right", padx=4)
+            del_lbl.bind("<Button-1>",
+                         lambda _e, m=msg_id, c=card: self._do_delete(m, c))
+            del_lbl.bind("<Enter>", lambda e: e.widget.config(fg=T["red"]))
+            del_lbl.bind("<Leave>", lambda e: e.widget.config(fg=T["grey"]))
+
+            # Auto-mark as read shortly after display
+            if not is_read:
+                self.app.after(600, lambda m=msg_id: self._silent_mark_read(m))
+
+            # Separator
+            tk.Frame(self._list_frame, bg=T["border"], height=1).pack(
+                fill="x", padx=4)
+        except tk.TclError:
+            pass
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _silent_mark_read(self, msg_id: int) -> None:
+        if self.app.online and self.app.online.is_online:
+            self.app.online.inbox.mark_read(msg_id, callback=lambda _r: None)
+
+    # ── Action handlers ───────────────────────────────────────────────────────
+
+    def _do_mark_all_read(self) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            return
+
+        def _cb(res):
+            def _upd():
+                if res.success:
+                    self.refresh()
+                    self.app._update_inbox_badge(0)
+            self.app.after(0, _upd)
+        self.app.online.inbox.mark_all_read(callback=_cb)
+
+    def _do_claim(self, msg_id: int) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda: self._handle_claim(res))
+        self.app.online.inbox.claim_reward(msg_id, callback=_cb)
+
+    def _handle_claim(self, res) -> None:
+        try:
+            if not res.success:
+                if isinstance(res.data, dict) and res.data.get("already_claimed"):
+                    self.app.message_bar.warn("Reward was already claimed.")
+                else:
+                    self.app.message_bar.err(res.error or "Failed to claim reward.")
+                return
+            self.app._apply_inbox_reward(res.data or {})
+            self.refresh()
+        except Exception:
+            pass
+
+    def _do_delete(self, msg_id: int, card: tk.Frame) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            return
+        try:
+            card.destroy()
+        except tk.TclError:
+            pass
+
+        def _cb(res):
+            def _upd():
+                if not res.success:
+                    self.app.message_bar.err("Failed to delete message.")
+                    self.refresh()
+                else:
+                    def _bc(br):
+                        if br and br.success:
+                            self.app.after(0,
+                                lambda: self.app._update_inbox_badge(br.data or 0))
+                    self.app.online.inbox.get_unread_count(callback=_bc)
+            self.app.after(0, _upd)
+        self.app.online.inbox.delete_message(msg_id, callback=_cb)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GAME APP  —  root window and navigation controller
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -13310,6 +14698,7 @@ class GameApp(tk.Tk):
         "settings":   SettingsScreen,
         "gamble":     GambleScreen,
         "voyage":     VoyageScreen,
+        "social":     SocialScreen,
     }
 
     def __init__(self) -> None:
@@ -13428,6 +14817,11 @@ class GameApp(tk.Tk):
 
         # ── Profile side panel (slide-in overlay, created after screens) ──
         self.profile_panel = ProfileSidePanel(self)
+
+        # ── Inbox panel (slide-in overlay, mutually exclusive with profile) ──
+        self._inbox_unread:    int = 0
+        self._cached_guild_name:   str = ""   # updated by SocialScreen guilds tab
+        self.inbox_panel = InboxPanel(self)
 
         # ── Global key bindings ───────────────────────────────────────────
         self.bind_all("<Escape>", self._on_escape)
@@ -13867,6 +15261,7 @@ class GameApp(tk.Tk):
             self.after(200, lambda: self.message_bar.ok(
                 f"✦  Signed in as {_online_greeting}  —  Online"))
             self.after(500, self._start_cloud_sync)
+            self.after(1200, self._start_inbox_polling)
             try:
                 self.custom_title.profile_btn.config(
                     text=" ● 👤 ", fg=T["green"])
@@ -13954,9 +15349,79 @@ class GameApp(tk.Tk):
     # ── Profile panel ─────────────────────────────────────────────────────────
 
     def toggle_profile_panel(self) -> None:
-        """Toggle the profile/social slide-in panel."""
+        """Toggle the profile/social slide-in panel (closes inbox if open)."""
+        if hasattr(self, "inbox_panel") and self.inbox_panel._visible:
+            self.inbox_panel.toggle()
         if hasattr(self, "profile_panel"):
             self.profile_panel.toggle()
+
+    def toggle_inbox_panel(self) -> None:
+        """Toggle the inbox panel (closes profile if open)."""
+        if hasattr(self, "profile_panel") and self.profile_panel._visible:
+            self.profile_panel.toggle()
+        if hasattr(self, "inbox_panel"):
+            self.inbox_panel.toggle()
+
+    # ── Inbox polling + badge ─────────────────────────────────────────────────
+
+    def _start_inbox_polling(self) -> None:
+        """Begin 30-second periodic polling for new inbox messages."""
+        self._do_inbox_poll()
+
+    def _do_inbox_poll(self) -> None:
+        """Poll the inbox for unread messages, then reschedule."""
+        if self.online and self.online.is_online:
+            def _cb(res):
+                if res and res.success:
+                    self.after(0, lambda: self._update_inbox_badge(res.data or 0))
+            self.online.inbox.get_unread_count(callback=_cb)
+        self.after(30_000, self._do_inbox_poll)
+
+    def _update_inbox_badge(self, count: int) -> None:
+        """Update the header inbox badge and refresh panel if open."""
+        self._inbox_unread = count
+        try:
+            self.custom_title.update_inbox_badge(count)
+        except Exception:
+            pass
+
+    def _apply_inbox_reward(self, reward: dict) -> None:
+        """Apply a claimed inbox reward to the live game state, then save."""
+        gold  = float(reward.get("reward_gold",  0) or 0)
+        items = dict(reward.get("reward_items",  {}) or {})
+        title = str(reward.get("reward_title",   "") or "")
+        desc  = str(reward.get("reward_description", "") or "")
+
+        if gold > 0:
+            self.game.inventory.gold = round(self.game.inventory.gold + gold, 2)
+
+        for item_key, qty in items.items():
+            try:
+                qty = int(qty)
+            except (TypeError, ValueError):
+                continue
+            self.game.inventory.items[item_key] = (
+                self.game.inventory.items.get(item_key, 0) + qty)
+
+        if title and title not in self.game.earned_titles:
+            self.game.earned_titles.append(title)
+            self.game.title_queue.append(title)
+            self._flush_achievements()
+
+        # Build a human-readable reward summary
+        parts: list = []
+        if gold > 0:
+            parts.append(f"{gold:,.0f}g")
+        if items:
+            parts.append(", ".join(f"{q}x {k}" for k, q in items.items()))
+        if title:
+            parts.append(f'title "{title}"')
+        reward_str = "  ·  ".join(parts) if parts else "a reward"
+        self.message_bar.ok(f"🎁  Reward claimed!  {reward_str}")
+
+        self.refresh()
+        self.after(500, lambda: self.game.save_game(silent=True)  # type: ignore
+                   if self.game else None)
 
     # ── Cloud sync ────────────────────────────────────────────────────────────
 
@@ -13976,7 +15441,7 @@ class GameApp(tk.Tk):
         self._sync_timer = self.after(3 * 60 * 1000, self._start_cloud_sync)
 
     def _do_cloud_sync(self) -> None:
-        """Push presence data (last_seen, net_worth, area) silently."""
+        """Push presence data (last_seen, net_worth, area) and leaderboard score silently."""
         if not (self.online and self.online.is_online):
             return
         try:
@@ -13986,6 +15451,43 @@ class GameApp(tk.Tk):
             )
         except Exception:
             pass
+        self._push_leaderboard()
+
+    def _push_leaderboard(self, done_callback=None) -> None:
+        """Upsert the player's net worth on the global leaderboard.
+
+        done_callback — optional no-arg callable invoked (via after(0,...)) once
+                        the upsert completes (success or failure).
+        """
+        if not (self.online and self.online.is_online):
+            if done_callback:
+                self.after(0, done_callback)
+            return
+        try:
+            g          = self.game
+            nw         = g._net_worth()
+            td         = None
+            if getattr(g, "active_title", None):
+                from merchant_tycoon import TITLES_BY_ID as _TBID
+                td = _TBID.get(g.active_title)
+            title_name = td["name"] if td else ""
+            guild_name = getattr(self, "_cached_guild_name", "")
+            cb = (lambda _r: self.after(0, done_callback)) if done_callback else None
+            self.online.leaderboard.submit_score(
+                gold          = g.inventory.gold,
+                reputation    = g.reputation,
+                day           = g._absolute_day(),
+                net_worth     = nw,
+                lifetime_gold = getattr(g, "lifetime_gold", g.inventory.gold),
+                title         = title_name,
+                player_name   = g.player_name or "",
+                guild_name    = guild_name,
+                area          = g.current_area.value,
+                callback      = cb,
+            )
+        except Exception:
+            if done_callback:
+                self.after(0, done_callback)
 
     def _push_cloud_save(self) -> None:
         """Upload the current save file to the cloud."""

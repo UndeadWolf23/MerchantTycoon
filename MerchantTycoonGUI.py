@@ -34,6 +34,7 @@ from tkinter import ttk
 import sys
 import os
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 # ── Import game model ─────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ if _HERE not in sys.path:
 from merchant_tycoon import (
     Game, Area, Season, LicenseType, SkillType, ItemCategory, PropertyType,
     ALL_ITEMS, AREA_INFO, BUSINESS_CATALOGUE, LICENSE_INFO, ACHIEVEMENTS,
+    TITLE_DEFINITIONS, TITLES_BY_ID,
     PROPERTY_CATALOGUE, LAND_PLOT_SIZES, PROPERTY_UPGRADES, AREA_PROPERTY_MULT,
     _PROP_NAMES, condition_label, DEFAULT_HOTKEYS,
     Item, LoanRecord, CDRecord, make_business, Contract,
@@ -2958,6 +2960,254 @@ class AchievementToast(tk.Toplevel):
             pass
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TITLE TOAST  —  Slide-in notification for newly unlocked titles
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TitleToast(tk.Toplevel):
+    """
+    Non-modal title-unlock popup — mirrors AchievementToast and shares
+    its stack so both toasts interleave without overlapping.
+
+        TitleToast(root, tdef_dict)   # fire-and-forget
+    """
+
+    AUTO_CLOSE_MS = 5_500
+    _SLIDE_STEPS  = 12
+    _SLIDE_MS     = 16
+
+    _TIER_COL = {
+        "bronze":   T["yellow"],
+        "silver":   T["fg"],
+        "gold":     T["yellow"],
+        "platinum": T["cyan"],
+        "":         T["green"],
+    }
+
+    def __init__(self, parent: tk.Widget, tdef: Dict) -> None:
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.configure(bg=T["border_light"])
+        self.attributes("-topmost", True)
+
+        tier_col = self._TIER_COL.get(tdef.get("tier", ""), T["cyan"])
+        inner = tk.Frame(self, bg=T["bg_panel"], padx=16, pady=12)
+        inner.pack(padx=2, pady=2)
+
+        icon = tdef.get("icon", "⚜")
+        tk.Label(inner, text=f"  {icon}  TITLE UNLOCKED!",
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD).pack(anchor="w")
+        ttk.Separator(inner, style="MT.TSeparator").pack(fill="x", pady=(4, 2))
+        tk.Label(inner, text=tdef.get("name", ""),
+                 bg=T["bg_panel"], fg=tier_col,
+                 font=FONT_FANTASY_BOLD).pack(anchor="w")
+
+        desc = tdef.get("desc", "")
+        if desc:
+            tk.Label(inner, text=desc, bg=T["bg_panel"], fg=T["fg"],
+                     font=FONT_FANTASY_S, wraplength=300,
+                     justify="left").pack(anchor="w", pady=(3, 0))
+
+        bonuses = tdef.get("bonuses", {})
+        bonus_parts = []
+        if bonuses.get("gold_mult", 1.0) > 1.0:
+            bonus_parts.append(f"+{int((bonuses['gold_mult']-1)*100)}% Gold")
+        if bonuses.get("rep_mult", 1.0) > 1.0:
+            bonus_parts.append(f"+{int((bonuses['rep_mult']-1)*100)}% Rep")
+        if bonuses.get("xp_mult", 1.0) > 1.0:
+            bonus_parts.append(f"+{int((bonuses['xp_mult']-1)*100)}% XP")
+        if bonus_parts:
+            tk.Label(inner, text="  ".join(bonus_parts),
+                     bg=T["bg_panel"], fg=T["green"],
+                     font=FONT_FANTASY_S).pack(anchor="w", pady=(2, 0))
+
+        # Share AchievementToast._active stack so both types stack correctly
+        self.update_idletasks()
+        slot         = len(AchievementToast._active)
+        h            = self.winfo_height()
+        self._px     = parent.winfo_rootx() + parent.winfo_width() - self.winfo_width() - 20
+        py_final     = parent.winfo_rooty() + parent.winfo_height() - (slot + 1) * (h + 8) - 20
+        py_start     = py_final + h + 20
+        self._py_final = py_final
+        AchievementToast._active.append(self)
+        self.geometry(f"+{self._px}+{py_start}")
+
+        for widget in self.winfo_children() + [self, inner]:
+            try:
+                widget.bind("<Button-1>", lambda _: self._safe_destroy())
+            except tk.TclError:
+                pass
+
+        self._slide_in(py_start, 0, self._SLIDE_STEPS)
+        self.after(self.AUTO_CLOSE_MS, self._safe_destroy)
+
+    def _slide_in(self, py_start: int, step: int, total: int) -> None:
+        if step >= total:
+            try:
+                self.geometry(f"+{self._px}+{self._py_final}")
+            except tk.TclError:
+                pass
+            return
+        t = step / total
+        t_eased = 1 - (1 - t) ** 2
+        py = int(py_start + (self._py_final - py_start) * t_eased)
+        try:
+            self.geometry(f"+{self._px}+{py}")
+            self.after(self._SLIDE_MS,
+                       lambda: self._slide_in(py_start, step + 1, total))
+        except tk.TclError:
+            pass
+
+    def _safe_destroy(self) -> None:
+        try:
+            AchievementToast._active.remove(self)
+        except ValueError:
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TITLE PICKER DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TitlePickerDialog(_BaseDialog):
+    """
+    Scrollable modal dialog listing all titles (earned + locked).
+    Equipping a title updates game state, the profile label, and Supabase.
+
+        TitlePickerDialog(parent_widget, app, title_label).wait()
+    """
+
+    def __init__(self, parent: tk.Widget, app, title_label=None) -> None:
+        super().__init__(parent, "Choose Title")
+        g = app.game
+        earned = set(g.earned_titles)
+
+        TIER_COLOURS = {
+            "bronze": T["yellow"], "silver": T["fg"], "gold": T["yellow"],
+            "platinum": T["cyan"], "": T["green"],
+        }
+
+        def _equip(tid: str) -> None:
+            g.active_title = tid
+            if title_label is not None:
+                try:
+                    tdef = TITLES_BY_ID.get(tid)
+                    display = tdef["name"] if tdef else ""
+                    title_label.config(text=display if display else "No title equipped")
+                except tk.TclError:
+                    pass
+            if app.online and app.online.is_online:
+                try:
+                    app.online.profile.set_active_title(tid)
+                except Exception:
+                    pass
+            app.refresh()
+            self.result = tid
+            self.destroy()
+
+        body_frame = tk.Frame(self, bg=_DIALOG_BG, padx=8, pady=4)
+        body_frame.pack(fill="both", expand=True)
+
+        sf = ScrollableFrame(body_frame)
+        sf.pack(fill="both", expand=True)
+        body = sf.inner
+
+        # "None" option
+        none_row = tk.Frame(body, bg=T["bg_panel"], padx=6, pady=4)
+        none_row.pack(fill="x", pady=2)
+        none_lbl = tk.Label(none_row, text="  ✗  No title",
+                            bg=T["bg_panel"], fg=T["fg_dim"],
+                            font=FONT_FANTASY_S, anchor="w", cursor="hand2")
+        none_lbl.pack(side="left")
+        if not g.active_title:
+            none_lbl.config(fg=T["cyan"], font=FONT_FANTASY_BOLD)
+        none_lbl.bind("<Button-1>", lambda _: _equip(""))
+        none_lbl.bind("<Enter>", lambda e: e.widget.config(bg=T["bg_button_act"]))
+        none_lbl.bind("<Leave>", lambda e: e.widget.config(bg=T["bg_panel"]))
+        tk.Frame(body, bg=T["border"], height=1).pack(fill="x")
+
+        for tdef in TITLE_DEFINITIONS:
+            tid = tdef["id"]
+            if tdef.get("future_event"):
+                continue
+            is_earned = tid in earned
+            bonuses = tdef.get("bonuses", {})
+            bonus_parts = []
+            if bonuses.get("gold_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['gold_mult']-1)*100)}% Gold")
+            if bonuses.get("rep_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['rep_mult']-1)*100)}% Rep")
+            if bonuses.get("xp_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['xp_mult']-1)*100)}% XP")
+            bonus_str = "  ".join(bonus_parts) if bonus_parts else "No bonus"
+            tier_col  = TIER_COLOURS.get(tdef.get("tier", ""), T["fg"])
+
+            row = tk.Frame(body,
+                           bg=T["bg_panel"] if is_earned else _DIALOG_BG,
+                           padx=6, pady=4,
+                           cursor="hand2" if is_earned else "")
+            row.pack(fill="x", pady=1)
+
+            tk.Label(row, text=f" {tdef.get('icon', '★')} ",
+                     bg=row["bg"],
+                     fg=tier_col if is_earned else T["fg_dim"],
+                     font=FONT_FANTASY_S).pack(side="left")
+
+            name_col = tier_col if is_earned else T["fg_dim"]
+            if g.active_title == tid:
+                name_col = T["cyan"]
+            tk.Label(row, text=tdef["name"],
+                     bg=row["bg"], fg=name_col,
+                     font=FONT_FANTASY_BOLD if g.active_title == tid else FONT_FANTASY_S,
+                     anchor="w").pack(side="left", padx=(2, 8))
+
+            if is_earned:
+                tk.Label(row, text=bonus_str,
+                         bg=row["bg"], fg=T["green"],
+                         font=FONT_SMALL).pack(side="left")
+                tk.Label(row,
+                         text="  ←  equipped" if g.active_title == tid else "",
+                         bg=row["bg"], fg=T["cyan"],
+                         font=FONT_SMALL).pack(side="left")
+
+                def _bind_equip(r, t):
+                    row_bg = T["bg_panel"]
+                    def _enter(e):
+                        r.config(bg=T["bg_button_act"])
+                        for w in r.winfo_children():
+                            w.config(bg=T["bg_button_act"])
+                    def _leave(e):
+                        r.config(bg=row_bg)
+                        for w in r.winfo_children():
+                            w.config(bg=row_bg)
+                    def _click(_): _equip(t)
+                    r.bind("<Enter>", _enter)
+                    r.bind("<Leave>", _leave)
+                    r.bind("<Button-1>", _click)
+                    for w in r.winfo_children():
+                        w.bind("<Enter>", _enter)
+                        w.bind("<Leave>", _leave)
+                        w.bind("<Button-1>", _click)
+                _bind_equip(row, tid)
+            else:
+                desc     = tdef.get("desc", "")
+                lock_txt = f"  🔒  {desc}" if desc else "  🔒  (locked)"
+                tk.Label(row, text=lock_txt,
+                         bg=row["bg"], fg=T["fg_dim"],
+                         font=FONT_SMALL).pack(side="left")
+
+            tk.Frame(body, bg=T["border"], height=1).pack(fill="x")
+
+        tk.Frame(self, bg=T["border"], height=1).pack(fill="x")
+        ttk.Button(self, text="  Close  ", style="Nav.TButton",
+                   command=self._on_cancel).pack(pady=6)
+        self.geometry("560x480")
+        self._center()
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GAME TOAST  —  Lightweight action-feedback notification
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3456,6 +3706,26 @@ class CustomTitleBar(tk.Frame):
         min_btn.bind("<Button-1>", lambda _: app._minimize_window())
         min_btn.bind("<Enter>",    lambda e: e.widget.config(bg=T["bg_button_act"], fg=T["fg"]))
         min_btn.bind("<Leave>",    lambda e: e.widget.config(bg=T["bg_panel"],      fg=T["grey"]))
+
+        # Separator + Profile panel toggle button
+        tk.Frame(inner, bg=T["border"], width=1).pack(
+            side="right", fill="y", pady=4, padx=(0, 4))
+        self.profile_btn = tk.Label(inner, text=" 👤 ",
+                                    bg=T["bg_panel"], fg=T["fg_dim"],
+                                    font=FONT_FANTASY_S, cursor="hand2",
+                                    padx=4)
+        self.profile_btn.pack(side="right", padx=(2, 2))
+        self.profile_btn.bind("<Button-1>", lambda _: app.toggle_profile_panel())
+        self.profile_btn.bind("<Enter>",
+            lambda e: e.widget.config(bg=T["bg_button_act"], fg=T["fg"]))
+        self.profile_btn.bind("<Leave>",
+            lambda e: e.widget.config(bg=T["bg_panel"], fg=T["fg_dim"]))
+
+        # Cloud sync status indicator
+        self.sync_lbl = tk.Label(inner, text="",
+                                 bg=T["bg_panel"], fg=T["fg_dim"],
+                                 font=FONT_SMALL, padx=4)
+        self.sync_lbl.pack(side="right", padx=(0, 2))
 
         # Bottom separator
         tk.Frame(self, bg=T["border"], height=1).pack(fill="x", side="bottom")
@@ -11290,10 +11560,8 @@ class MainMenuScreen(Screen):
         ("Voyage",        "voyage",     "OPERATIONS",   "⛵", "Send cargo on international sea voyages"),
         ("Market Info",   "market",     "INTELLIGENCE", "📊", "Prices & trade routes"),
         ("News & Events", "news",       "INTELLIGENCE", "📰", "World events & impacts"),
-        ("Progress",      "progress",   "PLAYER",       "🏆", "Stats & achievements"),
         ("Influence",     "influence",  "PLAYER",       "⭐", "Reputation & market power"),
         ("Licenses",      "licenses",   "PLAYER",       "📋", "Permits & certifications"),
-        ("Help",          "help",       "PLAYER",       "❓", "Game guide & tips"),
         ("Settings",      "settings",   "PLAYER",       "⚙", "Options, audio & keybindings"),
     ]
 
@@ -11325,14 +11593,28 @@ class MainMenuScreen(Screen):
                                     padx=16, pady=6, anchor="e", justify="right")
         self._dash_alert.pack(anchor="e", fill="both", expand=True)
 
-        # ── Debug gold button (testing aid) ───────────────────────────────
+        # ── Debug buttons (testing aids) ──────────────────────────────────
+        tk.Button(dr, text="🗑 Purge Saves",
+                  font=FONT_FANTASY_S,
+                  bg="#3a1a1a", fg="#dd4444",
+                  relief="flat", bd=0,
+                  padx=6, pady=2,
+                  cursor="hand2",
+                  command=self._debug_purge_saves).pack(side="right", padx=(0, 4), pady=4)
+        tk.Button(dr, text="☁ Restore",
+                  font=FONT_FANTASY_S,
+                  bg="#1a2a3a", fg="#44aadd",
+                  relief="flat", bd=0,
+                  padx=6, pady=2,
+                  cursor="hand2",
+                  command=self._debug_cloud_restore).pack(side="right", padx=(0, 4), pady=4)
         tk.Button(dr, text="🪙 +5000g",
                   font=FONT_FANTASY_S,
                   bg="#1a3a1a", fg="#7dd444",
                   relief="flat", bd=0,
                   padx=6, pady=2,
                   cursor="hand2",
-                  command=self._debug_add_gold).pack(side="right", padx=(0, 8), pady=4)
+                  command=self._debug_add_gold).pack(side="right", padx=(0, 4), pady=4)
 
         # ── Card grid ─────────────────────────────────────────────────────
         _scroll = ScrollableFrame(outer)
@@ -11477,13 +11759,74 @@ class MainMenuScreen(Screen):
         )
 
     def _save(self) -> None:
+        # Accumulate session time before save (mirrors _quick_save)
+        if hasattr(self.app, "_session_start"):
+            import time as _time
+            self.app.game.time_played_seconds += _time.time() - self.app._session_start
+            self.app._session_start = _time.time()
         self.game.save_game(silent=True)
+        self.app._push_cloud_save()
         self.msg.ok("Game saved.")
 
     def _debug_add_gold(self) -> None:
         self.game.inventory.gold += 5000
         self.app.refresh()
         self.msg.ok("+5000g added (debug).")
+
+    def _debug_cloud_restore(self) -> None:
+        """Manually pull the cloud save and restore it (overwrites local)."""
+        if not (self.app.online and self.app.online.is_online):
+            self.msg.warn("Not online — cannot restore from cloud.")
+            return
+        if not ConfirmDialog(
+            self.app,
+            "☁  Restore from Cloud Save?\n\n"
+            "This will overwrite your current local save with the cloud save.\n"
+            "Any unsaved local progress will be lost.",
+            "Cloud Restore",
+        ).wait():
+            return
+        self.msg.info("Fetching cloud save...")
+        self.app._restore_cloud_save()
+
+    def _debug_purge_saves(self) -> None:
+        """Delete all local save files for testing purposes (does NOT reset the in-memory game)."""
+        if not ConfirmDialog(
+            self.app,
+            "⚠  Purge all local save files?\n\n"
+            "This deletes your save data from disk only.\n"
+            "The current in-memory game is NOT reset.\n"
+            "Use for testing only — this cannot be undone!",
+            "Purge Local Saves",
+        ).wait():
+            return
+        import glob as _glob
+        deleted: list = []
+        for path in [
+            Game.SAVE_FILE,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "merchant_savegame.json"),
+        ]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    deleted.append(os.path.basename(path))
+                except Exception as exc:
+                    self.msg.warn(f"Could not delete {os.path.basename(path)}: {exc}")
+        # Also remove any .dat/.json files matching save pattern in data dir
+        data_dir = os.path.dirname(Game.SAVE_FILE)
+        for pat in ["savegame*.dat", "savegame*.json"]:
+            for f in _glob.glob(os.path.join(data_dir, pat)):
+                if f not in [Game.SAVE_FILE]:
+                    try:
+                        os.remove(f)
+                        deleted.append(os.path.basename(f))
+                    except Exception:
+                        pass
+        if deleted:
+            self.msg.ok(f"Purged: {', '.join(deleted)}  —  local files deleted.")
+        else:
+            self.msg.info("No save files found to delete.")
 
     def _file_bankruptcy(self) -> None:
         """Wipe save, reset to a new game — no tutorial on restart."""
@@ -11577,7 +11920,15 @@ class _RegisterDialog(_BaseDialog):
         def _cb(res):
             self.app.after(0, lambda: self._handle_result(res))
 
-        self.app.online.auth.sign_up(email, password, username, callback=_cb)
+        # Start the local verification server so the email redirect lands
+        # on a styled page instead of Supabase's default.
+        redirect_url = ""
+        if self.app.online and hasattr(self.app.online, "verification"):
+            self.app.online.verification.start()
+            redirect_url = self.app.online.verification.REDIRECT_URL
+
+        self.app.online.auth.sign_up(email, password, username,
+                                     redirect_to=redirect_url, callback=_cb)
 
     def _handle_result(self, res) -> None:
         try:
@@ -11615,6 +11966,164 @@ class _RegisterDialog(_BaseDialog):
             self._status.config(text=text, fg=color)
         except tk.TclError:
             pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BIND SAVE DIALOG  —  offered when an unbound offline save exists at login
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _BindSaveDialog(_BaseDialog):
+    """
+    Shown at login when an unbound offline save (savegame.dat) exists but no
+    account-specific save does.  Asks the player whether to link the existing
+    progress to the current account or discard it and start fresh.
+
+    Returns "bind" or "fresh".
+    """
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        username:     str   = "Merchant",
+        unbound_day:  int   = 0,
+        unbound_gold: float = 0.0,
+    ) -> None:
+        super().__init__(parent, f"Welcome, {username}!")
+        f = tk.Frame(self, bg=_DIALOG_BG, padx=32, pady=24)
+        f.pack()
+
+        tk.Label(
+            f,
+            text="An unlinked save file was found on this device.",
+            bg=_DIALOG_BG, fg=T["cyan"],
+            font=FONT_FANTASY_BOLD,
+        ).pack(pady=(0, 6))
+        tk.Label(
+            f,
+            text=f"Day {unbound_day}   ·   {unbound_gold:,.0f}g",
+            bg=_DIALOG_BG, fg=T["yellow"],
+            font=FONT_FANTASY,
+        ).pack(pady=(0, 14))
+
+        warn_frame = tk.Frame(f, bg=T["bg_panel"], padx=16, pady=10)
+        warn_frame.pack(fill="x", pady=(0, 18))
+        tk.Label(
+            warn_frame,
+            text="⚠  Linking is permanent.",
+            bg=T["bg_panel"], fg=T["orange"] if "orange" in T else T["yellow"],
+            font=FONT_FANTASY_BOLD,
+        ).pack()
+        tk.Label(
+            warn_frame,
+            text="Once linked, this save can only be loaded by this account.",
+            bg=T["bg_panel"], fg=T["fg_dim"],
+            font=FONT_FANTASY_S,
+            wraplength=380,
+        ).pack(pady=(4, 0))
+
+        btn_row = tk.Frame(f, bg=_DIALOG_BG)
+        btn_row.pack()
+        ttk.Button(
+            btn_row, text=f"🔗  Link to {username}",
+            style="OK.TButton",
+            command=lambda: self._pick("bind"),
+        ).pack(side="left", padx=(0, 10))
+        ttk.Button(
+            btn_row, text="✗  Start Fresh",
+            style="Danger.TButton",
+            command=lambda: self._pick("fresh"),
+        ).pack(side="left")
+
+        self._center()
+
+    def _pick(self, val: str) -> None:
+        self.result = val
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        # Closing the dialog without choosing defaults to "fresh"
+        self._pick("fresh")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLOUD SAVE CHOICE DIALOG  —  shown at startup when both local and cloud saves
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _CloudSaveChoiceDialog(_BaseDialog):
+    """
+    Shown at startup when both a local save and a cloud save exist.
+    Returns "local", "cloud", or None (start new game).
+    """
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        username:  str = "Merchant",
+        local_day: int = 0,
+        local_ts:  str = "unknown",
+        local_gold: float = 0.0,
+        cloud_day: int = 0,
+        cloud_ts:  str = "unknown",
+        cloud_gold: float = 0.0,
+    ) -> None:
+        super().__init__(parent, f"Welcome back, {username}!")
+        f = tk.Frame(self, bg=_DIALOG_BG, padx=28, pady=20)
+        f.pack()
+
+        tk.Label(
+            f,
+            text="Where would you like to continue your journey?",
+            bg=_DIALOG_BG, fg=T["cyan"],
+            font=FONT_FANTASY_BOLD,
+        ).pack(pady=(0, 18))
+
+        cards_row = tk.Frame(f, bg=_DIALOG_BG)
+        cards_row.pack()
+
+        local_newer = local_day >= cloud_day
+
+        def _card(parent, header, day, gold, ts, newer, result_val):
+            border_col = T["border_light"] if newer else T["border"]
+            outer = tk.Frame(parent, bg=border_col, padx=2, pady=2)
+            outer.pack(side="left", padx=10)
+            inner = tk.Frame(outer, bg=T["bg_panel"], padx=18, pady=14, width=190)
+            inner.pack()
+            tk.Label(inner, text=header,
+                     bg=T["bg_panel"], fg=T["border_light"] if newer else T["fg_dim"],
+                     font=FONT_FANTASY_BOLD).pack()
+            if newer:
+                tk.Label(inner, text="★ Newer",
+                         bg=T["bg_panel"], fg=T["yellow"],
+                         font=FONT_FANTASY_S).pack(pady=(0, 6))
+            else:
+                tk.Frame(inner, bg=T["bg_panel"], height=6).pack()
+            tk.Label(inner, text=f"Day {day}",
+                     bg=T["bg_panel"], fg=T["fg"],
+                     font=FONT_FANTASY).pack()
+            tk.Label(inner, text=f"{gold:,.0f}g",
+                     bg=T["bg_panel"], fg=T["yellow"],
+                     font=FONT_FANTASY_S).pack(pady=(2, 4))
+            tk.Label(inner, text=ts,
+                     bg=T["bg_panel"], fg=T["fg_dim"],
+                     font=FONT_MONO).pack(pady=(0, 10))
+            style = "OK.TButton" if newer else "Nav.TButton"
+            ttk.Button(inner, text="Load This Save", style=style,
+                       command=lambda v=result_val: self._pick(v)).pack()
+
+        _card(cards_row, "💾  Local Save",  local_day, local_gold, local_ts,
+              local_newer, "local")
+        _card(cards_row, "☁  Cloud Save",  cloud_day, cloud_gold, cloud_ts,
+              not local_newer, "cloud")
+
+        tk.Frame(f, bg=T["border"], height=1).pack(fill="x", pady=(18, 10))
+        ttk.Button(f, text="⚔  Start a New Game instead",
+                   style="Danger.TButton",
+                   command=self._on_cancel).pack()
+        self._center()
+
+    def _pick(self, val: str) -> None:
+        self.result = val
+        self.destroy()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -11934,6 +12443,823 @@ class LaunchScreen(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PROFILE SIDE PANEL  —  slide-in right-edge overlay
+# Sections: Identity, Player Stats, Guild, Friends, Achievements, Options
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProfileSidePanel(tk.Frame):
+    """
+    Animated slide-in panel anchored to the right edge of the game window.
+    Toggle via GameApp.toggle_profile_panel().
+
+    Online features (friends, cloud stats) degrade gracefully when offline.
+    """
+
+    WIDTH      = 388
+    _STEPS     = 14
+    _STEP_MS   = 15   # ~66 fps
+
+    def __init__(self, app: "GameApp") -> None:
+        super().__init__(app, bg=T["bg_panel"])
+        self.app      = app
+        self._visible = False
+        self._anim_id: Optional[str] = None
+
+        self._build()
+
+        # Start off-screen (right edge)
+        app.update_idletasks()
+        off = max(app.winfo_width(), app.WIN_W)
+        self.place(x=off, y=0, width=self.WIDTH, relheight=1.0)
+        self.lift()
+        app.bind("<Configure>", self._on_resize, add="+")
+
+    # ── Resize tracking ───────────────────────────────────────────────────────
+
+    def _on_resize(self, _e: tk.Event = None) -> None:
+        w = self.app.winfo_width()
+        if w < 10:
+            return
+        if self._visible:
+            self.place(x=w - self.WIDTH, y=0, width=self.WIDTH, relheight=1.0)
+        else:
+            self.place(x=w, y=0, width=self.WIDTH, relheight=1.0)
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        # Left border accent
+        tk.Frame(self, bg=T["border_light"], width=2).pack(side="left", fill="y")
+
+        main = tk.Frame(self, bg=T["bg_panel"])
+        main.pack(side="left", fill="both", expand=True)
+
+        # ── Header bar ────────────────────────────────────────────────────
+        hdr_bg = "#1c1410"
+        hdr = tk.Frame(main, bg=hdr_bg)
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=T["border_light"], height=2).pack(fill="x", side="top")
+
+        hdr_inner = tk.Frame(hdr, bg=hdr_bg)
+        hdr_inner.pack(fill="x")
+
+        tk.Label(hdr_inner, text="⚘  Profile",
+                 bg=hdr_bg, fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, anchor="w",
+                 padx=12, pady=8).pack(side="left")
+
+        close_lbl = tk.Label(hdr_inner, text=" ✕ ",
+                             bg=hdr_bg, fg=T["grey"],
+                             font=FONT_FANTASY_BOLD, cursor="hand2",
+                             padx=6, pady=8)
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda _: self.app.toggle_profile_panel())
+        close_lbl.bind("<Enter>",    lambda e: e.widget.config(bg="#5a1010", fg=T["fg_header"]))
+        close_lbl.bind("<Leave>",    lambda e: e.widget.config(bg=hdr_bg,    fg=T["grey"]))
+        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", side="bottom")
+
+        # ── Scrollable body ───────────────────────────────────────────────
+        sf = ScrollableFrame(main)
+        sf.pack(fill="both", expand=True)
+        self._body = sf.inner
+
+        self._build_identity()
+        self._build_stats()
+        self._build_guild()
+        self._build_friends()
+        self._build_achievements()
+        self._build_footer_buttons()
+
+    def _sec_hdr(self, label: str) -> None:
+        tk.Frame(self._body, bg=T["border"], height=1).pack(fill="x")
+        tk.Label(self._body, text=label,
+                 bg=T["bg"], fg=T["border_light"],
+                 font=FONT_FANTASY_S, anchor="w",
+                 padx=12, pady=5).pack(fill="x")
+        tk.Frame(self._body, bg=T["border"], height=1).pack(fill="x")
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+
+    def _build_identity(self) -> None:
+        self._sec_hdr("🏷  IDENTITY")
+        wrap = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=8)
+        wrap.pack(fill="x")
+
+        # Merchant name + discriminator + edit pencil
+        name_row = tk.Frame(wrap, bg=T["bg_panel"])
+        name_row.pack(fill="x", pady=(0, 2))
+
+        self._lbl_name = tk.Label(name_row, text="Merchant",
+                                  bg=T["bg_panel"], fg=T["fg_header"],
+                                  font=FONT_FANTASY_L, anchor="w")
+        self._lbl_name.pack(side="left")
+
+        self._lbl_disc = tk.Label(name_row, text="",
+                                  bg=T["bg_panel"], fg=T["fg_dim"],
+                                  font=FONT_FANTASY_S, anchor="w", padx=2)
+        self._lbl_disc.pack(side="left", pady=(3, 0))
+
+        pen = tk.Label(name_row, text=" ✎",
+                       bg=T["bg_panel"], fg=T["border_light"],
+                       font=FONT_FANTASY_S, cursor="hand2")
+        pen.pack(side="left", pady=(3, 0))
+        pen.bind("<Button-1>", lambda _: self._do_edit_name())
+        pen.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        pen.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # Active title + edit
+        title_row = tk.Frame(wrap, bg=T["bg_panel"])
+        title_row.pack(fill="x", pady=(0, 6))
+
+        self._lbl_title = tk.Label(title_row, text="No title equipped",
+                                   bg=T["bg_panel"], fg=T["yellow"],
+                                   font=FONT_FANTASY_S, anchor="w")
+        self._lbl_title.pack(side="left")
+
+        pen2 = tk.Label(title_row, text=" ✎",
+                        bg=T["bg_panel"], fg=T["border_light"],
+                        font=FONT_FANTASY_S, cursor="hand2")
+        pen2.pack(side="left")
+        pen2.bind("<Button-1>", lambda _: self._do_edit_title())
+        pen2.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        pen2.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # Online status
+        st_row = tk.Frame(wrap, bg=T["bg_panel"])
+        st_row.pack(fill="x", pady=(0, 4))
+        self._lbl_status = tk.Label(st_row, text="○  Offline mode",
+                                    bg=T["bg_panel"], fg=T["grey"],
+                                    font=FONT_MONO_S, anchor="w")
+        self._lbl_status.pack(side="left")
+
+        # UUID row
+        uuid_row = tk.Frame(wrap, bg=T["bg_panel"])
+        uuid_row.pack(fill="x", pady=(0, 2))
+        tk.Label(uuid_row, text="UUID:", bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_MONO_S, width=7, anchor="w").pack(side="left")
+        self._lbl_uuid = tk.Label(uuid_row, text="—",
+                                  bg=T["bg_panel"], fg=T["grey"],
+                                  font=FONT_MONO_S, anchor="w")
+        self._lbl_uuid.pack(side="left", padx=(2, 0))
+        self._lbl_uuid._full_uid = ""
+        copy_btn = tk.Label(uuid_row, text=" ⎘ ",
+                            bg=T["bg_panel"], fg=T["border_light"],
+                            font=FONT_MONO_S, cursor="hand2")
+        copy_btn.pack(side="left")
+        copy_btn.bind("<Button-1>", lambda _: self._copy_uuid())
+        copy_btn.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        copy_btn.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # Email row
+        email_row = tk.Frame(wrap, bg=T["bg_panel"])
+        email_row.pack(fill="x")
+        tk.Label(email_row, text="Email:", bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_MONO_S, width=7, anchor="w").pack(side="left")
+        self._lbl_email = tk.Label(email_row, text="—",
+                                   bg=T["bg_panel"], fg=T["grey"],
+                                   font=FONT_MONO_S, anchor="w")
+        self._lbl_email.pack(side="left", padx=(2, 0))
+
+    # ── Player Stats ──────────────────────────────────────────────────────────
+
+    def _build_stats(self) -> None:
+        self._sec_hdr("📊  PLAYER STATS")
+        sf = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=6)
+        sf.pack(fill="x")
+
+        self._stat_labels: Dict[str, tk.Label] = {}
+
+        def _row(key: str, caption: str) -> None:
+            r = tk.Frame(sf, bg=T["bg_panel"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=caption, bg=T["bg_panel"], fg=T["fg_dim"],
+                     font=FONT_MONO_S, width=17, anchor="w").pack(side="left")
+            lbl = tk.Label(r, text="—", bg=T["bg_panel"], fg=T["fg"],
+                           font=FONT_MONO_S, anchor="w")
+            lbl.pack(side="left")
+            self._stat_labels[key] = lbl
+
+        _row("net_worth",  "Net Worth")
+        _row("gold",       "Gold (wallet)")
+        _row("bank",       "Bank Balance")
+        _row("rep",        "Reputation")
+        _row("time_played","Time Played")
+        _row("days",       "Days In-Game")
+        _row("area",       "Current Area")
+        _row("trades",     "Lifetime Trades")
+        _row("contracts",  "Contracts Done")
+        _row("titles",     "Titles Earned")
+
+    # ── Guild ─────────────────────────────────────────────────────────────────
+
+    def _build_guild(self) -> None:
+        self._sec_hdr("⚜  GUILD")
+        gf = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=8)
+        gf.pack(fill="x")
+        self._lbl_guild = tk.Label(gf, text="No guild — guild system coming soon",
+                                   bg=T["bg_panel"], fg=T["fg_dim"],
+                                   font=FONT_FANTASY_S, anchor="w")
+        self._lbl_guild.pack(fill="x")
+
+    # ── Friends ───────────────────────────────────────────────────────────────
+
+    def _build_friends(self) -> None:
+        self._sec_hdr("👥  FRIENDS  (max 100)")
+        fw = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=6)
+        fw.pack(fill="x")
+
+        # Add-friend search bar
+        add_row = tk.Frame(fw, bg=T["bg_panel"])
+        add_row.pack(fill="x", pady=(0, 2))
+
+        tk.Label(add_row, text="Add:", bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_MONO_S, width=5, anchor="w").pack(side="left")
+        ev = tk.Frame(add_row, bg=T["border"], pady=1)
+        ev.pack(side="left", fill="x", expand=True)
+        self._friend_var = tk.StringVar()
+        self._friend_entry = tk.Entry(ev, textvariable=self._friend_var,
+                                      font=FONT_MONO_S,
+                                      bg=T["bg_button"], fg=T["fg"],
+                                      insertbackground=T["cyan"],
+                                      relief="flat", bd=4)
+        self._friend_entry.pack(fill="x")
+        self._friend_entry.bind("<Return>", lambda _: self._do_add_friend())
+        ttk.Button(add_row, text="Add", style="MT.TButton",
+                   command=self._do_add_friend).pack(side="left", padx=(4, 0))
+
+        tk.Label(fw, text="Search by  Name #1234  or by UUID",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_SMALL, anchor="w").pack(fill="x", pady=(0, 6))
+
+        # Pending requests banner + container
+        self._pending_banner = tk.Label(fw, text="",
+                                        bg=T["bg_panel"], fg=T["yellow"],
+                                        font=FONT_FANTASY_S, anchor="w")
+        self._pending_banner.pack(fill="x")
+        self._pending_frame = tk.Frame(fw, bg=T["bg_panel"])
+        self._pending_frame.pack(fill="x")
+
+        # Divider
+        tk.Frame(fw, bg=T["border"], height=1).pack(fill="x", pady=(4, 2))
+
+        # Friends list container (repopulated on refresh)
+        self._friends_list = tk.Frame(fw, bg=T["bg_panel"])
+        self._friends_list.pack(fill="x")
+
+    # ── Achievements ──────────────────────────────────────────────────────────
+
+    def _build_achievements(self) -> None:
+        self._sec_hdr("🏆  ACHIEVEMENTS")
+        af = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=8)
+        af.pack(fill="x")
+        self._lbl_ach = tk.Label(af, text="—",
+                                 bg=T["bg_panel"], fg=T["fg"],
+                                 font=FONT_FANTASY_S, anchor="w")
+        self._lbl_ach.pack(fill="x")
+        ttk.Button(af, text="View Full Progress & Achievements →",
+                   style="Nav.TButton",
+                   command=self._open_progress).pack(anchor="w", pady=(6, 0))
+
+    # ── Footer buttons ────────────────────────────────────────────────────────
+
+    def _build_footer_buttons(self) -> None:
+        self._sec_hdr("⚙  OPTIONS")
+        bf = tk.Frame(self._body, bg=T["bg_panel"], padx=12, pady=8)
+        bf.pack(fill="x")
+
+        ttk.Button(bf, text="⚙  Settings",
+                   style="Nav.TButton",
+                   command=self._open_settings).pack(fill="x", pady=(0, 4))
+
+        ttk.Button(bf, text="🎁  Redeem Code",
+                   style="Nav.TButton",
+                   command=self._do_redeem_code).pack(fill="x", pady=(0, 4))
+
+        ttk.Button(bf, text="🚪  Sign Out",
+                   style="Danger.TButton",
+                   command=self._do_sign_out).pack(fill="x")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Animation
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def toggle(self) -> None:
+        if self._visible:
+            self._animate_out()
+        else:
+            self._visible = True
+            self.refresh()
+            self.lift()
+            self._animate_in()
+
+    def _animate_in(self) -> None:
+        self._animate_to(self.app.winfo_width() - self.WIDTH)
+
+    def _animate_out(self) -> None:
+        def _done():
+            self._visible = False
+        self._animate_to(self.app.winfo_width(), on_done=_done)
+
+    def _animate_to(self, target_x: int, on_done=None) -> None:
+        if self._anim_id:
+            self.app.after_cancel(self._anim_id)
+            self._anim_id = None
+        try:
+            start_x = self.winfo_x()
+        except tk.TclError:
+            start_x = self.app.winfo_width()
+
+        steps = self._STEPS
+        dx    = target_x - start_x
+
+        def _step(n: int) -> None:
+            if n <= 0:
+                try:
+                    self.place(x=target_x, y=0, width=self.WIDTH, relheight=1.0)
+                except tk.TclError:
+                    pass
+                if on_done:
+                    on_done()
+                return
+            # Ease-out cubic: t*(3 - 2t)*t²
+            t       = 1.0 - n / steps
+            t_eased = t * t * (3.0 - 2.0 * t)
+            nx = int(start_x + dx * t_eased)
+            try:
+                self.place(x=nx, y=0, width=self.WIDTH, relheight=1.0)
+            except tk.TclError:
+                return
+            self._anim_id = self.app.after(self._STEP_MS, lambda: _step(n - 1))
+
+        _step(steps)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Data refresh
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def refresh(self) -> None:
+        """Refresh all panel sections with current game + online data."""
+        self._refresh_identity()
+        self._refresh_stats()
+        self._refresh_achievements()
+        if self.app.online and self.app.online.is_online:
+            self._refresh_friends_async()
+        else:
+            self._show_friends_offline()
+
+    # ── Identity refresh ──────────────────────────────────────────────────────
+
+    def _refresh_identity(self) -> None:
+        g = self.app.game
+        try:
+            self._lbl_name.config(text=g.player_name or "Merchant")
+        except tk.TclError:
+            return
+
+        if not (self.app.online and self.app.online.is_online):
+            self._lbl_status.config(text="○  Offline mode", fg=T["grey"])
+            self._lbl_uuid.config(text="—")
+            self._lbl_uuid._full_uid = ""
+            self._lbl_email.config(text="—")
+            self._lbl_disc.config(text="")
+            return
+
+        auth = self.app.online.auth
+        uid  = auth.user_id or "—"
+        self._lbl_uuid.config(
+            text=f"{uid[:8]}…{uid[-4:]}" if len(uid) > 12 else uid)
+        self._lbl_uuid._full_uid = uid
+        self._lbl_email.config(
+            text=self._obfuscate_email(auth.email or "—"), fg=T["fg"])
+        self._lbl_status.config(text="●  Online", fg=T["green"])
+
+        # Show cached discriminator immediately while async fetch runs
+        cached = getattr(self.app, "_cached_disc", 0)
+        if cached:
+            try:
+                self._lbl_disc.config(text=f" #{cached:04d}")
+            except tk.TclError:
+                pass
+        else:
+            try:
+                self._lbl_disc.config(text="")
+            except tk.TclError:
+                pass
+
+        def _cb(res):
+            self.app.after(0, lambda: self._apply_profile(res))
+        self.app.online.profile.get_profile(callback=_cb)
+
+    def _apply_profile(self, res, _retry: bool = True) -> None:
+        try:
+            if res.success and res.data is None and _retry:
+                # Profile row doesn't exist yet (account pre-dates create_profile).
+                # Create it now, then re-fetch once.
+                import random as _rnd
+                username = (self.app.online.auth.username
+                            or self.app.game.player_name
+                            or "Merchant")
+                def _after_create(cr):
+                    def _cb2(r2):
+                        self.app.after(0, lambda: self._apply_profile(r2, _retry=False))
+                    self.app.online.profile.get_profile(callback=_cb2)
+                self.app.online.profile.create_profile(
+                    username=username, callback=_after_create)
+                return
+            if res.success and res.data:
+                p = res.data
+                disc = p.get("discriminator", 0)
+                if not disc:
+                    # Discriminator is 0 (DB default) — assign a random one now
+                    import random as _rnd
+                    disc = _rnd.randint(1000, 9999)
+                    def _patch_cb(_r): pass
+                    self.app.online.profile.update_profile(
+                        {"discriminator": disc}, callback=_patch_cb)
+                self.app._cached_disc = disc
+                try:
+                    self._lbl_disc.config(text=f" #{disc:04d}")
+                except tk.TclError:
+                    pass
+                # Sync active title from cloud if player hasn't overridden locally
+                cloud_title = p.get("title", "")
+                if cloud_title and not self.app.game.active_title:
+                    self.app.game.active_title = cloud_title
+                display_title = self.app.game.active_title
+                tdef = TITLES_BY_ID.get(display_title)
+                try:
+                    self._lbl_title.config(
+                        text=tdef["name"] if tdef else (display_title or "No title equipped"))
+                except tk.TclError:
+                    pass
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _obfuscate_email(email: str) -> str:
+        if "@" not in email:
+            return email
+        local, domain = email.split("@", 1)
+        if len(local) <= 2:
+            return f"{'*' * len(local)}@{domain}"
+        return f"{local[:2]}{'*' * (len(local) - 2)}@{domain}"
+
+    # ── Stats refresh ─────────────────────────────────────────────────────────
+
+    def _refresh_stats(self) -> None:
+        g = self.app.game
+
+        def _s(key: str, text: str) -> None:
+            lbl = self._stat_labels.get(key)
+            if lbl:
+                try:
+                    lbl.config(text=text)
+                except tk.TclError:
+                    pass
+
+        _s("net_worth",  f"{g._net_worth():,.0f}g")
+        _s("gold",       f"{g.inventory.gold:,.0f}g")
+        _s("bank",       f"{g.bank_balance:,.2f}g")
+        _s("rep",        str(g.reputation))
+        # Time played: accumulate session time into the display
+        total_secs = g.time_played_seconds
+        if hasattr(self.app, "_session_start"):
+            total_secs += time.time() - self.app._session_start
+        th = int(total_secs // 3600)
+        tm = int((total_secs % 3600) // 60)
+        _s("time_played", f"{th}h {tm}m")
+        _s("days",       str(g._absolute_day()))
+        _s("area",       g.current_area.value)
+        _s("trades",     str(g.lifetime_trades))
+        _s("contracts",  str(g.ach_stats.get("contracts_completed", 0)))
+        _s("titles",     f"{len(g.earned_titles)} / {sum(1 for t in TITLE_DEFINITIONS if not t.get('future_event'))}")
+
+    # ── Achievements refresh ──────────────────────────────────────────────────
+
+    def _refresh_achievements(self) -> None:
+        total = len(ACHIEVEMENTS)
+        count = len(self.app.game.achievements)
+        try:
+            self._lbl_ach.config(
+                text=(f"{count} / {total} unlocked  "
+                      f"({count * 100 // max(total, 1)}%)"))
+        except tk.TclError:
+            pass
+
+    # ── Friends async refresh ─────────────────────────────────────────────────
+
+    def _refresh_friends_async(self) -> None:
+        def _cb_f(res):
+            self.app.after(0, lambda: self._populate_friends(res))
+        self.app.online.friends.list_friends_with_profiles(callback=_cb_f)
+
+        def _cb_p(res):
+            self.app.after(0, lambda: self._populate_pending(res))
+        self.app.online.friends.list_pending_requests(callback=_cb_p)
+
+    def _show_friends_offline(self) -> None:
+        for w in list(self._friends_list.winfo_children()):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        try:
+            tk.Label(self._friends_list,
+                     text="Sign in to view your friends list.",
+                     bg=T["bg_panel"], fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, anchor="w").pack(fill="x", pady=4)
+        except tk.TclError:
+            pass
+
+    def _populate_friends(self, res) -> None:
+        try:
+            for w in list(self._friends_list.winfo_children()):
+                w.destroy()
+        except tk.TclError:
+            return
+        try:
+            friends = res.data if (res.success and isinstance(res.data, list)) else []
+            if not friends:
+                tk.Label(self._friends_list,
+                         text="No friends yet — add one above!",
+                         bg=T["bg_panel"], fg=T["fg_dim"],
+                         font=FONT_FANTASY_S, anchor="w").pack(fill="x", pady=4)
+                return
+
+            for f in friends[:100]:
+                p      = f.get("profile") or {}
+                fname  = p.get("username",      "Unknown Merchant")
+                fdisc  = p.get("discriminator",  0)
+                fnet   = p.get("last_networth",  0.0)
+                flast  = p.get("last_seen",      "")
+                fid    = f.get("friend_id",      "")
+
+                dot, dot_col  = self._online_dot(flast)
+                disc_str = f" #{fdisc:04d}" if fdisc else ""
+
+                row = tk.Frame(self._friends_list, bg=T["bg_panel"], pady=1)
+                row.pack(fill="x")
+
+                tk.Label(row, text=dot, bg=T["bg_panel"],
+                         fg=dot_col, font=FONT_MONO_S, width=2).pack(side="left")
+                tk.Label(row, text=f"{fname}{disc_str}",
+                         bg=T["bg_panel"], fg=T["fg"],
+                         font=FONT_MONO_S, anchor="w").pack(side="left")
+                tk.Label(row, text=f"  {fnet:,.0f}g",
+                         bg=T["bg_panel"], fg=T["yellow"],
+                         font=FONT_MONO_S).pack(side="left", padx=(6, 0))
+
+                rm = tk.Label(row, text=" ✕ ",
+                              bg=T["bg_panel"], fg=T["grey"],
+                              font=FONT_MONO_S, cursor="hand2")
+                rm.pack(side="right")
+                rm.bind("<Button-1>",
+                        lambda _e, fid_=fid, fn=fname: self._do_remove_friend(fid_, fn))
+                rm.bind("<Enter>", lambda e: e.widget.config(fg=T["red"]))
+                rm.bind("<Leave>", lambda e: e.widget.config(fg=T["grey"]))
+
+                tk.Frame(self._friends_list, bg=T["border"], height=1).pack(fill="x")
+        except tk.TclError:
+            pass
+
+    def _populate_pending(self, res) -> None:
+        try:
+            for w in list(self._pending_frame.winfo_children()):
+                w.destroy()
+            self._pending_banner.config(text="")
+
+            pending = (res.data if (res.success and isinstance(res.data, list))
+                       else [])
+            if not pending:
+                return
+
+            self._pending_banner.config(
+                text=(f"⚠  {len(pending)} pending friend request"
+                      f"{'s' if len(pending) > 1 else ''}"),
+                fg=T["yellow"])
+
+            for req in pending[:10]:
+                p     = req.get("profiles") or {}
+                rname = p.get("username",      "Unknown")
+                rdisc = p.get("discriminator", 0)
+                rid   = req.get("requester_id", "")
+                disc_str = f" #{rdisc:04d}" if rdisc else ""
+
+                row = tk.Frame(self._pending_frame, bg=T["bg_panel"], pady=2)
+                row.pack(fill="x")
+                tk.Label(row, text=f"{rname}{disc_str}",
+                         bg=T["bg_panel"], fg=T["fg"],
+                         font=FONT_FANTASY_S, anchor="w").pack(side="left")
+                ttk.Button(row, text="✓", style="OK.TButton",
+                           command=lambda r=rid, n=rname:
+                               self._do_respond(r, True, n)
+                           ).pack(side="right", padx=(2, 0))
+                ttk.Button(row, text="✗", style="Danger.TButton",
+                           command=lambda r=rid:
+                               self._do_respond(r, False, None)
+                           ).pack(side="right", padx=(2, 0))
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _online_dot(last_seen: str) -> Tuple[str, str]:
+        """Return (dot_char, colour) based on last_seen ISO timestamp."""
+        if not last_seen:
+            return "○", T["grey"]
+        try:
+            import datetime
+            ls  = last_seen.replace("Z", "+00:00")
+            dt  = datetime.datetime.fromisoformat(ls)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            age = (now - dt).total_seconds()
+            if age < 300:    # < 5 min → online
+                return "●", T["green"]
+            if age < 1800:   # < 30 min → away
+                return "◑", T["yellow"]
+        except Exception:
+            pass
+        return "○", T["grey"]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Action handlers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _copy_uuid(self) -> None:
+        uid = getattr(self._lbl_uuid, "_full_uid", "")
+        if not uid or uid == "—":
+            self.app.message_bar.warn("No UUID available — sign in first.")
+            return
+        try:
+            self.app.clipboard_clear()
+            self.app.clipboard_append(uid)
+            self.app.message_bar.ok("UUID copied to clipboard.")
+        except tk.TclError:
+            pass
+
+    def _do_edit_name(self) -> None:
+        new_name = InputDialog(
+            self.app, "Enter new merchant name:",
+            "Edit Merchant Name", self.app.game.player_name
+        ).wait()
+        if not new_name or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        self.app.game.player_name = new_name
+        try:
+            self._lbl_name.config(text=new_name)
+        except tk.TclError:
+            pass
+        if self.app.online and self.app.online.is_online:
+            self.app.online.auth.update_username(new_name)
+        self.app.refresh()
+        self.app.message_bar.ok(f"Merchant name updated to '{new_name}'.")
+
+    def _do_edit_title(self) -> None:
+        """Open the title picker dialog (custom title bar, slide-in, drag)."""
+        TitlePickerDialog(self.app, self.app, self._lbl_title).wait()
+
+    def _do_add_friend(self) -> None:
+        query = self._friend_var.get().strip()
+        if not query:
+            self.app.message_bar.warn(
+                "Enter a merchant name (Name #1234) or UUID to search.")
+            return
+        if not (self.app.online and self.app.online.is_online):
+            self.app.message_bar.err("You must be online to add friends.")
+            return
+
+        def _cb(res):
+            self.app.after(0, lambda: self._handle_search(res, query))
+        self.app.online.profile.search_players(query, callback=_cb)
+
+    def _handle_search(self, res, query: str) -> None:
+        try:
+            if not res.success:
+                self.app.message_bar.err(f"Search failed: {res.error}")
+                return
+            players = res.data if isinstance(res.data, list) else []
+            if not players:
+                self.app.message_bar.warn(f"No merchant found matching '{query}'.")
+                return
+            p     = players[0]
+            pname = p.get("username",      "Unknown")
+            pdisc = p.get("discriminator", 0)
+            pid   = p.get("id",            "")
+            if pid == self.app.online.auth.user_id:
+                self.app.message_bar.warn("That's you!")
+                return
+            disc_str = f" #{pdisc:04d}" if pdisc else ""
+            if not ConfirmDialog(
+                self.app,
+                f"Send a friend request to {pname}{disc_str}?",
+                "Add Friend",
+            ).wait():
+                return
+
+            def _cb2(res2):
+                self.app.after(0, lambda: self._handle_request_sent(res2, pname))
+            self.app.online.friends.send_request(pid, callback=_cb2)
+        except tk.TclError:
+            pass
+
+    def _handle_request_sent(self, res, name: str) -> None:
+        try:
+            if res.success:
+                self.app.message_bar.ok(f"Friend request sent to {name}!")
+                self._friend_var.set("")
+            else:
+                msg = res.error or "Failed to send request."
+                if "duplicate" in msg.lower() or "unique" in msg.lower():
+                    msg = f"A pending request with {name} already exists."
+                self.app.message_bar.err(msg)
+        except tk.TclError:
+            pass
+
+    def _do_remove_friend(self, friend_id: str, friend_name: str) -> None:
+        if not ConfirmDialog(
+            self.app,
+            f"Remove {friend_name} from your friends list?",
+            "Remove Friend",
+        ).wait():
+            return
+
+        def _cb(res):
+            def _upd():
+                try:
+                    if res.success:
+                        self.app.message_bar.ok(
+                            f"{friend_name} removed from friends.")
+                        self._refresh_friends_async()
+                    else:
+                        self.app.message_bar.err(
+                            res.error or "Failed to remove friend.")
+                except tk.TclError:
+                    pass
+            self.app.after(0, _upd)
+        self.app.online.friends.remove_friend(friend_id, callback=_cb)
+
+    def _do_respond(self, requester_id: str, accept: bool,
+                    name: Optional[str]) -> None:
+        def _cb(res):
+            def _upd():
+                try:
+                    if res.success:
+                        if accept and name:
+                            self.app.message_bar.ok(
+                                f"Friend request from {name} accepted!")
+                        else:
+                            self.app.message_bar.info("Request declined.")
+                        self._refresh_friends_async()
+                    else:
+                        self.app.message_bar.err(
+                            res.error or "Failed to respond to request.")
+                except tk.TclError:
+                    pass
+            self.app.after(0, _upd)
+        self.app.online.friends.respond_to_request(
+            requester_id, accept, callback=_cb)
+
+    def _open_progress(self) -> None:
+        self.app.toggle_profile_panel()
+        self.app.show("progress")
+
+    def _open_settings(self) -> None:
+        self.app.toggle_profile_panel()
+        self.app.show("settings")
+
+    def _do_redeem_code(self) -> None:
+        self.app.message_bar.info("Redeem codes — coming soon!")
+
+    def _do_sign_out(self) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            self.app.message_bar.warn("Not currently signed in.")
+            return
+        if not ConfirmDialog(
+            self.app,
+            "Sign out of your account?\n"
+            "You can sign in again on next launch.",
+            "Sign Out",
+        ).wait():
+            return
+
+        def _cb(res):
+            def _upd():
+                try:
+                    self.app.message_bar.ok("Signed out successfully.")
+                    self._refresh_identity()
+                    self._show_friends_offline()
+                    try:
+                        self.app.custom_title.profile_btn.config(
+                            text=" 👤 ", fg=T["fg_dim"])
+                    except (tk.TclError, AttributeError):
+                        pass
+                except tk.TclError:
+                    pass
+            self.app.after(0, _upd)
+        self.app.online.auth.sign_out(callback=_cb)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GAME APP  —  root window and navigation controller
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -11989,12 +13315,29 @@ class GameApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         # ── Window setup ──────────────────────────────────────────────────
+        # Withdraw immediately so the window is never shown before WS_EX_APPWINDOW
+        # is applied.  _set_appwindow() / deiconify() in start() does the first show.
+        self.withdraw()
+
         self.title("Merchant Tycoon — Expanded Edition")
         self.minsize(self.MIN_W, self.MIN_H)
         self.configure(bg=T["bg"])
 
-        # Remove native OS title bar; custom bar is built below
-        self.overrideredirect(True)
+        # Remove the native title bar.
+        #
+        # IMPORTANT — do NOT use overrideredirect(True) on Windows.
+        # overrideredirect() internally sets WS_EX_TOOLWINDOW on the HWND and
+        # marks the window so the Windows shell never registers a taskbar button
+        # for it, regardless of any WS_EX_APPWINDOW patching applied afterwards.
+        #
+        # On Windows we use _apply_frameless_win32() (called from start()) which
+        # strips WS_CAPTION | WS_THICKFRAME from the window style instead.  The
+        # window remains a normal WS_OVERLAPPED window from the shell perspective
+        # — it appears in the taskbar and Alt+Tab exactly like any other app.
+        #
+        # On non-Windows platforms overrideredirect is the only viable option.
+        if sys.platform != "win32":
+            self.overrideredirect(True)
 
         # Hide the console/CMD window that launched this script
         if sys.platform == "win32":
@@ -12003,7 +13346,7 @@ class GameApp(tk.Tk):
             if hwnd_console:
                 ctypes.windll.user32.ShowWindow(hwnd_console, 0)  # SW_HIDE
 
-        # Centre on screen immediately (after overrideredirect so position sticks).
+        # Centre on screen.
         # winfo_screenwidth/height are always available regardless of map state.
         _sw = self.winfo_screenwidth()
         _sh = self.winfo_screenheight()
@@ -12011,16 +13354,17 @@ class GameApp(tk.Tk):
         _cy = max(0, (_sh - self.WIN_H) // 2)
         self.geometry(f"{self.WIN_W}x{self.WIN_H}+{_cx}+{_cy}")
 
-        # Register window in taskbar (deferred so Win32 HWND is fully mapped)
-        if sys.platform == "win32":
-            self.after(200, self._set_appwindow)
-
         # Apply theme
         apply_dark_theme(ttk.Style(self))
 
         # Game model
         self.game = Game()
         self.profit_animations: bool = True   # toggle via Settings
+        self._session_start: float        = time.time()   # for time_played accumulation
+        self._last_sync_time: Optional[float] = None       # timestamp of last cloud push
+        self._cached_disc: int               = 0           # cached discriminator
+        self._last_synced_day: int           = 0           # for day-change auto-sync
+        self._sync_label_timer: Optional[str] = None       # running after-id for label ticks
 
         # Online services (merchant_tycoon_online.py)  — silently disabled if
         # the module is absent or Supabase is unreachable at import time.
@@ -12049,6 +13393,26 @@ class GameApp(tk.Tk):
         self.status_bar  = StatusBar(self, self.game)
         self.status_bar.pack(fill="x", side="top")
 
+        # ── Persistent footer bar: ? help button ─────────────────────────
+        # Packed first with side="bottom" so it anchors to the very bottom;
+        # message_bar is then packed above it.
+        self._footer_bar = tk.Frame(self, bg=T["bg"])
+        self._footer_bar.pack(fill="x", side="bottom")
+        tk.Frame(self._footer_bar, bg=T["border"], height=1).pack(fill="x")
+        _foot_inner = tk.Frame(self._footer_bar, bg=T["bg"], height=22)
+        _foot_inner.pack(fill="x")
+        _foot_inner.pack_propagate(False)
+        tk.Label(_foot_inner, text="Merchant Tycoon",
+                 bg=T["bg"], fg=T["fg_dim"],
+                 font=FONT_SMALL, padx=8).pack(side="left", pady=3)
+        _help_btn = tk.Label(_foot_inner, text=" ❓ Help ",
+                             bg=T["bg"], fg=T["border_light"],
+                             font=FONT_SMALL, cursor="hand2", padx=4)
+        _help_btn.pack(side="right", pady=3, padx=4)
+        _help_btn.bind("<Button-1>", lambda _: self.show("help"))
+        _help_btn.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        _help_btn.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
         self.message_bar = MessageBar(self)
         self.message_bar.pack(fill="x", side="bottom")
         # Wire toast callback so MessageBar also fires floating GameToast
@@ -12061,6 +13425,9 @@ class GameApp(tk.Tk):
         self.screens: Dict[str, Screen] = {}
         self._stack:  List[str]         = []
         self._register_screens()
+
+        # ── Profile side panel (slide-in overlay, created after screens) ──
+        self.profile_panel = ProfileSidePanel(self)
 
         # ── Global key bindings ───────────────────────────────────────────
         self.bind_all("<Escape>", self._on_escape)
@@ -12134,6 +13501,11 @@ class GameApp(tk.Tk):
         if self._stack:
             self.screens[self._stack[-1]].refresh()
         self._flush_achievements()
+        # Auto-save + cloud-sync whenever a new in-game day has passed
+        current_day = self.game._absolute_day()
+        if self._last_synced_day > 0 and current_day != self._last_synced_day:
+            self._last_synced_day = current_day
+            self.after(400, self._auto_save_and_sync)
 
     def profit_flash(self, amount: float) -> None:
         """Trigger gold overlay animation if profit meets a threshold."""
@@ -12141,31 +13513,52 @@ class GameApp(tk.Tk):
             ProfitFlash.trigger(self, amount)
 
     def _flush_achievements(self) -> None:
-        """Pop and display any queued achievement toasts."""
+        """Pop and toast any queued achievements/titles; sync both to Supabase."""
+        is_online = self.online and self.online.is_online
+
+        # ── Achievements ────────────────────────────────────────────────────
         for aid in list(self.game.ach_queue):
             ach = next((a for a in ACHIEVEMENTS if a["id"] == aid), None)
             if ach:
                 AchievementToast(self, ach)
+            if is_online:
+                try:
+                    self.online.profile.award_achievement(
+                        aid, callback=lambda _r, _a=aid: None)
+                except Exception:
+                    pass
         self.game.ach_queue.clear()
+
+        # ── Titles ──────────────────────────────────────────────────────────
+        for tid in list(self.game.title_queue):
+            tdef = TITLES_BY_ID.get(tid)
+            if tdef:
+                TitleToast(self, tdef)
+            if is_online:
+                try:
+                    self.online.profile.award_title(
+                        tid, callback=lambda _r, _t=tid: None)
+                except Exception:
+                    pass
+        self.game.title_queue.clear()
 
     # ── Save / Quit ───────────────────────────────────────────────────────────
 
     def _quick_save(self) -> None:
+        # Accumulate session time before save
+        if hasattr(self, "_session_start"):
+            self.game.time_played_seconds += time.time() - self._session_start
+            self._session_start = time.time()
         self.game.save_game(silent=True)
         self.message_bar.ok("Game saved.")
+        self._push_cloud_save()
 
     def _minimize_window(self) -> None:
-        """Minimize to taskbar (works with overrideredirect)."""
-        if sys.platform == "win32":
-            import ctypes
-            # GetAncestor(GA_ROOT=2) walks up to the outermost top-level HWND
-            # that the shell tracks — more reliable than GetParent for
-            # overrideredirect windows where GetParent may return 0.
-            GA_ROOT = 2
-            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), GA_ROOT) or self.winfo_id()
-            ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
-        else:
-            self.iconify()
+        """Minimize to taskbar."""
+        # self.iconify() works correctly now that we no longer use
+        # overrideredirect(True) on Windows.  The window is a normal
+        # WS_OVERLAPPED HWND so Tkinter's native iconify path is reliable.
+        self.iconify()
 
     def _toggle_maximize(self, btn: tk.Label) -> None:
         """Toggle between maximized (work area) and restored geometry."""
@@ -12191,6 +13584,11 @@ class GameApp(tk.Tk):
                 self.geometry(f"{sw}x{sh}+0+0")
             self._maximized = True
             btn.config(text="  ❐  ")
+        # Let profile panel reposition after geometry change
+        self.after(30, lambda: (
+            hasattr(self, "profile_panel") and
+            self.profile_panel._on_resize()
+        ))
 
     def _install_resize_grips(self) -> None:
         """Place transparent resize-grip strips at all 8 window edges/corners."""
@@ -12213,7 +13611,12 @@ class GameApp(tk.Tk):
 
     def quit_game(self) -> None:
         if ConfirmDialog(self, "Save before quitting?", "Quit").wait():
+            # Accumulate session time before final save
+            if hasattr(self, "_session_start"):
+                self.game.time_played_seconds += time.time() - self._session_start
+                self._session_start = time.time()
             self.game.save_game(silent=True)
+            self._push_cloud_save()
         self.destroy()
 
     def _center_on_screen(self) -> None:
@@ -12225,90 +13628,318 @@ class GameApp(tk.Tk):
         y  = max(0, (sh - self.WIN_H) // 2)
         self.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
 
-    def _set_appwindow(self) -> None:
+    def _apply_frameless_win32(self) -> None:
         """
-        Apply WS_EX_APPWINDOW so the borderless window appears in the taskbar
-        and minimises normally.
+        Make the game window visually borderless on Windows without using
+        overrideredirect(True).
 
-        SetWindowPos(SWP_FRAMECHANGED) alone is insufficient — the Windows
-        shell only re-reads the extended style when the window is hidden then
-        shown again (withdraw + deiconify).
-        GetAncestor(GA_ROOT=2) is used instead of GetParent because Tkinter’s
-        winfo_id() returns the inner wrapper HWND; GetParent of that can be 0
-        for overrideredirect windows, while GetAncestor reliably walks to the
-        outermost top-level frame that the shell tracks.
+        overrideredirect(True) sets WS_EX_TOOLWINDOW internally and permanently
+        removes the window from the Windows shell (no taskbar button, no Alt+Tab
+        entry) regardless of any WS_EX_APPWINDOW patching applied afterwards.
+
+        This method instead strips WS_CAPTION and WS_THICKFRAME from the normal
+        window style (GWL_STYLE), leaving the window as a fully-registered
+        WS_OVERLAPPED window.  The shell continues to track it, the taskbar
+        button appears automatically, iconify/deiconify work natively, and our
+        custom CustomTitleBar + _ResizeGrip widgets provide all chrome and
+        resize handling.
+
+        DwmExtendFrameIntoClientArea is called with a 1 px margin on each side
+        to restore the DWM drop-shadow that would otherwise be lost when the
+        native frame is removed.
         """
         import ctypes
-        GWL_EXSTYLE      = -20
-        WS_EX_APPWINDOW  = 0x00040000
-        WS_EX_TOOLWINDOW = 0x00000080
-        GA_ROOT          = 2
-        hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), GA_ROOT) or self.winfo_id()
-        if hwnd:
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-            # withdraw + deiconify forces the shell to re-register the window
-            # under its new extended style — SetWindowPos alone is not enough.
-            self.withdraw()
-            self.deiconify()
+        GWL_STYLE        = -16
+        WS_CAPTION       = 0x00C00000   # title bar
+        WS_THICKFRAME    = 0x00040000   # sizing border
+        SWP_NOMOVE       = 0x0002
+        SWP_NOSIZE       = 0x0001
+        SWP_NOZORDER     = 0x0004
+        SWP_NOACTIVATE   = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+
+        user32 = ctypes.windll.user32
+
+        # winfo_id() returns the inner Tk *client* HWND.
+        # On Windows, Tkinter wraps every top-level inside an outer "TkTopLevel"
+        # HWND that carries WS_CAPTION and the visible title bar.
+        # GetParent() walks up one level to that outer wrapper -- it is the HWND
+        # we must patch.  Fall back to the inner HWND if GetParent returns 0
+        # (shouldn't happen for a normal tk.Tk root window).
+        hwnd_inner = self.winfo_id()
+        hwnd = user32.GetParent(hwnd_inner) or hwnd_inner
+
+        # Strip native caption and resize border -- window looks borderless.
+        style  = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~(WS_CAPTION | WS_THICKFRAME)
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+        # Notify Windows of the style change before the first WM_SHOWWINDOW.
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                            SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+        # Restore DWM drop-shadow (lost when WS_CAPTION is stripped).
+        try:
+            class _MARGINS(ctypes.Structure):
+                _fields_ = [('l', ctypes.c_int), ('r', ctypes.c_int),
+                            ('t', ctypes.c_int), ('b', ctypes.c_int)]
+            ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+                hwnd, ctypes.byref(_MARGINS(1, 1, 1, 1)))
+        except Exception:
+            pass
+
+        # Show the window -- taskbar button already exists because the HWND was
+        # a normal WS_OVERLAPPED window from the moment it was created.
+        self.deiconify()
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
     def start(self) -> None:
         """Run the startup flow then hand control to the tkinter event loop."""
+        # Flush pending layout so the HWND is fully created before we touch it.
+        self.update_idletasks()
+        # Strip native chrome (Win32) or just show (other platforms).
+        # Both paths end by calling deiconify() so the window appears.
+        if sys.platform == "win32":
+            self._apply_frameless_win32()   # strips caption then calls deiconify
+        else:
+            self.deiconify()
         # Defer _startup so the window is fully mapped before dialogs grab focus
         self.after(1, self._startup)
         self.mainloop()
 
     def _startup(self) -> None:
         """
-        New game / load game flow — mirrors the CLI play() preamble
-        but uses dialog boxes instead of input() / print().
+        Startup flow:
+          1. Always authenticate first (session restore or login screen).
+          2. Probe local + cloud saves and let the player choose.
+          3. Load the chosen save (or start a new game).
+          4. Skip name prompt and tutorial if loading any existing save.
         """
-        # ── Online: restore or request a session ────────────────────────────
+        import datetime as _dt
+
+        # ── Step 1: Auth — always login first ─────────────────────────────
         _online_greeting: Optional[str] = None
         if self.online:
             had_session = self.online.startup()
             if had_session:
-                # Silently resumed — greet after the main screen loads
                 _online_greeting = self.online.auth.username or "Merchant"
             else:
+                # No remembered session → show login/offline screen first
                 result = LaunchScreen(self).wait()
                 if result == "signed_in" and self.online.auth.is_authenticated:
                     _online_greeting = self.online.auth.username or "Merchant"
 
+        is_online = bool(self.online and self.online.is_online)
         is_new_game = True
 
-        if os.path.exists(Game.SAVE_FILE):
-            if ConfirmDialog(self, "Save file found. Load game?",
-                             "Welcome").wait():
-                if self.game.load_game():
-                    self.message_bar.ok(
-                        f"Welcome back, {self.game.player_name}!")
-                    is_new_game = False
-                else:
-                    name = InputDialog(self, "Enter your merchant name:",
-                                       "New Game", "Merchant").wait()
-                    self.game.player_name = name or "Merchant"
-            else:
-                name = InputDialog(self, "Enter your merchant name:",
-                                   "New Game", "Merchant").wait()
-                self.game.player_name = name or "Merchant"
+        # ── Step 2: Probe available saves ─────────────────────────────────
+        # When authenticated, route this account to its own per-account save
+        # file (savegame_<uid8>.dat).  If an unbound savegame.dat exists on
+        # disk but no account file does, offer the player a chance to link it.
+        cloud_meta = None   # metadata dict from cloud slot-list
+
+        if is_online and _online_greeting and self.online and self.online.auth.user_id:
+            _uid      = self.online.auth.user_id
+            acct_file = Game.save_path_for_user(_uid)
+            # Bind the game instance to this account's path / user_id
+            self.game.SAVE_FILE     = acct_file
+            self.game.bound_user_id = _uid
+
+            has_local   = os.path.exists(acct_file)
+            unbound_dat = Game.SAVE_FILE   # class-level path → savegame.dat
+
+            if not has_local and os.path.exists(unbound_dat):
+                # Unbound offline save found — load it briefly to read stats
+                _tmp = Game()
+                _tmp.SAVE_FILE = unbound_dat
+                if _tmp.load_game():
+                    _bind_pick = _BindSaveDialog(
+                        self,
+                        username     = _online_greeting or "Merchant",
+                        unbound_day  = _tmp._absolute_day(),
+                        unbound_gold = _tmp.inventory.gold,
+                    ).wait()
+                    if _bind_pick == "bind":
+                        import shutil as _shutil
+                        _shutil.copy2(unbound_dat, acct_file)
+                        has_local = True
+                # _tmp goes out of scope; self.game still points to acct_file
         else:
+            has_local = os.path.exists(Game.SAVE_FILE)
+
+        if is_online and _online_greeting:
+            try:
+                meta_res = self.online.saves.list_saves()   # synchronous
+                if meta_res and meta_res.success:
+                    rows = meta_res.data if isinstance(meta_res.data, list) else []
+                    if rows:
+                        cloud_meta = rows[0]   # slot 1
+            except Exception:
+                pass
+
+        # ── Step 3: Load save ─────────────────────────────────────────────
+        local_day  = 0
+        local_gold = 0.0
+
+        if has_local:
+            # Load local into game state (in-place) to read its day number
+            if self.game.load_game():
+                local_day  = self.game._absolute_day()
+                local_gold = self.game.inventory.gold
+
+        if has_local and cloud_meta:
+            # Both saves exist → ask the player which to use
+            cloud_day  = cloud_meta.get("day",  0)
+            cloud_gold = cloud_meta.get("gold", 0.0)
+            raw_ts     = cloud_meta.get("updated_at", "")
+            cloud_ts   = raw_ts[:16].replace("T", " ") if raw_ts else "unknown"
+            try:
+                _mt = os.path.getmtime(self.game.SAVE_FILE)
+                local_ts = _dt.datetime.fromtimestamp(_mt).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                local_ts = "unknown"
+
+            pick = _CloudSaveChoiceDialog(
+                self,
+                username   = _online_greeting or "Merchant",
+                local_day  = local_day,  local_ts   = local_ts,  local_gold  = local_gold,
+                cloud_day  = cloud_day,  cloud_ts   = cloud_ts,  cloud_gold  = cloud_gold,
+            ).wait()   # "local", "cloud", or None (new game)
+
+            if pick == "cloud":
+                pull_res = self.online.saves.download_save()   # synchronous
+                if pull_res and pull_res.success and self._write_cloud_to_disk(pull_res):
+                    if self.game.load_game():
+                        is_new_game = False
+                        self._last_synced_day = self.game._absolute_day()
+                    else:
+                        self.message_bar.warn(
+                            "Cloud save could not be read — local save loaded.")
+                        if local_day > 0:
+                            is_new_game = False
+                            self._last_synced_day = local_day
+                else:
+                    err = (pull_res.error if pull_res else "no response")
+                    self.message_bar.warn(f"Cloud fetch failed ({err}) — local save loaded.")
+                    if local_day > 0:
+                        is_new_game = False
+                        self._last_synced_day = local_day
+            elif pick == "local":
+                # game is already populated with local data from the peek above
+                if local_day > 0:
+                    is_new_game = False
+                    self._last_synced_day = local_day
+                    if is_online:
+                        self.after(2500, self._push_cloud_save)  # upload local to cloud
+            # else pick is None → player chose New Game; is_new_game stays True
+
+        elif has_local and local_day > 0:
+            # Only local save exists — use it
+            is_new_game = False
+            self._last_synced_day = local_day
+
+        elif cloud_meta and not has_local:
+            # No local save but cloud save exists (new device / purged local)
+            pull_res = self.online.saves.download_save()   # synchronous
+            if pull_res and pull_res.success and self._write_cloud_to_disk(pull_res):
+                if self.game.load_game():
+                    is_new_game = False
+                    self._last_synced_day = self.game._absolute_day()
+            else:
+                self.message_bar.warn("Cloud load failed — starting a new game.")
+
+        if is_new_game:
             name = InputDialog(self, "Enter your merchant name:",
                                "New Game", "Merchant").wait()
             self.game.player_name = name or "Merchant"
+
+        # ── Step 4: Show main screen ──────────────────────────────────────
+        # Auth is now complete (signed in or offline) — stop the local
+        # verification server so port 3000 is freed immediately.
+        if self.online and hasattr(self.online, "verification"):
+            self.online.verification.stop()
 
         self.show("main")
 
         if _online_greeting:
             self.after(200, lambda: self.message_bar.ok(
                 f"✦  Signed in as {_online_greeting}  —  Online"))
+            self.after(500, self._start_cloud_sync)
+            try:
+                self.custom_title.profile_btn.config(
+                    text=" ● 👤 ", fg=T["green"])
+            except (tk.TclError, AttributeError):
+                pass
+            self.after(600, self._update_sync_label)
 
         if is_new_game:
-            # Defer slightly so the main screen finishes rendering first
             self.after(120, self._offer_tutorial)
+
+    # _check_cloud_save_on_login / _handle_cloud_save_check are superseded by
+    # the new _startup logic that handles save selection before showing any screen.
+
+    def _write_cloud_to_disk(self, pull_res) -> bool:
+        """Extract compressed_b64 from a pull result and write it to SAVE_FILE.
+        Returns True on success, False on any error."""
+        try:
+            if not (pull_res and pull_res.success and pull_res.data):
+                return False
+            save_blob = pull_res.data.get("save_data", {})
+            if isinstance(save_blob, str):
+                import json as _json
+                try:
+                    save_blob = _json.loads(save_blob)
+                except Exception:
+                    save_blob = {}
+            payload_b64 = (save_blob.get("compressed_b64", "")
+                           if isinstance(save_blob, dict) else "")
+            if not payload_b64:
+                return False
+            import base64 as _b64
+            raw_bytes = _b64.b64decode(payload_b64)
+            os.makedirs(os.path.dirname(self.game.SAVE_FILE), exist_ok=True)
+            with open(self.game.SAVE_FILE, "wb") as _f:
+                _f.write(raw_bytes)
+            return True
+        except Exception:
+            return False
+
+    def _restore_cloud_save(self) -> None:
+        """Async cloud restore — download then reload game (used by debug button)."""
+        if not (self.online and self.online.is_online):
+            return
+        try:
+            def _cb(res):
+                self.after(0, lambda: self._apply_cloud_restore(res))
+            self.online.sync.pull(callback=_cb)
+        except Exception:
+            self.message_bar.warn("Cloud restore not available.")
+
+    def _apply_cloud_restore(self, res) -> None:
+        """Write downloaded cloud save to disk and hot-reload game state."""
+        if not self._write_cloud_to_disk(res):
+            self.message_bar.err(
+                "Cloud restore failed — no valid data returned." if not (
+                    res and res.success) else
+                "Cloud save data is empty or in an unrecognised format.")
+            return
+        try:
+            # load_game() reloads in-place; no need to replace self.game
+            if self.game.load_game():
+                self.status_bar.game = self.game
+                for sc in self.screens.values():
+                    sc.game = self.game
+                self._session_start  = time.time()
+                self._last_synced_day = self.game._absolute_day()
+                self.refresh()
+                self.message_bar.ok(
+                    f"Cloud save loaded!  Welcome back, {self.game.player_name}.")
+            else:
+                self.message_bar.err("Cloud save corrupted — keeping current state.")
+        except Exception as exc:
+            self.message_bar.err(f"Cloud restore error: {exc}")
 
     def _offer_tutorial(self) -> None:
         """Ask new players if they want the tutorial, then show it."""
@@ -12319,6 +13950,118 @@ class GameApp(tk.Tk):
             "New Merchant",
         ).wait():
             TutorialDialog(self).wait()
+
+    # ── Profile panel ─────────────────────────────────────────────────────────
+
+    def toggle_profile_panel(self) -> None:
+        """Toggle the profile/social slide-in panel."""
+        if hasattr(self, "profile_panel"):
+            self.profile_panel.toggle()
+
+    # ── Cloud sync ────────────────────────────────────────────────────────────
+
+    def _auto_save_and_sync(self) -> None:
+        """Save locally and push to cloud; used by day-tick and 3-min timer."""
+        if hasattr(self, "_session_start"):
+            self.game.time_played_seconds += time.time() - self._session_start
+            self._session_start = time.time()
+        self.game.save_game(silent=True)
+        self._push_cloud_save()
+
+    def _start_cloud_sync(self) -> None:
+        """Begin 3-minute periodic auto-save + cloud presence sync."""
+        self._do_cloud_sync()        # presence update (lightweight)
+        self._auto_save_and_sync()   # full local save + cloud upload
+        # Reschedule every 3 minutes
+        self._sync_timer = self.after(3 * 60 * 1000, self._start_cloud_sync)
+
+    def _do_cloud_sync(self) -> None:
+        """Push presence data (last_seen, net_worth, area) silently."""
+        if not (self.online and self.online.is_online):
+            return
+        try:
+            self.online.profile.update_presence(
+                self.game._net_worth(),
+                self.game.current_area.value,
+            )
+        except Exception:
+            pass
+
+    def _push_cloud_save(self) -> None:
+        """Upload the current save file to the cloud."""
+        if not (self.online and self.online.is_online):
+            return
+        try:
+            save_path = Game.SAVE_FILE
+            if not os.path.exists(save_path):
+                return
+            with open(save_path, "rb") as _f:
+                raw_bytes = _f.read()
+            meta = {
+                "day":        self.game._absolute_day(),
+                "gold":       self.game.inventory.gold,
+                "reputation": self.game.reputation,
+            }
+            import base64 as _b64
+            save_data = {"compressed_b64": _b64.b64encode(raw_bytes).decode("ascii")}
+
+            def _on_push_done(r, _app=self):
+                if r and r.success:
+                    _app._last_sync_time = time.time()
+                    _app.after(0, _app._update_sync_label)
+                else:
+                    err = (r.error if r else "no response from server")
+                    _app.after(0, lambda e=err: _app.message_bar.warn(
+                        f"☁ Cloud sync failed — {e}"))
+
+            self.online.sync.push(save_data, meta, callback=_on_push_done)
+        except Exception:
+            pass
+
+    def _update_sync_label(self) -> None:
+        """Update the ☁ indicator in the title bar; self-reschedules every 15s
+        while the last sync was recent (< 10 minutes ago)."""
+        # Cancel any previously pending tick so we never run double chains
+        if self._sync_label_timer:
+            try:
+                self.after_cancel(self._sync_label_timer)
+            except Exception:
+                pass
+            self._sync_label_timer = None
+
+        try:
+            lbl = self.custom_title.sync_lbl
+        except AttributeError:
+            return
+
+        is_online = bool(self.online and self.online.is_online)
+
+        if self._last_sync_time is None:
+            try:
+                lbl.config(text="☁ ─" if is_online else "", fg=T["fg_dim"])
+            except tk.TclError:
+                pass
+            return
+
+        secs = int(time.time() - self._last_sync_time)
+        if secs < 10:
+            txt = "☁ synced now"
+        elif secs < 60:
+            txt = "☁ synced < 1m ago"
+        elif secs < 120:
+            txt = "☁ synced 1m ago"
+        else:
+            mins = secs // 60
+            txt  = f"☁ synced {mins}m ago"
+
+        try:
+            lbl.config(text=txt, fg=T["fg_dim"])
+        except tk.TclError:
+            return
+
+        # Keep ticking every 15 s until stale (> 10 min)
+        if secs < 10 * 60:
+            self._sync_label_timer = self.after(15_000, self._update_sync_label)
 
     # ── Focus / entry guard ───────────────────────────────────────────────────
 
@@ -12441,6 +14184,11 @@ class GameApp(tk.Tk):
         # Show the top-most screen without pushing it again
         self.screens[self._stack[-1]].show()
         self.status_bar.refresh()
+        # Reposition the profile panel for the new window dimensions
+        self.after(50, lambda: (
+            hasattr(self, "profile_panel") and
+            self.profile_panel._on_resize()
+        ))
 
     def _on_ctrl_scroll(self, event: tk.Event) -> None:
         """Ctrl+Scroll — zoom in (up) or out (down) by 0.25 steps."""
@@ -12454,8 +14202,8 @@ class GameApp(tk.Tk):
         """Wipe save file, create a fresh Game, prompt for a name, skip tutorial."""
         import os as _os
         try:
-            if _os.path.exists(Game.SAVE_FILE):
-                _os.remove(Game.SAVE_FILE)
+            if _os.path.exists(self.game.SAVE_FILE):
+                _os.remove(self.game.SAVE_FILE)
         except Exception:
             pass
         # Rebuild game model
@@ -12465,6 +14213,11 @@ class GameApp(tk.Tk):
         # Re-wire each existing screen to the new game instance
         for sc in self.screens.values():
             sc.game = self.game
+        # Re-bind to the same account if the player is online
+        if self.online and self.online.auth.user_id:
+            _uid = self.online.auth.user_id
+            self.game.SAVE_FILE     = Game.save_path_for_user(_uid)
+            self.game.bound_user_id = _uid
         # Ask for a name then go straight to main (no tutorial)
         name = InputDialog(self, "Enter your merchant name:",
                            "Fresh Start", "Merchant").wait()

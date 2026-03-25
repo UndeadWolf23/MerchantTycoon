@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Merchant Tycoon - Verification</title>
+
+<style>
+    body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, #3b2a1a, #1f140c);
+        font-family: Georgia, serif;
+        color: #d4af37;
+        text-align: center;
+    }
+
+    .card {
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(212, 175, 55, 0.4);
+        padding: 50px 70px;
+        border-radius: 16px;
+        box-shadow: 0 0 25px rgba(0,0,0,0.6);
+        max-width: 600px;
+    }
+
+    .title {
+        font-size: 32px;
+        letter-spacing: 2px;
+        color: #f5d77a;
+        margin-bottom: 10px;
+        text-shadow: 0 0 10px rgba(212,175,55,0.5);
+    }
+
+    .success {
+        font-size: 54px;
+        font-weight: bold;
+        color: #ffd86b;
+        margin: 25px 0;
+        text-shadow: 0 0 18px rgba(212,175,55,0.7);
+    }
+
+    p {
+        font-size: 16px;
+        color: #e6c86a;
+        line-height: 1.5;
+        margin-top: 10px;
+    }
+
+    .button {
+        margin-top: 25px;
+        display: inline-block;
+        padding: 12px 20px;
+        border-radius: 10px;
+        background: #d4af37;
+        color: #2b1b10;
+        font-weight: bold;
+        text-decoration: none;
+        transition: 0.2s ease;
+    }
+
+    .button:hover {
+        background: #f5d77a;
+        transform: scale(1.05);
+    }
+</style>
+</head>
+
+<body>
+    <div class="card">
+        <div class="title">Merchant Tycoon</div>
+
+        <div class="success">Verification Successful</div>
+
+        <p>
+            Your account has been successfully verified.<br>
+            You may now return to the game and log into your new account.
+        </p>
+
+        <a class="button" href="javascript:window.close();">
+            Return to Game
+        </a>
+    </div>
+</body>
+</html>

@@ -54,8 +54,10 @@ Supabase tables (SQL schema in each manager's docstring):
     guilds, guild_members, guild_invites
 """
 
+import http.server
 import json
 import os
+import socketserver
 import sys
 import threading
 import urllib.request
@@ -83,6 +85,105 @@ SUPABASE_URL: str      = os.environ.get(
     "SUPABASE_URL", "https://bshhjvxbrheheofcdsbw.supabase.co")
 SUPABASE_ANON_KEY: str = os.environ.get(
     "SUPABASE_ANON_KEY", "sb_publishable_sIWaf4GR_x9hL9Lg1Z6Ahg_6Sh4QZ0v")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VERIFICATION SERVER  —  local HTTP server for email-verification redirect
+# ─────────────────────────────────────────────────────────────────────────────
+
+# HTML file lives next to this module in the same directory
+_SCRIPTS_DIR      = os.path.dirname(os.path.abspath(__file__))
+_VERIF_HTML_PATH  = os.path.join(_SCRIPTS_DIR, "VerificationSuccess.html")
+
+
+class VerificationServer:
+    """
+    Minimal single-file HTTP server that serves VerificationSuccess.html
+    on  http://localhost:3000/VerificationSuccess.html
+
+    Runs on a daemon thread — completely invisible to the player.
+    Supabase email verification links redirect to this URL, so the
+    landing page is styled to match the game rather than Supabase's default.
+
+    Usage:
+        server = VerificationServer()   # or OnlineServices().verification
+        server.start()                  # begin hosting
+        server.stop()                   # shut down (port freed immediately)
+    """
+
+    PORT        = 3000
+    FILENAME    = "VerificationSuccess.html"
+    REDIRECT_URL = f"http://localhost:{PORT}/{FILENAME}"
+
+    def __init__(self, html_path: str = _VERIF_HTML_PATH) -> None:
+        self._html_path = html_path
+        self._server:  Optional[socketserver.TCPServer] = None
+        self._thread:  Optional[threading.Thread]       = None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> bool:
+        """Start the server; returns True on success, False if already running
+        or the port is in use."""
+        if self._server is not None:
+            return True   # already running
+
+        html_path = self._html_path
+        filename  = self.FILENAME
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            """Serves only VerificationSuccess.html; silences all log output."""
+
+            def do_GET(self) -> None:  # noqa: N802
+                req_path = self.path.split("?")[0].lstrip("/")
+                if req_path == filename:
+                    try:
+                        with open(html_path, "rb") as fh:
+                            data = fh.read()
+                        self.send_response(200)
+                        self.send_header("Content-Type",   "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except Exception:
+                        self.send_response(500)
+                        self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *_args) -> None:  # suppress all console output
+                pass
+
+        try:
+            # allow_reuse_address prevents "address already in use" on quick restart
+            socketserver.TCPServer.allow_reuse_address = True
+            srv = socketserver.TCPServer(("127.0.0.1", self.PORT), _Handler)
+            self._server = srv
+            self._thread = threading.Thread(
+                target=srv.serve_forever, daemon=True, name="verif-server")
+            self._thread.start()
+            return True
+        except OSError:
+            # Port 3000 already in use — not a fatal error
+            self._server = None
+            self._thread = None
+            return False
+
+    def stop(self) -> None:
+        """Shut down the server and free the port."""
+        srv = self._server
+        if srv is not None:
+            try:
+                srv.shutdown()       # signals serve_forever() to exit
+                srv.server_close()   # closes the socket
+            except Exception:
+                pass
+            self._server = None
+            self._thread = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._server is not None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOCAL SESSION STORAGE  —  same user-data directory as the main game
@@ -349,11 +450,14 @@ class AuthManager:
         email: str,
         password: str,
         username: str = "",
+        redirect_to: str = "",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
         """
         Register a new account.
         username is stored in user_metadata and used as the display name.
+        redirect_to, when set, tells Supabase where to redirect the player
+        after they click the verification link in their email.
         If the Supabase project requires email confirmation, result.data will
         contain {"action": "confirm_email"} and no session is started yet.
         """
@@ -361,7 +465,10 @@ class AuthManager:
             body: Dict = {"email": email, "password": password}
             if username:
                 body["data"] = {"username": username}
-            result = self._client.post("/auth/v1/signup", body)
+            params: Optional[Dict] = None
+            if redirect_to:
+                params = {"redirect_to": redirect_to}
+            result = self._client.post("/auth/v1/signup", body, params=params)
             if result.success:
                 if result.data.get("access_token"):
                     self._apply_session(result.data)
@@ -1191,6 +1298,18 @@ class ProfileManager:
         create policy "read all"   on earned_titles for select using (true);
         create policy "insert own" on earned_titles for insert
             with check (auth.uid() = user_id);
+
+        -- Achievements earned by each player
+        create table if not exists earned_achievements (
+            user_id   uuid references auth.users on delete cascade not null,
+            ach_key   text not null,
+            earned_at timestamptz default now(),
+            primary key (user_id, ach_key)
+        );
+        alter table earned_achievements enable row level security;
+        create policy "read all"   on earned_achievements for select using (true);
+        create policy "insert own" on earned_achievements for insert
+            with check (auth.uid() = user_id);
     """
 
     def __init__(self, client: OnlineClient, auth: AuthManager) -> None:
@@ -1202,13 +1321,27 @@ class ProfileManager:
         username: str,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Create the public profile row after a new account is registered."""
+        """Create the public profile row after a new account is registered.
+
+        Required additional columns on the profiles table (run in Supabase SQL editor):
+            alter table profiles
+                add column if not exists discriminator integer not null default 0,
+                add column if not exists last_seen     timestamptz default now(),
+                add column if not exists last_networth float not null default 0,
+                add column if not exists last_area     text  not null default '';
+        """
+        import random
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
+            discriminator = random.randint(1000, 9999)
             return self._client.post(
                 "/rest/v1/profiles",
-                body={"id": self._auth.user_id, "username": username},
+                body={
+                    "id":            self._auth.user_id,
+                    "username":      username,
+                    "discriminator": discriminator,
+                },
                 extra_headers={"Prefer": "return=representation"},
             )
 
@@ -1293,6 +1426,27 @@ class ProfileManager:
         _run_async(_do, callback)
         return None
 
+    def award_achievement(
+        self,
+        ach_key: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Award an achievement to the current player (idempotent; safe to call again)."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            return self._client.post(
+                "/rest/v1/earned_achievements",
+                body={"user_id": self._auth.user_id, "ach_key": ach_key},
+                params={"on_conflict": "user_id,ach_key"},
+                extra_headers={"Prefer": "resolution=ignore-duplicates"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
     def get_earned_titles(
         self,
         user_id: Optional[str] = None,
@@ -1331,6 +1485,86 @@ class ProfileManager:
             return _do()
         _run_async(_do, callback)
         return None
+
+    def search_players(
+        self,
+        query: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """
+        Search for players by merchant name or UUID.
+        Supported query formats:
+          "GoldMerchant"         — partial username search (ILIKE)
+          "GoldMerchant #4291"   — exact name + 4-digit discriminator tag
+          "550e8400-e29b-..."    — UUID exact match (36 chars)
+        Returns a list of matching profile rows.
+        """
+        def _do() -> OnlineResult:
+            q = (query or "").strip()
+            if not q:
+                return OnlineResult(success=True, data=[])
+
+            _fields = "id,username,discriminator,last_seen,last_networth"
+
+            # UUID detection: 36 chars with 4 dashes
+            if len(q) == 36 and q.count("-") == 4:
+                result = self._client.get(
+                    "/rest/v1/profiles",
+                    params={"id": f"eq.{q}", "select": _fields, "limit": "1"},
+                )
+                if result.success:
+                    rows = result.data if isinstance(result.data, list) else \
+                           ([result.data] if result.data else [])
+                    result.data = rows
+                return result
+
+            # Name#tag detection
+            name_part: str       = q
+            tag_part:  Optional[int] = None
+            if "#" in q:
+                parts = q.rsplit("#", 1)
+                name_part = parts[0].strip()
+                try:
+                    tag_part = int(parts[1].strip())
+                except ValueError:
+                    pass
+
+            params: Dict[str, str] = {"select": _fields, "limit": "10"}
+            if tag_part is not None:
+                params["username"]      = f"ilike.{name_part}"
+                params["discriminator"] = f"eq.{tag_part}"
+            else:
+                params["username"] = f"ilike.%{name_part}%"
+
+            result = self._client.get("/rest/v1/profiles", params=params)
+            if result.success:
+                result.data = result.data if isinstance(result.data, list) else []
+            return result
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def update_presence(
+        self,
+        networth: float,
+        area: str = "",
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """
+        Update the player's online status: last_seen timestamp and current networth.
+        Intended to be called every few minutes while the player is in-game.
+        """
+        import datetime
+        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        updates: Dict = {
+            "last_seen":     now_str,
+            "last_networth": round(networth, 2),
+        }
+        if area:
+            updates["last_area"] = area
+        return self.update_profile(updates, callback=callback)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1494,11 +1728,85 @@ class FriendsManager:
             return self._client.get(
                 "/rest/v1/friends",
                 params={
-                    "select":       "requester_id,created_at,profiles(username,title)",
+                    "select":       "requester_id,created_at,profiles(username,title,discriminator)",
                     "addressee_id": f"eq.{self._auth.user_id}",
                     "status":       "eq.pending",
                 },
             )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def list_friends_with_profiles(
+        self, callback: Optional[Callable] = None
+    ) -> Optional[OnlineResult]:
+        """
+        Return all accepted friends enriched with their profile data.
+
+        Each item in the list:
+            {
+                "friend_id":  str,
+                "profile":    {username, discriminator, last_seen, last_networth},
+                "updated_at": str,
+            }
+        Max 100 friends returned (matches the 100-friend cap).
+        """
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            uid = self._auth.user_id
+
+            # Step 1 — get accepted rows (both directions, up to 100)
+            fr = self._client.get(
+                "/rest/v1/friends",
+                params={
+                    "select": "requester_id,addressee_id,updated_at",
+                    "status": "eq.accepted",
+                    "or":     f"(requester_id.eq.{uid},addressee_id.eq.{uid})",
+                    "limit":  "100",
+                },
+            )
+            if not fr.success:
+                return fr
+
+            rows = fr.data if isinstance(fr.data, list) else []
+            if not rows:
+                return OnlineResult(success=True, data=[])
+
+            # Step 2 — extract the other person's UUID for each row
+            friend_ids = [
+                row["addressee_id"] if row["requester_id"] == uid
+                else row["requester_id"]
+                for row in rows
+            ]
+
+            # Step 3 — batch-fetch profiles in a single request
+            ids_csv = ",".join(friend_ids)
+            pr = self._client.get(
+                "/rest/v1/profiles",
+                params={
+                    "select": "id,username,discriminator,last_seen,last_networth",
+                    "id":     f"in.({ids_csv})",
+                    "limit":  "100",
+                },
+            )
+            profiles_by_id: Dict[str, Dict] = {}
+            if pr.success and isinstance(pr.data, list):
+                for p in pr.data:
+                    profiles_by_id[p["id"]] = p
+
+            # Step 4 — combine into unified records
+            combined = [
+                {
+                    "friend_id":  fid,
+                    "profile":    profiles_by_id.get(fid, {}),
+                    "updated_at": row.get("updated_at"),
+                }
+                for row, fid in zip(rows, friend_ids)
+            ]
+            return OnlineResult(success=True, data=combined)
 
         if callback is None:
             return _do()
@@ -1605,6 +1913,7 @@ class OnlineServices:
         self.leaderboard  = LeaderboardManager(self._http, self.auth)
         self.friends      = FriendsManager(self._http, self.auth)
         self.guilds       = GuildManager(self._http, self.auth)
+        self.verification = VerificationServer()
 
     def startup(self) -> bool:
         """

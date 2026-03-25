@@ -912,6 +912,300 @@ class StockMarket:
                 self.stocks[sym]["history"] = deque(d.get("history", []), maxlen=30)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TITLES  (25 total)
+# Each dict: id, name, tier, icon, hidden, future_event, desc, check(game)->bool,
+#            bonuses: {gold_mult, rep_mult, xp_mult}  (multiplicative, 1.0 = no bonus)
+# hidden=True titles are not shown until unlocked.
+# future_event=True titles cannot be earned via normal gameplay yet.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TITLE_DEFINITIONS = [
+    # ── Normal titles (15) ───────────────────────────────────────────────────
+    {
+        "id": "wandering_trader",
+        "name": "Wandering Trader",
+        "tier": "bronze",
+        "icon": "⛺",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Your first steps on the merchant road.",
+        "check": lambda g: g.lifetime_trades >= 1,
+        "bonuses": {"gold_mult": 1.00, "rep_mult": 1.00, "xp_mult": 1.02},
+    },
+    {
+        "id": "market_hawk",
+        "name": "Market Hawk",
+        "tier": "bronze",
+        "icon": "🦅",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Complete 100 trades.",
+        "check": lambda g: g.lifetime_trades >= 100,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "silver_tongue",
+        "name": "Silver Tongue",
+        "tier": "silver",
+        "icon": "💬",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach Haggling skill level 5.",
+        "check": lambda g: g.skills.haggling >= 5,
+        "bonuses": {"gold_mult": 1.08, "rep_mult": 1.00, "xp_mult": 1.05},
+    },
+    {
+        "id": "debt_baron",
+        "name": "Debt Baron",
+        "tier": "silver",
+        "icon": "📜",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Take out 5 or more loans.",
+        "check": lambda g: g.ach_stats.get("loans_taken", 0) >= 5,
+        "bonuses": {"gold_mult": 1.00, "rep_mult": 1.05, "xp_mult": 1.00},
+    },
+    {
+        "id": "the_landlord",
+        "name": "The Landlord",
+        "tier": "silver",
+        "icon": "🏠",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Own 5 or more properties at once.",
+        "check": lambda g: len(g.real_estate) >= 5,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.05, "xp_mult": 1.00},
+    },
+    {
+        "id": "industrialist",
+        "name": "Captain of Industry",
+        "tier": "gold",
+        "icon": "🏭",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Own at least one of every type of business.",
+        "check": lambda g: len({b.key for b in g.businesses}) >= 5,
+        "bonuses": {"gold_mult": 1.10, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "sea_wolf",
+        "name": "Sea Wolf",
+        "tier": "gold",
+        "icon": "⚓",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Complete 10 successful voyages.",
+        "check": lambda g: g.ach_stats.get("voyages_completed", 0) >= 10,
+        "bonuses": {"gold_mult": 1.08, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "contract_king",
+        "name": "Contract King",
+        "tier": "gold",
+        "icon": "👑",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Complete 25 contracts.",
+        "check": lambda g: g.ach_stats.get("contracts_completed", 0) >= 25,
+        "bonuses": {"gold_mult": 1.10, "rep_mult": 1.05, "xp_mult": 1.00},
+    },
+    {
+        "id": "gold_hoarder",
+        "name": "Gold Hoarder",
+        "tier": "silver",
+        "icon": "💰",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Hold 10,000 gold in your wallet.",
+        "check": lambda g: g.inventory.gold >= 10_000,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "the_smuggler",
+        "name": "The Smuggler",
+        "tier": "silver",
+        "icon": "🕵️",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Successfully smuggle 10 times.",
+        "check": lambda g: g.ach_stats.get("smuggle_success", 0) >= 10,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "tycoon",
+        "name": "Tycoon",
+        "tier": "gold",
+        "icon": "🏆",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach a net worth of 100,000 gold.",
+        "check": lambda g: g._net_worth() >= 100_000,
+        "bonuses": {"gold_mult": 1.12, "rep_mult": 1.08, "xp_mult": 1.00},
+    },
+    {
+        "id": "merchant_prince",
+        "name": "Merchant Prince",
+        "tier": "platinum",
+        "icon": "⚜",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach a net worth of 500,000 gold.",
+        "check": lambda g: g._net_worth() >= 500_000,
+        "bonuses": {"gold_mult": 1.15, "rep_mult": 1.10, "xp_mult": 1.00},
+    },
+    {
+        "id": "grand_magnate",
+        "name": "Grand Magnate",
+        "tier": "platinum",
+        "icon": "✦",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach level 5 in all merchant skills.",
+        "check": lambda g: all(
+            getattr(g.skills, s.value.lower(), 0) >= 5 for s in SkillType),
+        "bonuses": {"gold_mult": 1.10, "rep_mult": 1.00, "xp_mult": 1.10},
+    },
+    {
+        "id": "shadow_broker",
+        "name": "Shadow Broker",
+        "tier": "gold",
+        "icon": "🌑",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach Espionage skill level 5.",
+        "check": lambda g: g.skills.espionage >= 5,
+        "bonuses": {"gold_mult": 1.08, "rep_mult": 1.05, "xp_mult": 1.00},
+    },
+    {
+        "id": "the_banker",
+        "name": "The Banker",
+        "tier": "gold",
+        "icon": "🏦",
+        "hidden": False,
+        "future_event": False,
+        "desc": "Reach Banking skill level 5 and hold 5 certificates of deposit.",
+        "check": lambda g: g.skills.banking >= 5 and len(g.cds) >= 5,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.10, "xp_mult": 1.00},
+    },
+    # ── Hidden mystery titles (7) ────────────────────────────────────────────
+    {
+        "id": "ghost",
+        "name": "Ghost",
+        "tier": "gold",
+        "icon": "👻",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Delivered goods across the land during a plague event.",
+        "check": lambda g: g.ach_stats.get("plague_medicine_sold", 0) >= 5,
+        "bonuses": {"gold_mult": 1.06, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "lucky_devil",
+        "name": "Lucky Devil",
+        "tier": "silver",
+        "icon": "🎲",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Escaped a smuggling bust nearly penniless.",
+        "check": lambda g: g.ach_stats.get("smuggle_busts", 0) >= 1
+                           and g.inventory.gold < 5,
+        "bonuses": {"gold_mult": 1.03, "rep_mult": 1.00, "xp_mult": 1.10},
+    },
+    {
+        "id": "night_owl",
+        "name": "Night Owl",
+        "tier": "silver",
+        "icon": "🦉",
+        "hidden": True,
+        "future_event": False,
+        "desc": "A veteran who has seen 365 days of trade.",
+        "check": lambda g: g._absolute_day() >= 365,
+        "bonuses": {"gold_mult": 1.00, "rep_mult": 1.05, "xp_mult": 1.05},
+    },
+    {
+        "id": "contrarian",
+        "name": "Contrarian",
+        "tier": "bronze",
+        "icon": "↙",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Sold goods at a loss 10 times — the market's greatest mystery.",
+        "check": lambda g: g.ach_stats.get("sold_at_loss", False)
+                           and g.ach_stats.get("lifetime_loss_count", 0) >= 10,
+        "bonuses": {"gold_mult": 1.00, "rep_mult": 1.08, "xp_mult": 1.00},
+    },
+    {
+        "id": "old_salt",
+        "name": "Old Salt",
+        "tier": "gold",
+        "icon": "🌊",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Lost 3 voyages, yet still sails on.",
+        "check": lambda g: g.ach_stats.get("voyages_lost", 0) >= 3,
+        "bonuses": {"gold_mult": 1.05, "rep_mult": 1.00, "xp_mult": 1.08},
+    },
+    {
+        "id": "midas_touch",
+        "name": "Midas Touch",
+        "tier": "platinum",
+        "icon": "✨",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Amassed a staggering fortune of one million gold.",
+        "check": lambda g: g._net_worth() >= 1_000_000,
+        "bonuses": {"gold_mult": 1.20, "rep_mult": 1.15, "xp_mult": 1.00},
+    },
+    {
+        "id": "comeback_kid",
+        "name": "The Comeback Kid",
+        "tier": "platinum",
+        "icon": "🌅",
+        "hidden": True,
+        "future_event": False,
+        "desc": "Rebuilt your reputation from zero back to the heights.",
+        "check": lambda g: g.ach_stats.get("rep_recovered", False),
+        "bonuses": {"gold_mult": 1.00, "rep_mult": 1.15, "xp_mult": 1.10},
+    },
+    # ── Future event titles (3) — cannot be earned yet ───────────────────────
+    {
+        "id": "winters_champion",
+        "name": "Winter's Champion",
+        "tier": "platinum",
+        "icon": "❄",
+        "hidden": False,
+        "future_event": True,
+        "desc": "Awarded to victors of the Winter Trade Tournament.",
+        "check": lambda g: False,
+        "bonuses": {"gold_mult": 1.10, "rep_mult": 1.00, "xp_mult": 1.00},
+    },
+    {
+        "id": "festival_merchant",
+        "name": "Festival Merchant",
+        "tier": "gold",
+        "icon": "🎉",
+        "hidden": False,
+        "future_event": True,
+        "desc": "Honoured at the Grand Merchant Festival.",
+        "check": lambda g: False,
+        "bonuses": {"gold_mult": 1.08, "rep_mult": 1.08, "xp_mult": 1.00},
+    },
+    {
+        "id": "the_kingmaker",
+        "name": "The Kingmaker",
+        "tier": "platinum",
+        "icon": "👑",
+        "hidden": False,
+        "future_event": True,
+        "desc": "Shaped the fate of a nation through commerce.",
+        "check": lambda g: False,
+        "bonuses": {"gold_mult": 1.15, "rep_mult": 1.12, "xp_mult": 1.12},
+    },
+]
+
+TITLES_BY_ID: dict = {t["id"]: t for t in TITLE_DEFINITIONS}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ACHIEVEMENTS  (100 total)
 # Each dict:  id, name, tier, icon, hidden, hint, desc, check(game)->bool
 # Tiers: "bronze" "silver" "gold" "platinum" ""
@@ -2521,6 +2815,13 @@ class Voyage:
 
 class Game:
     SAVE_FILE            = os.path.join(_USER_DATA_DIR, "savegame.dat")
+
+    @staticmethod
+    def save_path_for_user(user_id: str) -> str:
+        """Return the per-account local save path for the given Supabase user ID."""
+        uid_short = user_id.replace("-", "")[:8]
+        return os.path.join(_USER_DATA_DIR, f"savegame_{uid_short}.dat")
+
     DAYS_PER_SEASON      = 30
     SEASONS_PER_YEAR     = 4
     DAILY_TIME_UNITS     = 6     # activity slots per in-game day before night falls
@@ -2631,8 +2932,16 @@ class Game:
             "voyages_completed":   0,
             "voyages_lost":        0,
             "voyage_gold_earned":  0.0,
+            # ── Titles ───────────────────────────────────────────────────
+            "lifetime_loss_count": 0,   # how many times sold at a loss
         }
         self.influence_cooldowns: Dict[str, int] = {}  # "{area}:{item}:{action}" → expiry abs_day
+        # ── Titles ────────────────────────────────────────────────────────
+        self.earned_titles: List[str] = []   # list of earned title IDs
+        self.active_title:  str       = ""   # currently equipped title ID
+        self.title_queue:   list      = []   # IDs pending announce
+        # ── Play-time tracking ────────────────────────────────────────────
+        self.time_played_seconds: float = 0.0  # accumulated across sessions
         # ── Voyage system ─────────────────────────────────────────────────
         self.ships: List[Ship]       = []
         self.captains: List[Captain] = []
@@ -2640,6 +2949,9 @@ class Game:
         self.next_ship_id:    int    = 1
         self.next_captain_id: int    = 1
         self.next_voyage_id:  int    = 1
+        # ── Account binding ────────────────────────────────────────────────────
+        self.bound_user_id: str = ""   # Supabase user_id this save is locked to
+        self._load_error:   str = ""   # set by load_game on account-mismatch
         self._generate_captains()
 
     def _generate_captains(self) -> None:
@@ -2678,12 +2990,36 @@ class Game:
         return round(self.BASE_LIVING_COST * fluctuation * self.settings.cost_mult, 2)
 
     def _sell_mult(self) -> float:
-        """Effective sell-price multiplier: difficulty × reputation penalty."""
+        """Effective sell-price multiplier: difficulty × reputation penalty × title bonus."""
         rep_penalty = 1.0
         if self.reputation < 40:
             # Linear penalty: rep 0→0.78, rep 20→0.87, rep 40→1.0
             rep_penalty = 0.78 + (self.reputation / 40.0) * 0.22
-        return round(self.settings.price_sell_mult * rep_penalty, 4)
+        return round(self.settings.price_sell_mult * rep_penalty * self.title_gold_mult, 4)
+
+    @property
+    def title_gold_mult(self) -> float:
+        """Gold-income multiplier from the currently equipped title (1.0 = no bonus)."""
+        if not self.active_title:
+            return 1.0
+        td = TITLES_BY_ID.get(self.active_title)
+        return td["bonuses"].get("gold_mult", 1.0) if td else 1.0
+
+    @property
+    def title_xp_mult(self) -> float:
+        """XP multiplier from the currently equipped title (1.0 = no bonus)."""
+        if not self.active_title:
+            return 1.0
+        td = TITLES_BY_ID.get(self.active_title)
+        return td["bonuses"].get("xp_mult", 1.0) if td else 1.0
+
+    @property
+    def title_rep_mult(self) -> float:
+        """Reputation-gain multiplier from the currently equipped title (1.0 = no bonus)."""
+        if not self.active_title:
+            return 1.0
+        td = TITLES_BY_ID.get(self.active_title)
+        return td["bonuses"].get("rep_mult", 1.0) if td else 1.0
 
     # ── Achievement System ───────────────────────────────────────────────────
 
@@ -2701,7 +3037,8 @@ class Game:
             self.ach_stats[key] = current + amount
 
     def _check_achievements(self) -> None:
-        """Unlock any newly met achievements and push them to the queue."""
+        """Unlock any newly met achievements and push them to the queue,
+        then check for any newly earned titles."""
         for ach in ACHIEVEMENTS:
             if ach["id"] in self.achievements:
                 continue
@@ -2711,6 +3048,51 @@ class Game:
                     self.ach_queue.append(ach["id"])
             except Exception:
                 pass
+        self._check_title_unlocks()
+
+    def _check_title_unlocks(self) -> None:
+        """Check and unlock any newly earned titles, queuing them for display."""
+        for td in TITLE_DEFINITIONS:
+            tid = td["id"]
+            if td.get("future_event") or tid in self.earned_titles:
+                continue
+            try:
+                if td["check"](self):
+                    self.earned_titles.append(tid)
+                    self.title_queue.append(tid)
+            except Exception:
+                pass
+
+    def _display_title_queue(self) -> None:
+        """Print unlock banners for every newly earned title."""
+        if not self.title_queue:
+            return
+        for tid in list(self.title_queue):
+            td = TITLES_BY_ID.get(tid)
+            if not td:
+                continue
+            icon = td.get("icon", "★")
+            name = td["name"]
+            tiers = td.get("tier", "")
+            bonuses = td.get("bonuses", {})
+            bonus_parts = []
+            if bonuses.get("gold_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['gold_mult']-1)*100)}% Gold")
+            if bonuses.get("rep_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['rep_mult']-1)*100)}% Rep")
+            if bonuses.get("xp_mult", 1.0) > 1.0:
+                bonus_parts.append(f"+{int((bonuses['xp_mult']-1)*100)}% XP")
+            bonus_str = "  " + "  ".join(bonus_parts) if bonus_parts else "  No stat bonus"
+            print()
+            print(f"  {c('╔══════════════════════════════════════════════════════════╗', CYAN)}")
+            print(f"  {c('║', CYAN)}  {c(icon, YELLOW)} TITLE UNLOCKED!                                  {c('║', CYAN)}")
+            print(f"  {c('╠══════════════════════════════════════════════════════════╣', CYAN)}")
+            print(f"  {c('║', CYAN)}  {c(name, BOLD + CYAN):<54}  {c('║', CYAN)}")
+            print(f"  {c('║', CYAN)}  {td.get('desc', ''):<56}{c('║', CYAN)}")
+            print(f"  {c('║', CYAN)}{bonus_str:<58}{c('║', CYAN)}")
+            print(f"  {c('╚══════════════════════════════════════════════════════════╝', CYAN)}")
+        self.title_queue.clear()
+        pause()
 
     def _display_achievement_queue(self) -> None:
         """Print the box-art unlock banner for every queued achievement."""
@@ -4420,6 +4802,7 @@ class Game:
                     self.ach_stats["max_single_sale"] = earnings
                 if avg_cost is not None and profit < 0:
                     self._track_stat("sold_at_loss", True)
+                    self._track_stat("lifetime_loss_count", 1)
                 # War / Plague event item tracking
                 for ev in getattr(self.markets[self.current_area], "active_events", []):
                     ev_name = ev.get("name", "").upper() if isinstance(ev, dict) else str(ev).upper()
@@ -5545,7 +5928,7 @@ class Game:
 
     def _gain_skill_xp(self, skill: SkillType, amount: int):
         key = skill.value
-        self.skills.xp[key] = self.skills.xp.get(key, 0) + amount
+        self.skills.xp[key] = self.skills.xp.get(key, 0) + round(amount * self.title_xp_mult)
 
     # ── Smuggling ─────────────────────────────────────────────────────────────
 
@@ -7170,6 +7553,7 @@ class Game:
 
         data = {
             "version": 2,
+            "bound_user_id": self.bound_user_id,
             "player_name": self.player_name,
             "day": self.day, "year": self.year, "season": self.season.name,
             "current_area": self.current_area.name,
@@ -7225,6 +7609,9 @@ class Game:
                 k: (list(v) if isinstance(v, list) else v)
                 for k, v in self.ach_stats.items()
             },
+            "earned_titles":       self.earned_titles,
+            "active_title":        self.active_title,
+            "time_played_seconds": self.time_played_seconds,
             "gamble_mercy":       self.settings.gamble_mercy,
             "influence_cooldowns": dict(self.influence_cooldowns),
             # ── Real Estate ──────────────────────────────────────────────────────────
@@ -7338,6 +7725,13 @@ class Game:
             except Exception:
                 return False
         try:
+            # ── Account binding check ─────────────────────────────────────────────
+            file_uid = data.get("bound_user_id", "")
+            if file_uid and self.bound_user_id and file_uid != self.bound_user_id:
+                self._load_error = "wrong_account"
+                return False
+            if file_uid:
+                self.bound_user_id = file_uid
 
             self.player_name  = data.get("player_name", "Merchant")
             self.day          = data.get("day", 1)
@@ -7481,6 +7875,10 @@ class Game:
                         self.ach_stats[k] = sv
             self.influence_cooldowns = {k: int(v) for k, v in data.get("influence_cooldowns", {}).items()}
             self.settings.gamble_mercy = int(data.get("gamble_mercy", 0))
+            # ── Title data (backward-compatible) ────────────────────────
+            self.earned_titles       = list(data.get("earned_titles", []))
+            self.active_title        = data.get("active_title", "")
+            self.time_played_seconds = float(data.get("time_played_seconds", 0.0))
 
             # ── Real Estate (backward-compatible) ───────────────────────────────────
             self.real_estate = []

@@ -202,6 +202,7 @@ DEFAULT_HOTKEYS: Dict[str, str] = {
     "help":       "h",
     "settings":   "F10",
     "save":       "Control-s",
+    "voyage":     "g",
 }
 
 @dataclass
@@ -257,7 +258,6 @@ class GameSettings:
                 "double_click_action":   self.double_click_action,
                 "right_click_haggle":    self.right_click_haggle,
                 "enable_signatures":     self.enable_signatures,
-                "gamble_mercy":          self.gamble_mercy,
                 "hotkeys":               self.hotkeys,
             }, f)
 
@@ -276,7 +276,6 @@ class GameSettings:
                 self.double_click_action  = bool(d.get("double_click_action",   True))
                 self.right_click_haggle   = bool(d.get("right_click_haggle",    True))
                 self.enable_signatures    = bool(d.get("enable_signatures",     True))
-                self.gamble_mercy         = int(d.get("gamble_mercy",          0))
                 # Merge saved hotkeys with defaults (new actions get default binding)
                 raw_hk = d.get("hotkeys", {})
                 if isinstance(raw_hk, dict):
@@ -359,6 +358,7 @@ class LicenseType(Enum):
     CONTRACTS   = "Trade Contract Seal"   # formal trade contracts
     FUND_MGR    = "Fund Manager License"  # manage private funds; stock market
     REAL_ESTATE = "Real Estate Charter"   # buy/sell/develop land and property
+    VOYAGE      = "Voyage Charter"        # buy ships and send international cargo
 
 class PropertyType(Enum):
     PLOT      = "Vacant Land Plot"
@@ -407,6 +407,12 @@ LICENSE_INFO: Dict = {
         "cost": 1500, "rep": 55, "banking": 2,
         "desc": "Grants the right to purchase, develop, and lease real estate and land.",
         "unlocks": "Browse property listings, buy land plots, construct buildings, repair & flip properties, and earn lease income.",
+        "tier": "elite",
+    },
+    LicenseType.VOYAGE: {
+        "cost": 3000, "rep": 100, "banking": 0,
+        "desc": "A royal charter authorising you to outfit ships for international trade voyages.",
+        "unlocks": "Buy ships, hire captains, load cargo, and send voyages to distant ports for massive profits.",
         "tier": "elite",
     },
 }
@@ -2378,6 +2384,138 @@ class Inventory:
         print(f"\n  Weight: [{bar}] {w}/{cap}   Gold: {c(f'{self.gold:.2f}', YELLOW)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VOYAGE SYSTEM  —  Ships, Captains, and International Trade
+# ─────────────────────────────────────────────────────────────────────────────
+
+SHIP_TYPES: Dict[str, Dict] = {
+    "sloop":      {"name": "Sloop",      "cargo": 40,  "base_days": (30, 40), "piracy_risk": 0.08, "wreck_risk": 0.05, "cost": 2500},
+    "brigantine": {"name": "Brigantine", "cargo": 80,  "base_days": (35, 50), "piracy_risk": 0.07, "wreck_risk": 0.06, "cost": 5000},
+    "galleon":    {"name": "Galleon",    "cargo": 160, "base_days": (40, 60), "piracy_risk": 0.06, "wreck_risk": 0.07, "cost": 9000},
+    "carrack":    {"name": "Carrack",    "cargo": 120, "base_days": (38, 55), "piracy_risk": 0.05, "wreck_risk": 0.08, "cost": 7000},
+}
+
+SHIP_UPGRADES: Dict[str, Dict] = {
+    "reinforced_hull": {"name": "Reinforced Hull", "cost": 600, "wreck_mult": 0.55, "desc": "Iron plating reduces shipwreck risk."},
+    "cannon_battery":  {"name": "Cannon Battery",  "cost": 800, "piracy_mult": 0.50, "desc": "Mounted guns deter pirates."},
+    "speed_rigging":   {"name": "Speed Rigging",   "cost": 500, "days_mult":   0.80, "desc": "Superior sails cut voyage duration by 20%."},
+    "merchant_flag":   {"name": "Merchant Flag",   "cost": 300, "piracy_mult": 0.70, "profit_mult": 1.05, "desc": "Guild flag reduces piracy, boosts prices."},
+    "expanded_hold":   {"name": "Expanded Hold",   "cost": 700, "cargo_bonus": 40,   "desc": "Extra storage adds 40 cargo capacity."},
+}
+
+VOYAGE_PORTS: Dict[str, Dict] = {
+    "al_rashid":   {"name": "Port Al-Rashid", "days_mod": 1.0, "profit_mult": {"LUXURY": 1.8, "FOOD": 1.5, "RAW_MATERIAL": 1.2}},
+    "veldtholm":   {"name": "Veldtholm",      "days_mod": 0.9, "profit_mult": {"RAW_MATERIAL": 1.9, "PROCESSED": 1.6, "LUXURY": 1.3}},
+    "port_aureus": {"name": "Port Aureus",    "days_mod": 1.2, "profit_mult": {"LUXURY": 2.2, "EQUIPMENT": 1.8, "FOOD": 1.4}},
+    "ironreach":   {"name": "Ironreach",      "days_mod": 1.1, "profit_mult": {"EQUIPMENT": 2.0, "PROCESSED": 1.7, "RAW_MATERIAL": 1.5}},
+    "sundara":     {"name": "Sundara",        "days_mod": 1.3, "profit_mult": {"LUXURY": 2.5, "FOOD": 1.9, "PROCESSED": 1.6}},
+    "coldwater":   {"name": "Coldwater",      "days_mod": 0.8, "profit_mult": {"RAW_MATERIAL": 1.7, "FOOD": 1.6, "EQUIPMENT": 1.5}},
+}
+
+_CAPTAIN_FIRST  = ["Edmund", "Silas", "Aldric", "Torben", "Margret", "Fenwick",
+                    "Caelum", "Drest", "Gilda", "Oric", "Vesper", "Halvard",
+                    "Britta", "Cormac", "Theron", "Isolde", "Roric", "Beatrix"]
+_CAPTAIN_LAST   = ["Saltmere", "Wavecrest", "Drake", "Hornsby", "Brine",
+                    "Fairweather", "Stormwall", "Ironkeel", "Thatcher",
+                    "Blackwater", "Coldwind", "Hartley", "Dunmore", "Reefshire"]
+_CAPTAIN_TITLES = ["Captain", "Admiral", "Commodore", "Navigator", "Skipper"]
+
+_SHIP_NAME_PREFIXES = ["Swift", "Iron", "Golden", "Sea", "Storm", "Silver", "Brave", "Proud"]
+_SHIP_NAME_SUFFIXES = ["Wind", "Wave", "Dawn", "Star", "Crest", "Tide", "Anchor", "Gull"]
+
+
+@dataclass
+class Ship:
+    id: int
+    ship_type: str
+    name: str
+    upgrades: List[str] = field(default_factory=list)
+    status: str = "docked"           # "docked" | "sailing"
+    voyage_id: Optional[int] = None
+
+    @property
+    def cargo_capacity(self) -> int:
+        return SHIP_TYPES[self.ship_type]["cargo"] + sum(
+            SHIP_UPGRADES[u].get("cargo_bonus", 0) for u in self.upgrades
+        )
+
+    @property
+    def piracy_risk(self) -> float:
+        m = 1.0
+        for u in self.upgrades:
+            m *= SHIP_UPGRADES[u].get("piracy_mult", 1.0)
+        return SHIP_TYPES[self.ship_type]["piracy_risk"] * m
+
+    @property
+    def wreck_risk(self) -> float:
+        m = 1.0
+        for u in self.upgrades:
+            m *= SHIP_UPGRADES[u].get("wreck_mult", 1.0)
+        return SHIP_TYPES[self.ship_type]["wreck_risk"] * m
+
+    @property
+    def days_mult(self) -> float:
+        m = 1.0
+        for u in self.upgrades:
+            m *= SHIP_UPGRADES[u].get("days_mult", 1.0)
+        return m
+
+    @property
+    def profit_mult(self) -> float:
+        m = 1.0
+        for u in self.upgrades:
+            m *= SHIP_UPGRADES[u].get("profit_mult", 1.0)
+        return m
+
+
+@dataclass
+class Captain:
+    id: int
+    name: str
+    title: str
+    navigation: int    # 1–5
+    combat: int        # 1–5
+    seamanship: int    # 1–5
+    charisma: int      # 1–5
+    wage_per_voyage: float
+    crew_wage: float
+    is_hired: bool = False
+
+    @property
+    def day_reduction(self) -> float:
+        return (self.navigation - 1) * 0.05
+
+    @property
+    def piracy_mult(self) -> float:
+        return max(0.40, 1.0 - (self.combat - 1) * 0.12)
+
+    @property
+    def wreck_mult(self) -> float:
+        return max(0.40, 1.0 - (self.seamanship - 1) * 0.12)
+
+    @property
+    def profit_mult(self) -> float:
+        return 1.0 + (self.charisma - 1) * 0.08
+
+
+@dataclass
+class Voyage:
+    id: int
+    ship_id: int
+    ship_name: str
+    captain_id: int
+    captain_name: str
+    destination_key: str
+    cargo: Dict[str, int]      # item_key → qty
+    cargo_cost: float
+    days_total: int
+    days_remaining: int
+    status: str = "sailing"    # "sailing" | "arrived" | "lost_piracy" | "lost_wreck"
+    outcome_gold: float = 0.0
+    outcome_text: str = ""
+    departure_day: int = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN GAME CLASS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2489,8 +2627,50 @@ class Game:
             "campaigns_run":       0,
             "slanders_run":        0,
             "max_campaign_gold":   0.0,
+            # ── Voyage ───────────────────────────────────────────────────
+            "voyages_completed":   0,
+            "voyages_lost":        0,
+            "voyage_gold_earned":  0.0,
         }
         self.influence_cooldowns: Dict[str, int] = {}  # "{area}:{item}:{action}" → expiry abs_day
+        # ── Voyage system ─────────────────────────────────────────────────
+        self.ships: List[Ship]       = []
+        self.captains: List[Captain] = []
+        self.voyages: List[Voyage]   = []
+        self.next_ship_id:    int    = 1
+        self.next_captain_id: int    = 1
+        self.next_voyage_id:  int    = 1
+        self._generate_captains()
+
+    def _generate_captains(self) -> None:
+        """Generate a pool of 6 hireable captains at game start."""
+        self.captains = []
+        self.next_captain_id = 1
+        used_names: set = set()
+        for _ in range(6):
+            for _attempt in range(20):
+                first = random.choice(_CAPTAIN_FIRST)
+                last  = random.choice(_CAPTAIN_LAST)
+                if (first, last) not in used_names:
+                    used_names.add((first, last))
+                    break
+            title = random.choice(_CAPTAIN_TITLES)
+            nav   = random.randint(1, 5)
+            com   = random.randint(1, 5)
+            sea   = random.randint(1, 5)
+            cha   = random.randint(1, 5)
+            wage  = round(50 + (nav + com + sea + cha) * 8 + random.uniform(-10, 10), 0)
+            crew  = round(20 + random.uniform(0, 15), 0)
+            self.captains.append(Captain(
+                id=self.next_captain_id,
+                name=f"{first} {last}",
+                title=title,
+                navigation=nav, combat=com, seamanship=sea, charisma=cha,
+                wage_per_voyage=wage,
+                crew_wage=crew,
+                is_hired=False,
+            ))
+            self.next_captain_id += 1
 
     def _living_cost(self) -> float:
         """Living cost fluctuates daily ±30%, scaled by difficulty."""
@@ -6739,6 +6919,65 @@ class Game:
         if self.hired_managers:
             self._run_hired_managers()
 
+        # ── Voyage daily progress ─────────────────────────────────────────
+        for _voy in [v for v in self.voyages if v.status == "sailing"]:
+            _voy.days_remaining -= 1
+            _ship    = next((s for s in self.ships    if s.id == _voy.ship_id),    None)
+            _captain = next((c for c in self.captains if c.id == _voy.captain_id), None)
+            _piracy_r = (_ship.piracy_risk if _ship else 0.10) * (_captain.piracy_mult if _captain else 1.0)
+            _wreck_r  = (_ship.wreck_risk  if _ship else 0.06) * (_captain.wreck_mult  if _captain else 1.0)
+            _daily_piracy = _piracy_r / max(1, _voy.days_total)
+            _daily_wreck  = _wreck_r  / max(1, _voy.days_total)
+            _roll = random.random()
+            if _roll < _daily_wreck:
+                _voy.status       = "lost_wreck"
+                _voy.outcome_text = f"The {_voy.ship_name} was lost in a violent storm."
+                if _ship:
+                    self.ships.remove(_ship)
+                self.ach_stats["voyages_lost"] = self.ach_stats.get("voyages_lost", 0) + 1
+                self.news_feed.appendleft((self._absolute_day(), "Sea", "Shipwreck",
+                                           f"The {_voy.ship_name} was lost at sea!"))
+                self.event_log.appendleft(_voy.outcome_text)
+            elif _roll < _daily_wreck + _daily_piracy:
+                _voy.status       = "lost_piracy"
+                _voy.outcome_text = f"Pirates seized the {_voy.ship_name}. Crew ransomed for 200g."
+                self.inventory.gold = max(0.0, self.inventory.gold - 200)
+                if _ship:
+                    _ship.status    = "docked"
+                    _ship.voyage_id = None
+                self.ach_stats["voyages_lost"] = self.ach_stats.get("voyages_lost", 0) + 1
+                self.news_feed.appendleft((self._absolute_day(), "Sea", "Piracy",
+                                           f"The {_voy.ship_name} was seized by pirates!"))
+                self.event_log.appendleft(_voy.outcome_text)
+            elif _voy.days_remaining <= 0:
+                _port  = VOYAGE_PORTS.get(_voy.destination_key, {})
+                _pmult = _port.get("profit_mult", {})
+                _profit = 0.0
+                for _ikey, _qty in _voy.cargo.items():
+                    _item = ALL_ITEMS.get(_ikey)
+                    if _item:
+                        _cat_mult = _pmult.get(_item.category.name, 1.1)
+                        _profit  += _item.base_price * _qty * _cat_mult
+                if _captain:
+                    _profit *= _captain.profit_mult
+                if _ship:
+                    _profit *= _ship.profit_mult
+                _profit *= self.settings.price_sell_mult
+                _voy.status        = "arrived"
+                _voy.outcome_gold  = _profit
+                _voy.outcome_text  = (f"The {_voy.ship_name} returned from "
+                                      f"{_port.get('name', '?')} with {_profit:,.0f}g.")
+                self.inventory.gold += _profit
+                self.total_profit   += max(0.0, _profit - _voy.cargo_cost)
+                if _ship:
+                    _ship.status    = "docked"
+                    _ship.voyage_id = None
+                self.ach_stats["voyages_completed"] = self.ach_stats.get("voyages_completed", 0) + 1
+                self.ach_stats["voyage_gold_earned"] = self.ach_stats.get("voyage_gold_earned", 0.0) + _profit
+                self.news_feed.appendleft((self._absolute_day(), "Sea", "Voyage Return",
+                                           _voy.outcome_text))
+                self.event_log.appendleft(_voy.outcome_text)
+
         # ── Citizen loan weekly payments (every 7 days) ───────────────────
         if self.day % 7 == 0:
             for cl in self.citizen_loans[:]:
@@ -6986,6 +7225,7 @@ class Game:
                 k: (list(v) if isinstance(v, list) else v)
                 for k, v in self.ach_stats.items()
             },
+            "gamble_mercy":       self.settings.gamble_mercy,
             "influence_cooldowns": dict(self.influence_cooldowns),
             # ── Real Estate ──────────────────────────────────────────────────────────
             "real_estate": [
@@ -7028,6 +7268,33 @@ class Game:
                 for m in self.hired_managers
             ],
             "manager_action_log": list(self._manager_action_log),
+            # ── Voyage system ────────────────────────────────────────────────────────────
+            "ships": [
+                {"id": s.id, "ship_type": s.ship_type, "name": s.name,
+                 "upgrades": s.upgrades, "status": s.status, "voyage_id": s.voyage_id}
+                for s in self.ships
+            ],
+            "captains": [
+                {"id": c.id, "name": c.name, "title": c.title,
+                 "navigation": c.navigation, "combat": c.combat,
+                 "seamanship": c.seamanship, "charisma": c.charisma,
+                 "wage_per_voyage": c.wage_per_voyage, "crew_wage": c.crew_wage,
+                 "is_hired": c.is_hired}
+                for c in self.captains
+            ],
+            "voyages": [
+                {"id": v.id, "ship_id": v.ship_id, "ship_name": v.ship_name,
+                 "captain_id": v.captain_id, "captain_name": v.captain_name,
+                 "destination_key": v.destination_key, "cargo": v.cargo,
+                 "cargo_cost": v.cargo_cost, "days_total": v.days_total,
+                 "days_remaining": v.days_remaining, "status": v.status,
+                 "outcome_gold": v.outcome_gold, "outcome_text": v.outcome_text,
+                 "departure_day": v.departure_day}
+                for v in self.voyages
+            ],
+            "next_ship_id":    self.next_ship_id,
+            "next_captain_id": self.next_captain_id,
+            "next_voyage_id":  self.next_voyage_id,
             # ── Activity logs (saved so they survive a reload) ────────────────────────────
             "news_feed":  [list(entry) for entry in self.news_feed],
             "event_log":  list(self.event_log),
@@ -7213,6 +7480,7 @@ class Game:
                     else:
                         self.ach_stats[k] = sv
             self.influence_cooldowns = {k: int(v) for k, v in data.get("influence_cooldowns", {}).items()}
+            self.settings.gamble_mercy = int(data.get("gamble_mercy", 0))
 
             # ── Real Estate (backward-compatible) ───────────────────────────────────
             self.real_estate = []
@@ -7281,6 +7549,54 @@ class Game:
                     pass
             for entry in reversed(data.get("manager_action_log", [])):
                 self._manager_action_log.appendleft(str(entry))
+
+            # ── Voyage system (backward-compatible) ────────────────────────────────────────
+            self.ships = []
+            for sd in data.get("ships", []):
+                try:
+                    self.ships.append(Ship(
+                        id=sd["id"], ship_type=sd["ship_type"], name=sd["name"],
+                        upgrades=sd.get("upgrades", []),
+                        status=sd.get("status", "docked"),
+                        voyage_id=sd.get("voyage_id"),
+                    ))
+                except Exception:
+                    pass
+            self.captains = []
+            for cd in data.get("captains", []):
+                try:
+                    self.captains.append(Captain(
+                        id=cd["id"], name=cd["name"], title=cd["title"],
+                        navigation=cd["navigation"], combat=cd["combat"],
+                        seamanship=cd["seamanship"], charisma=cd["charisma"],
+                        wage_per_voyage=cd["wage_per_voyage"], crew_wage=cd["crew_wage"],
+                        is_hired=cd.get("is_hired", False),
+                    ))
+                except Exception:
+                    pass
+            # Re-generate captains pool if none were saved (legacy saves)
+            if not self.captains:
+                self._generate_captains()
+            self.voyages = []
+            for vd in data.get("voyages", []):
+                try:
+                    self.voyages.append(Voyage(
+                        id=vd["id"], ship_id=vd["ship_id"], ship_name=vd["ship_name"],
+                        captain_id=vd["captain_id"], captain_name=vd["captain_name"],
+                        destination_key=vd["destination_key"],
+                        cargo=vd.get("cargo", {}),
+                        cargo_cost=vd.get("cargo_cost", 0.0),
+                        days_total=vd["days_total"], days_remaining=vd["days_remaining"],
+                        status=vd.get("status", "sailing"),
+                        outcome_gold=vd.get("outcome_gold", 0.0),
+                        outcome_text=vd.get("outcome_text", ""),
+                        departure_day=vd.get("departure_day", 0),
+                    ))
+                except Exception:
+                    pass
+            self.next_ship_id    = data.get("next_ship_id",    1)
+            self.next_captain_id = data.get("next_captain_id", len(self.captains) + 1)
+            self.next_voyage_id  = data.get("next_voyage_id",  1)
 
             # ── Restore activity logs ───────────────────────────────────────────────────────
             for entry in reversed(data.get("news_feed", [])):

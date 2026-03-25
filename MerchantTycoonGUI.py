@@ -52,6 +52,8 @@ from merchant_tycoon import (
     CitizenLoan, FundClient, StockHolding, Property, LandPlot,
     ManagerType, HiredManager, MANAGER_DEFS, MANAGER_XP_THRESHOLDS,
     MANAGER_EFFICIENCY, _MANAGER_DEFAULT_CONFIGS,
+    Ship, Captain, Voyage, SHIP_TYPES, SHIP_UPGRADES, VOYAGE_PORTS,
+    _SHIP_NAME_PREFIXES, _SHIP_NAME_SUFFIXES,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -865,7 +867,8 @@ class _BaseDialog(tk.Toplevel):
         # Thin mid-tone strip to create a gradient feel
         tk.Frame(self, bg="#8a6430", height=1).pack(fill="x", side="top")
 
-        _title_bar = tk.Frame(self, bg=_DIALOG_TITLE_BG, height=32)
+        _title_bar = tk.Frame(self, bg=_DIALOG_TITLE_BG,
+                              height=max(28, round(32 * _UI_SCALE)))
         _title_bar.pack(fill="x", side="top")
         _title_bar.pack_propagate(False)
 
@@ -999,7 +1002,7 @@ class ConfirmDialog(_BaseDialog):
         f = tk.Frame(self, bg=_DIALOG_BG, padx=24, pady=18)
         f.pack()
         tk.Label(f, text=question, bg=_DIALOG_BG, fg=T["fg"],
-                 font=FONT_FANTASY, wraplength=420,
+                 font=FONT_FANTASY, wraplength=round(420 * _UI_SCALE),
                  justify="center").pack(pady=(0, 16))
         row = tk.Frame(f, bg=_DIALOG_BG)
         row.pack()
@@ -1027,7 +1030,7 @@ class InputDialog(_BaseDialog):
         f = tk.Frame(self, bg=_DIALOG_BG, padx=24, pady=18)
         f.pack()
         tk.Label(f, text=label, bg=_DIALOG_BG, fg=T["fg"],
-                 font=FONT_FANTASY, wraplength=380).pack(pady=(0, 8))
+                 font=FONT_FANTASY, wraplength=round(380 * _UI_SCALE)).pack(pady=(0, 8))
         self._var = tk.StringVar(value=default)
         entry = ttk.Entry(f, textvariable=self._var,
                           style="MT.TEntry", width=34)
@@ -1062,7 +1065,7 @@ class ChoiceDialog(_BaseDialog):
         f = tk.Frame(self, bg=_DIALOG_BG, padx=28, pady=20)
         f.pack(fill="both", expand=True)
         tk.Label(f, text=label, bg=_DIALOG_BG, fg=T["cyan"],
-                 font=FONT_FANTASY_BOLD, wraplength=560).pack(pady=(0, 12))
+                 font=FONT_FANTASY_BOLD, wraplength=round(560 * _UI_SCALE)).pack(pady=(0, 12))
         lb_frame = tk.Frame(f, bg=_DIALOG_BG)
         lb_frame.pack(fill="both", expand=True)
         vsb = ttk.Scrollbar(lb_frame, orient="vertical",
@@ -1271,12 +1274,14 @@ class SignatureDialog(tk.Toplevel):
         self._drag_ox   = 0
         self._drag_oy   = 0
 
+        _s = lambda px: max(1, round(px * _UI_SCALE))  # pixel scaler
+
         ctx = context or {}
         doc = self._DOCS.get(doc_type, self._DOCS["license"])
         body = doc["body"].replace("{detail}", ctx.get("detail", "the agreement herein"))
 
         # ── Window geometry ────────────────────────────────────────────────
-        W, H = 542, 644
+        W, H = _s(542), _s(644)
         self.overrideredirect(True)
         rx = max(0, parent.winfo_rootx() + (parent.winfo_width()  - W) // 2)
         ry = max(0, parent.winfo_rooty() + (parent.winfo_height() - H) // 2)
@@ -1287,7 +1292,7 @@ class SignatureDialog(tk.Toplevel):
         # Shadow window
         self._shadow = tk.Toplevel(parent)
         self._shadow.overrideredirect(True)
-        self._shadow.geometry(f"{W}x{H}+{rx+6}+{ry+6}")
+        self._shadow.geometry(f"{W}x{H}+{rx+_s(6)}+{ry+_s(6)}")
         self._shadow.config(bg="#040201")
         self._shadow.lower(self)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -1310,12 +1315,12 @@ class SignatureDialog(tk.Toplevel):
             x = e.x_root - self._drag_ox
             y = e.y_root - self._drag_oy
             self.geometry(f"+{x}+{y}")
-            self._shadow.geometry(f"{W}x{H}+{x+6}+{y+6}")
+            self._shadow.geometry(f"{W}x{H}+{x+_s(6)}+{y+_s(6)}")
 
         # Corner ornament helper
         def _corner_lbl(fr, side, anch):
             tk.Label(fr, text="✦", bg=self._P_BG, fg=self._P_BORD,
-                     font=("Palatino Linotype", 12)).pack(
+                     font=("Palatino Linotype", _s(12))).pack(
                          side=side, anchor=anch, padx=4)
 
         # ── Top ornament row (draggable) ────────────────────────────────
@@ -1332,9 +1337,9 @@ class SignatureDialog(tk.Toplevel):
         hdr.pack(fill="x", padx=18)
         for w in (hdr,): w.bind("<ButtonPress-1>", _ds); w.bind("<B1-Motion>", _dm)
         tk.Label(hdr, text=doc["title"], bg=self._P_BG, fg=self._P_INK,
-                 font=("Palatino Linotype", 18, "bold")).pack()
+                 font=("Palatino Linotype", _s(18), "bold")).pack()
         tk.Label(hdr, text=doc["sub"], bg=self._P_BG, fg=self._P_DIM,
-                 font=("Palatino Linotype", 11, "italic")).pack()
+                 font=("Palatino Linotype", _s(11), "italic")).pack()
 
         # Triple-rule divider
         for thick, col in ((1, self._P_BORD), (2, self._P_BG), (1, self._P_DARK)):
@@ -1344,7 +1349,7 @@ class SignatureDialog(tk.Toplevel):
         tk.Label(inner,
                  text="Dated this Day of Commerce  ·  Realm Year 12  A.R.",
                  bg=self._P_BG, fg=self._P_DIM,
-                 font=("Palatino Linotype", 9, "italic"),
+                 font=("Palatino Linotype", _s(9), "italic"),
                  ).pack(anchor="e", padx=20, pady=(4, 2))
 
         # ── Body text + wax seal ────────────────────────────────────────
@@ -1353,7 +1358,7 @@ class SignatureDialog(tk.Toplevel):
 
         body_txt = tk.Text(
             body_row, wrap="word",
-            font=("Palatino Linotype", 10),
+            font=("Palatino Linotype", _s(10)),
             bg=self._P_BG, fg=self._P_INK,
             relief="flat", bd=0, padx=2, pady=4,
             cursor="arrow", state="normal", height=10,
@@ -1363,13 +1368,14 @@ class SignatureDialog(tk.Toplevel):
         body_txt.pack(side="left", fill="both", expand=True)
 
         # Wax seal (drawn on a tiny canvas)
-        sc = tk.Canvas(body_row, width=72, height=72,
+        _seal = _s(72)
+        sc = tk.Canvas(body_row, width=_seal, height=_seal,
                        bg=self._P_BG, highlightthickness=0)
         sc.pack(side="right", anchor="s", padx=(6, 0), pady=(0, 6))
-        sc.create_oval(2, 2, 70, 70, fill=self._P_SEAL, outline="#5a0808", width=2)
-        sc.create_oval(8, 8, 64, 64, fill="", outline="#c07060", width=1)
-        sc.create_text(36, 35, text=doc["seal"], fill="#f0c0b0",
-                       font=("Palatino Linotype", 8, "bold"), justify="center")
+        sc.create_oval(_s(2), _s(2), _s(70), _s(70), fill=self._P_SEAL, outline="#5a0808", width=2)
+        sc.create_oval(_s(8), _s(8), _s(64), _s(64), fill="", outline="#c07060", width=1)
+        sc.create_text(_seal // 2, round(_seal * 35 / 72), text=doc["seal"], fill="#f0c0b0",
+                       font=("Palatino Linotype", _s(8), "bold"), justify="center")
 
         # Thin rule above signature area
         tk.Frame(inner, bg=self._P_DARK, height=1).pack(fill="x", padx=8)
@@ -1379,28 +1385,28 @@ class SignatureDialog(tk.Toplevel):
         sh.pack(fill="x", padx=16, pady=(4, 0))
         tk.Label(sh, text="✒  Sign below:",
                  bg=self._P_BG, fg=self._P_DIM,
-                 font=("Palatino Linotype", 9, "italic")).pack(side="left")
+                 font=("Palatino Linotype", _s(9), "italic")).pack(side="left")
         tk.Label(sh, text="(draw your mark, or simply click Sign & Accept)",
                  bg=self._P_BG, fg=self._P_DIM,
-                 font=("Palatino Linotype", 8, "italic")).pack(side="left", padx=6)
+                 font=("Palatino Linotype", _s(8), "italic")).pack(side="left", padx=6)
 
         # ── Ink / signature canvas ────────────────────────────────────────
         self._sign_canvas = tk.Canvas(
-            inner, bg=self._P_SIGN, height=82,
+            inner, bg=self._P_SIGN, height=_s(82),
             cursor="crosshair",
             highlightthickness=1, highlightbackground=self._P_BORD,
         )
         self._sign_canvas.pack(fill="x", padx=16, pady=(2, 0))
         # X marker, dashed sign line, caption
-        _CW = 510
+        _CW = _s(510)
         self._sign_canvas.create_text(
-            14, 41, text="✗", fill=self._P_DIM,
-            font=("Palatino Linotype", 14, "bold"), anchor="w")
+            _s(14), _s(41), text="✗", fill=self._P_DIM,
+            font=("Palatino Linotype", _s(14), "bold"), anchor="w")
         self._sign_canvas.create_line(
-            30, 64, _CW, 64, fill=self._P_DARK, width=1, dash=(4, 2))
+            _s(30), _s(64), _CW, _s(64), fill=self._P_DARK, width=1, dash=(4, 2))
         self._sign_canvas.create_text(
-            30, 73, text="Signature of Merchant",
-            fill=self._P_DIM, font=("Palatino Linotype", 7, "italic"), anchor="w")
+            _s(30), _s(73), text="Signature of Merchant",
+            fill=self._P_DIM, font=("Palatino Linotype", _s(7), "italic"), anchor="w")
 
         # Load quill image (graceful fallback if not found)
         _quill_path = os.path.join(_HERE, "quill.png")
@@ -1408,8 +1414,9 @@ class SignatureDialog(tk.Toplevel):
             try:
                 _raw = tk.PhotoImage(file=_quill_path)
                 _w, _h = _raw.width(), _raw.height()
+                _target = max(20, round(80 * _UI_SCALE))
                 _factor = 1
-                while _w // _factor > 80 or _h // _factor > 80:
+                while _w // _factor > _target or _h // _factor > _target:
                     _factor *= 2
                 self._quill_img = _raw.subsample(_factor, _factor) if _factor > 1 else _raw
                 self._quill_id = self._sign_canvas.create_image(
@@ -1438,7 +1445,7 @@ class SignatureDialog(tk.Toplevel):
             btn_row, text="  ✒  Sign & Accept  ",
             bg="#2e5a1a", fg="#f5e8c8",
             activebackground="#3d7022", activeforeground="#ffffff",
-            font=("Palatino Linotype", 11, "bold"),
+            font=("Palatino Linotype", _s(11), "bold"),
             relief="flat", padx=10, pady=5,
             command=self._accept, cursor="hand2",
         ).pack(side="left", padx=(0, 12))
@@ -1446,7 +1453,7 @@ class SignatureDialog(tk.Toplevel):
             btn_row, text="  Decline  ",
             bg="#5a1a1a", fg="#f5e8c8",
             activebackground="#7a2020", activeforeground="#ffffff",
-            font=("Palatino Linotype", 10),
+            font=("Palatino Linotype", _s(10)),
             relief="flat", padx=8, pady=5,
             command=self._cancel, cursor="hand2",
         ).pack(side="left")
@@ -1579,6 +1586,17 @@ class MysteriousCofferDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Widget, game, mercy: int, free_spins: int = 0):
         super().__init__(parent)
+        # ── Scale all geometry constants to current UI scale ───────────────
+        _s = lambda px: max(1, round(px * _UI_SCALE))
+        self.W    = _s(690)
+        self.H    = _s(660)
+        self.BOX  = _s(88)
+        self.GAP  = _s(8)
+        self.STEP = self.BOX + self.GAP
+        self.CW   = _s(580)
+        self.CH   = _s(118)
+        self.PTR  = self.CW // 2
+        # N (strip length) and WIN (winning index) are counts, not pixels
         self._game       = game
         self._mercy      = mercy
         self._free_spins = free_spins
@@ -1618,6 +1636,7 @@ class MysteriousCofferDialog(tk.Toplevel):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
+        _s = lambda px: max(1, round(px * _UI_SCALE))  # pixel scaler
         # Outer brass border frame
         bord  = tk.Frame(self, bg="#8b6914", padx=3, pady=3)
         bord.pack(fill="both", expand=True)
@@ -1626,16 +1645,16 @@ class MysteriousCofferDialog(tk.Toplevel):
         inner.pack(fill="both", expand=True)
 
         # Title / drag bar
-        tbar = tk.Frame(inner, bg="#130e06", height=38)
+        tbar = tk.Frame(inner, bg="#130e06", height=_s(38))
         tbar.pack(fill="x")
         tbar.pack_propagate(False)
         tk.Label(tbar, text="✦  Mystery Coffer  ✦",
                  bg="#130e06", fg="#ffd700",
-                 font=("Palatino Linotype", 14, "bold")).pack(side="left", padx=14, pady=8)
+                 font=("Palatino Linotype", _s(14), "bold")).pack(side="left", padx=14, pady=8)
         tk.Button(tbar, text="✕", bg="#130e06", fg="#888888",
                   bd=0, relief="flat",
                   activebackground="#2a1a0a", activeforeground="#ffffff",
-                  font=("Consolas", 12),
+                  font=("Consolas", _s(12)),
                   command=self._on_close).pack(side="right", padx=10)
         tbar.bind("<ButtonPress-1>", self._drag_start)
         tbar.bind("<B1-Motion>",     self._drag_move)
@@ -1657,8 +1676,10 @@ class MysteriousCofferDialog(tk.Toplevel):
             try:
                 raw = tk.PhotoImage(file=cpath)
                 w, h = raw.width(), raw.height()
-                sx_s = max(1, w // 200)
-                sy_s = max(1, h // 170)
+                _tgt_w = max(1, round(200 * _UI_SCALE))
+                _tgt_h = max(1, round(170 * _UI_SCALE))
+                sx_s = max(1, w // _tgt_w)
+                sy_s = max(1, h // _tgt_h)
                 s    = max(sx_s, sy_s)
                 self._coffer_ph = raw.subsample(s, s)
                 tk.Label(img_frame, image=self._coffer_ph,
@@ -1667,57 +1688,58 @@ class MysteriousCofferDialog(tk.Toplevel):
                 self._coffer_ph = None
         if not self._coffer_ph:
             tk.Label(img_frame, text="🎁",
-                     font=("Palatino Linotype", 52),
+                     font=("Palatino Linotype", _s(52)),
                      bg="#09070e", fg="#ffd700").pack()
 
         # Reel band
         reel_wrap = tk.Frame(body, bg="#6b4a22", padx=2, pady=2)
         reel_wrap.pack(fill="x", pady=(6, 0))
-        tk.Frame(reel_wrap, bg="#181008", height=7).pack(fill="x")
+        tk.Frame(reel_wrap, bg="#181008", height=_s(7)).pack(fill="x")
         self._reel = tk.Canvas(reel_wrap,
                                width=self.CW, height=self.CH,
                                bg="#0c0c06", highlightthickness=0)
         self._reel.pack()
-        tk.Frame(reel_wrap, bg="#181008", height=7).pack(fill="x")
+        tk.Frame(reel_wrap, bg="#181008", height=_s(7)).pack(fill="x")
 
         # Pointer canvas — triangle pointing up at the centre
-        ptr_cv = tk.Canvas(body, width=self.CW, height=20,
+        ptr_cv = tk.Canvas(body, width=self.CW, height=_s(20),
                            bg="#09070e", highlightthickness=0)
         ptr_cv.pack()
         px = self.PTR
-        ptr_cv.create_polygon(px - 11, 20, px + 11, 20, px, 4,
+        _p = _s(11)  # half-width of pointer triangle
+        ptr_cv.create_polygon(px - _p, _s(20), px + _p, _s(20), px, _s(4),
                                fill="#ffd700", outline="#ffffff", width=1)
-        ptr_cv.create_line(0, 1, px - 13, 1, fill="#6b4a22", width=2)
-        ptr_cv.create_line(px + 13, 1, self.CW, 1, fill="#6b4a22", width=2)
+        ptr_cv.create_line(0, 1, px - _p - 2, 1, fill="#6b4a22", width=2)
+        ptr_cv.create_line(px + _p + 2, 1, self.CW, 1, fill="#6b4a22", width=2)
 
         # Status labels
         self._lbl_spin = tk.Label(body, text="Opening the coffer…",
-                                  font=("Palatino Linotype", 10),
+                                  font=("Palatino Linotype", _s(10)),
                                   bg="#09070e", fg="#b09050",
-                                  wraplength=560, justify="center")
+                                  wraplength=round(560 * _UI_SCALE), justify="center")
         self._lbl_spin.pack(pady=(7, 0))
 
         self._lbl_rarity = tk.Label(body, text="",
-                                    font=("Palatino Linotype", 17, "bold"),
+                                    font=("Palatino Linotype", _s(17), "bold"),
                                     bg="#09070e", fg="#ffffff")
         self._lbl_rarity.pack()
 
         self._lbl_prize = tk.Label(body, text="",
-                                   font=("Palatino Linotype", 11),
+                                   font=("Palatino Linotype", _s(11)),
                                    bg="#09070e", fg="#f0e4be",
-                                   wraplength=550, justify="center")
+                                   wraplength=round(550 * _UI_SCALE), justify="center")
         self._lbl_prize.pack()
 
         # Mercy bar
         mercy_row = tk.Frame(body, bg="#09070e")
         mercy_row.pack(fill="x", pady=(4, 0))
         tk.Label(mercy_row, text="Mercy:", bg="#09070e",
-                 fg="#5a4020", font=("Palatino Linotype", 8)).pack(side="left", padx=(2, 4))
+                 fg="#5a4020", font=("Palatino Linotype", _s(8))).pack(side="left", padx=(2, 4))
         self._mercy_bar = tk.Frame(mercy_row, bg="#09070e")
         self._mercy_bar.pack(side="left")
         self._free_lbl = tk.Label(mercy_row, text="",
                                   bg="#09070e", fg="#ffd700",
-                                  font=("Palatino Linotype", 9))
+                                  font=("Palatino Linotype", _s(9)))
         self._free_lbl.pack(side="right", padx=8)
         self._redraw_mercy()
 
@@ -1755,11 +1777,13 @@ class MysteriousCofferDialog(tk.Toplevel):
     def _redraw_mercy(self) -> None:
         for w in self._mercy_bar.winfo_children():
             w.destroy()
+        _sw = max(4, round(14 * _UI_SCALE))
+        _sh = max(4, round(10 * _UI_SCALE))
         for i in range(15):
             filled = i < self._mercy
             col = "#c8900a" if filled else "#231a09"
             tk.Frame(self._mercy_bar, bg=col,
-                     width=14, height=10).pack(side="left", padx=1)
+                     width=_sw, height=_sh).pack(side="left", padx=1)
 
     # ── Dragging ──────────────────────────────────────────────────────────────
 
@@ -1903,14 +1927,14 @@ class MysteriousCofferDialog(tk.Toplevel):
             # "?" symbol
             cv.create_text(bx + self.BOX // 2, by + self.BOX // 2,
                             text="?",
-                            font=("Palatino Linotype", 30, "bold"),
+                            font=("Palatino Linotype", max(7, round(30 * _UI_SCALE)), "bold"),
                             fill=rd["sfg"])
 
             # ×2 mercy badge
             if is_mercy:
                 cv.create_text(bx + self.BOX - 6, by + self.BOX - 6,
                                 text="×2",
-                                font=("Consolas", 9, "bold"),
+                                font=("Consolas", max(7, round(9 * _UI_SCALE)), "bold"),
                                 fill="#ffd700", anchor="se")
 
         # Left & right edge vignettes (fade-to-dark)
@@ -2013,7 +2037,7 @@ class MysteriousCofferDialog(tk.Toplevel):
                 text="⭐  Mercy Spin  —  FREE!",
                 bg="#8a6500", fg="#ffd700",
                 activebackground="#c8a000", activeforeground="#ffffff",
-                font=("Palatino Linotype", 10, "bold"),
+                font=("Palatino Linotype", max(7, round(10 * _UI_SCALE)), "bold"),
                 relief="ridge", bd=2,
             )
             self._free_lbl.config(text="⭐ Mercy spin ready!", fg="#ffd700")
@@ -10639,6 +10663,602 @@ class GambleScreen(Screen):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# VOYAGE SCREEN  —  international sea trade
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VoyageScreen(Screen):
+    """
+    Hub for the Voyage system.  Requires LicenseType.VOYAGE.
+
+    Sections:
+      • Fleet          — owned ships with upgrade/sell actions
+      • Captains       — hireable captain pool
+      • Launch Voyage  — configure and dispatch a new voyage
+      • Voyages Log    — in-progress + completed results
+    """
+
+    def build(self) -> None:
+        outer = ttk.Frame(self, style="MT.TFrame")
+        outer.pack(fill="both", expand=True)
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = tk.Frame(outer, bg=T["bg_panel"])
+        hdr.pack(fill="x")
+        tk.Frame(outer, bg=T["border_light"], height=2).pack(fill="x")
+        tk.Label(hdr, text="⛵  Voyage — International Trade",
+                 font=FONT_FANTASY_TITLE,
+                 bg=T["bg_panel"], fg=T["yellow"],
+                 padx=16, pady=10).pack(side="left")
+        ttk.Button(hdr, text="◀  Back", style="MT.TButton",
+                   command=self.app.go_back).pack(side="right", padx=12, pady=8)
+
+        body = ScrollableFrame(outer)
+        body.pack(fill="both", expand=True)
+        inner = body.inner
+
+        # ── Status row ────────────────────────────────────────────────────
+        sr = tk.Frame(inner, bg=T["bg"])
+        sr.pack(fill="x", padx=20, pady=(12, 0))
+        self._gold_lbl = tk.Label(sr, text="", font=FONT_FANTASY_BOLD,
+                                  bg=T["bg"], fg=T["yellow"], anchor="w")
+        self._gold_lbl.pack(side="left")
+        self._info_lbl = tk.Label(sr, text="", font=FONT_FANTASY_S,
+                                  bg=T["bg"], fg=T["grey"], anchor="e")
+        self._info_lbl.pack(side="right")
+
+        # ── License notice ────────────────────────────────────────────────
+        self._gate_lbl = tk.Label(inner, text="",
+                                  font=FONT_FANTASY_BOLD,
+                                  bg=T["bg"], fg=T["red"],
+                                  padx=20, anchor="w",
+                                  wraplength=600, justify="left")
+        self._gate_lbl.pack(fill="x", pady=(4, 0))
+
+        # ── Fleet section ─────────────────────────────────────────────────
+        self.section_label(inner, "⚓  Your Fleet").pack(fill="x", padx=20, pady=(8, 2))
+        self._fleet_tbl = DataTable(inner, [
+            ("ship_name",  "Ship Name",  130),
+            ("ship_type",  "Type",        80),
+            ("cargo_cap",  "Cargo Cap",   75),
+            ("status",     "Status",      80),
+            ("upgrades",   "Upgrades",   200),
+        ], height=5)
+        self._fleet_tbl.pack(fill="x", padx=20, pady=(0, 4))
+
+        fb = tk.Frame(inner, bg=T["bg"])
+        fb.pack(fill="x", padx=20, pady=(0, 12))
+        self.action_button(fb, "⚓  Buy Ship",     self._buy_ship    ).pack(side="left", padx=(0, 6))
+        self.action_button(fb, "🔧  Upgrade Ship", self._upgrade_ship).pack(side="left", padx=(0, 6))
+        self.action_button(fb, "💸  Sell Ship",    self._sell_ship   ).pack(side="left", padx=(0, 6))
+
+        # ── Captains section ──────────────────────────────────────────────
+        self.section_label(inner, "🧭  Captain Roster").pack(fill="x", padx=20, pady=(8, 2))
+        self._cap_tbl = DataTable(inner, [
+            ("cap_name",   "Name",        140),
+            ("title",      "Title",        80),
+            ("nav",        "Nav",          40),
+            ("com",        "Combat",       50),
+            ("sea",        "Seamanship",   75),
+            ("cha",        "Charisma",     60),
+            ("wage",       "Voyage Wage",  85),
+            ("cap_status", "Status",       70),
+        ], height=6)
+        self._cap_tbl.pack(fill="x", padx=20, pady=(0, 4))
+
+        cb = tk.Frame(inner, bg=T["bg"])
+        cb.pack(fill="x", padx=20, pady=(0, 12))
+        self.action_button(cb, "✅  Hire Captain",    self._hire_captain   ).pack(side="left", padx=(0, 6))
+        self.action_button(cb, "❌  Dismiss Captain", self._dismiss_captain).pack(side="left", padx=(0, 6))
+
+        # ── Launch voyage section ─────────────────────────────────────────
+        self.section_label(inner, "🌊  Dispatch a Voyage").pack(fill="x", padx=20, pady=(8, 2))
+        tk.Label(inner,
+                 text="Select a ship and hired captain, then choose destination and cargo.",
+                 font=FONT_FANTASY_S, bg=T["bg"], fg=T["fg_dim"],
+                 padx=20, anchor="w").pack(fill="x", pady=(0, 4))
+        lb = tk.Frame(inner, bg=T["bg"])
+        lb.pack(fill="x", padx=20, pady=(0, 12))
+        self.action_button(lb, "⛵  Launch Voyage", self._launch_voyage).pack(side="left", padx=(0, 6))
+
+        # ── Voyages log ───────────────────────────────────────────────────
+        self.section_label(inner, "📋  Voyages Log").pack(fill="x", padx=20, pady=(8, 2))
+        self._voyage_tbl = DataTable(inner, [
+            ("vship",   "Ship",         100),
+            ("vcap",    "Captain",      120),
+            ("vdest",   "Destination",  110),
+            ("vdays",   "Days Left",     65),
+            ("vstatus", "Status",        90),
+            ("vout",    "Outcome",      220),
+        ], height=6)
+        self._voyage_tbl.pack(fill="x", padx=20, pady=(0, 4))
+
+        vb = tk.Frame(inner, bg=T["bg"])
+        vb.pack(fill="x", padx=20, pady=(0, 12))
+        self.action_button(vb, "💰  Collect Results", self._collect_results).pack(side="left", padx=(0, 6))
+        self.action_button(vb, "🗑  Clear Completed",  self._clear_completed).pack(side="left", padx=(0, 6))
+
+        # ── Destination guide ─────────────────────────────────────────────
+        self.section_label(inner, "🗺  Destination Guide").pack(fill="x", padx=20, pady=(8, 2))
+        dest_tbl = DataTable(inner, [
+            ("port_name", "Port",       120),
+            ("best_cat",  "Best Cargo", 220),
+            ("time_mod",  "Voyage Time", 90),
+        ], height=6)
+        dest_tbl.pack(fill="x", padx=20, pady=(0, 16))
+        dest_rows = []
+        for pkey, pd_info in VOYAGE_PORTS.items():
+            best = ", ".join(
+                f"{k} ×{v:.1f}"
+                for k, v in sorted(pd_info["profit_mult"].items(), key=lambda x: -x[1])
+            )
+            dm = pd_info["days_mod"]
+            if dm < 1.0:
+                time_txt = f"Shorter  ({dm:.0%})"
+            elif dm > 1.0:
+                time_txt = f"Longer  ({dm:.0%})"
+            else:
+                time_txt = "Standard"
+            dest_rows.append({"port_name": pd_info["name"], "best_cat": best, "time_mod": time_txt})
+        dest_tbl.load(dest_rows)
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        g = self.game
+        self._gold_lbl.config(
+            text=f"◆  {g.inventory.gold:,.0f}g    Reputation: {g.reputation}"
+        )
+        hired_count = sum(1 for c in g.captains if c.is_hired)
+        self._info_lbl.config(
+            text=f"Ships: {len(g.ships)}   Captains hired: {hired_count}"
+        )
+
+        has_lic = LicenseType.VOYAGE in g.licenses
+        if not has_lic:
+            info = LICENSE_INFO.get(LicenseType.VOYAGE, {})
+            self._gate_lbl.config(
+                text=(f"⚠  Voyage Charter required to use this screen.  "
+                      f"Cost: {info.get('cost', 3000):,}g  "
+                      f"Reputation needed: {info.get('rep', 100)}")
+            )
+        else:
+            self._gate_lbl.config(text="")
+
+        # Fleet table
+        fleet_rows = []
+        for s in g.ships:
+            st_info = SHIP_TYPES.get(s.ship_type, {})
+            upg_str = ", ".join(SHIP_UPGRADES[u]["name"] for u in s.upgrades) or "—"
+            fleet_rows.append({
+                "ship_name": s.name,
+                "ship_type": st_info.get("name", s.ship_type),
+                "cargo_cap": str(s.cargo_capacity),
+                "status":    "⛵ Sailing" if s.status == "sailing" else "⚓ Docked",
+                "upgrades":  upg_str,
+            })
+        self._fleet_tbl.load(fleet_rows)
+
+        # Captains table
+        sailing_cap_ids = {v.captain_id for v in g.voyages if v.status == "sailing"}
+        cap_rows = []
+        for c in g.captains:
+            if c.is_hired and c.id in sailing_cap_ids:
+                cap_st = "⛵ Sailing"
+            elif c.is_hired:
+                cap_st = "✅ Hired"
+            else:
+                cap_st = "Available"
+            cap_rows.append({
+                "cap_name":   c.name,
+                "title":      c.title,
+                "nav":        str(c.navigation),
+                "com":        str(c.combat),
+                "sea":        str(c.seamanship),
+                "cha":        str(c.charisma),
+                "wage":       f"{c.wage_per_voyage:.0f}g",
+                "cap_status": cap_st,
+            })
+        self._cap_tbl.load(cap_rows)
+
+        # Voyages table
+        voyage_rows = []
+        for v in reversed(g.voyages):
+            port_name = VOYAGE_PORTS.get(v.destination_key, {}).get("name", v.destination_key)
+            if v.status == "sailing":
+                vstatus = "🌊 Sailing"
+                vout    = f"{v.days_remaining}d remaining"
+            elif v.status == "arrived":
+                vstatus = "✅ Arrived"
+                vout    = f"+{v.outcome_gold:,.0f}g"
+            elif v.status == "lost_wreck":
+                vstatus = "💀 Shipwreck"
+                vout    = v.outcome_text[:55]
+            elif v.status == "lost_piracy":
+                vstatus = "☠ Piracy"
+                vout    = v.outcome_text[:55]
+            else:
+                vstatus = v.status
+                vout    = v.outcome_text[:55]
+            voyage_rows.append({
+                "vship":   v.ship_name,
+                "vcap":    v.captain_name,
+                "vdest":   port_name,
+                "vdays":   str(v.days_remaining) if v.status == "sailing" else "—",
+                "vstatus": vstatus,
+                "vout":    vout,
+            })
+        self._voyage_tbl.load(voyage_rows)
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _buy_ship(self) -> None:
+        g = self.game
+        if LicenseType.VOYAGE not in g.licenses:
+            self.msg.err("Voyage Charter required.")
+            return
+        skey_list  = list(SHIP_TYPES.keys())
+        choices    = []
+        for skey in skey_list:
+            sd = SHIP_TYPES[skey]
+            choices.append(
+                f"{sd['name']}  —  Cargo: {sd['cargo']}  ·  Cost: {sd['cost']:,}g  ·  "
+                f"Piracy: {sd['piracy_risk']:.0%}  Wreck: {sd['wreck_risk']:.0%}"
+            )
+        idx = ChoiceDialog(self.app, "Select a ship type to purchase:", choices,
+                           "Buy a Ship").wait()
+        if idx is None:
+            return
+        skey = skey_list[idx]
+        sd   = SHIP_TYPES[skey]
+        if g.inventory.gold < sd["cost"]:
+            self.msg.err(f"Need {sd['cost']:,}g — you only have {g.inventory.gold:,.0f}g.")
+            return
+        import random as _rand
+        sname    = _rand.choice(_SHIP_NAME_PREFIXES) + " " + _rand.choice(_SHIP_NAME_SUFFIXES)
+        raw_name = InputDialog(self.app,
+                               f"Name your new {sd['name']}:",
+                               "Name Your Ship", sname).wait()
+        if raw_name is None:
+            return
+        ship_name = raw_name.strip() or sname
+        if not ConfirmDialog(self.app,
+                             f"Purchase {ship_name} ({sd['name']}) for {sd['cost']:,}g?",
+                             "Confirm Purchase").wait():
+            return
+        g.inventory.gold -= sd["cost"]
+        g.ships.append(Ship(id=g.next_ship_id, ship_type=skey, name=ship_name))
+        g.next_ship_id += 1
+        self.msg.ok(f"⚓  {ship_name} purchased for {sd['cost']:,}g!")
+        self.app.refresh()
+
+    def _upgrade_ship(self) -> None:
+        g = self.game
+        docked = [s for s in g.ships if s.status == "docked"]
+        if not docked:
+            self.msg.err("No docked ships to upgrade.")
+            return
+        sidx = ChoiceDialog(
+            self.app,
+            "Select a ship to upgrade:",
+            [f"{s.name}  ({SHIP_TYPES[s.ship_type]['name']})" for s in docked],
+            "Upgrade Ship",
+        ).wait()
+        if sidx is None:
+            return
+        ship      = docked[sidx]
+        available = [(uk, ud) for uk, ud in SHIP_UPGRADES.items() if uk not in ship.upgrades]
+        if not available:
+            self.msg.err(f"{ship.name} already has all upgrades.")
+            return
+        uidx = ChoiceDialog(
+            self.app,
+            f"Select an upgrade for {ship.name}:",
+            [f"{ud['name']}  —  {ud['cost']}g  ·  {ud['desc']}" for uk, ud in available],
+            "Choose Upgrade",
+        ).wait()
+        if uidx is None:
+            return
+        ukey, ud = available[uidx]
+        if g.inventory.gold < ud["cost"]:
+            self.msg.err(f"Need {ud['cost']}g — not enough gold.")
+            return
+        if not ConfirmDialog(self.app,
+                             f"Install {ud['name']} on {ship.name} for {ud['cost']}g?",
+                             "Confirm Upgrade").wait():
+            return
+        g.inventory.gold -= ud["cost"]
+        ship.upgrades.append(ukey)
+        self.msg.ok(f"🔧  {ud['name']} installed on {ship.name}!")
+        self.app.refresh()
+
+    def _sell_ship(self) -> None:
+        g = self.game
+        docked = [s for s in g.ships if s.status == "docked"]
+        if not docked:
+            self.msg.err("No docked ships to sell.")
+            return
+        sidx = ChoiceDialog(
+            self.app,
+            "Select a ship to sell:",
+            [f"{s.name}  ({SHIP_TYPES[s.ship_type]['name']})" for s in docked],
+            "Sell Ship",
+        ).wait()
+        if sidx is None:
+            return
+        ship  = docked[sidx]
+        base  = SHIP_TYPES[ship.ship_type]["cost"]
+        upg_v = sum(SHIP_UPGRADES[u]["cost"] for u in ship.upgrades)
+        sale  = round((base + upg_v) * 0.55)
+        if not ConfirmDialog(
+            self.app,
+            f"Sell {ship.name} for {sale:,}g?\n"
+            f"(Base: {base:,}g + upgrades: {upg_v:,}g at 55% return)",
+            "Confirm Sale",
+        ).wait():
+            return
+        g.inventory.gold += sale
+        g.ships.remove(ship)
+        self.msg.ok(f"💸  {ship.name} sold for {sale:,}g.")
+        self.app.refresh()
+
+    def _hire_captain(self) -> None:
+        g = self.game
+        available = [c for c in g.captains if not c.is_hired]
+        if not available:
+            self.msg.err("No captains available to hire.")
+            return
+        cidx = ChoiceDialog(
+            self.app,
+            "Select a captain to hire:",
+            [
+                f"{c.title} {c.name}  —  "
+                f"Nav:{c.navigation} Com:{c.combat} Sea:{c.seamanship} Cha:{c.charisma}"
+                f"  ·  Wage: {c.wage_per_voyage:.0f}g/voyage"
+                for c in available
+            ],
+            "Hire a Captain",
+        ).wait()
+        if cidx is None:
+            return
+        cap = available[cidx]
+        if not ConfirmDialog(self.app,
+                             f"Hire {cap.title} {cap.name} at {cap.wage_per_voyage:.0f}g per voyage?",
+                             "Hire Captain").wait():
+            return
+        cap.is_hired = True
+        self.msg.ok(f"✅  {cap.title} {cap.name} is now on your crew.")
+        self.app.refresh()
+
+    def _dismiss_captain(self) -> None:
+        g = self.game
+        hired = [c for c in g.captains if c.is_hired]
+        if not hired:
+            self.msg.err("No hired captains to dismiss.")
+            return
+        sailing_ids = {v.captain_id for v in g.voyages if v.status == "sailing"}
+        cidx = ChoiceDialog(
+            self.app,
+            "Select a captain to dismiss:",
+            [
+                f"{'[ON VOYAGE] ' if c.id in sailing_ids else ''}{c.title} {c.name}"
+                for c in hired
+            ],
+            "Dismiss Captain",
+        ).wait()
+        if cidx is None:
+            return
+        cap = hired[cidx]
+        if cap.id in sailing_ids:
+            self.msg.err("Cannot dismiss a captain who is currently on a voyage.")
+            return
+        if not ConfirmDialog(self.app, f"Dismiss {cap.title} {cap.name}?",
+                             "Dismiss Captain").wait():
+            return
+        cap.is_hired = False
+        self.msg.ok(f"❌  {cap.title} {cap.name} dismissed.")
+        self.app.refresh()
+
+    def _launch_voyage(self) -> None:
+        g = self.game
+        if LicenseType.VOYAGE not in g.licenses:
+            self.msg.err("Voyage Charter required.")
+            return
+        docked = [s for s in g.ships if s.status == "docked"]
+        if not docked:
+            self.msg.err("No docked ships available — buy a ship first.")
+            return
+        sailing_cap_ids = {v.captain_id for v in g.voyages if v.status == "sailing"}
+        free_caps = [c for c in g.captains if c.is_hired and c.id not in sailing_cap_ids]
+        if not free_caps:
+            self.msg.err("No available captain — hire a captain first.")
+            return
+
+        # Step 1: select ship
+        sidx = ChoiceDialog(
+            self.app,
+            "Select a ship for this voyage:",
+            [f"{s.name}  ({SHIP_TYPES[s.ship_type]['name']}, {s.cargo_capacity} cargo)"
+             for s in docked],
+            "Launch Voyage — Ship",
+        ).wait()
+        if sidx is None:
+            return
+        ship = docked[sidx]
+
+        # Step 2: select captain
+        cidx = ChoiceDialog(
+            self.app,
+            "Select a captain:",
+            [
+                f"{c.title} {c.name}  —  "
+                f"Nav:{c.navigation} Com:{c.combat} Sea:{c.seamanship} Cha:{c.charisma}"
+                f"  ·  Wage: {c.wage_per_voyage:.0f}g"
+                for c in free_caps
+            ],
+            "Launch Voyage — Captain",
+        ).wait()
+        if cidx is None:
+            return
+        captain = free_caps[cidx]
+
+        # Step 3: select destination
+        port_keys   = list(VOYAGE_PORTS.keys())
+        pidx = ChoiceDialog(
+            self.app,
+            "Select a destination port:",
+            [
+                f"{VOYAGE_PORTS[pk]['name']}  —  "
+                f"Best ×{max(VOYAGE_PORTS[pk]['profit_mult'].values(), default=1.0):.1f}"
+                for pk in port_keys
+            ],
+            "Launch Voyage — Destination",
+        ).wait()
+        if pidx is None:
+            return
+        dest_key = port_keys[pidx]
+        port     = VOYAGE_PORTS[dest_key]
+
+        # Step 4: load cargo iteratively
+        inv_items = {k: v for k, v in g.inventory.items.items() if v > 0}
+        if not inv_items:
+            self.msg.err("Your inventory is empty — nothing to load as cargo.")
+            return
+        pmults          = port.get("profit_mult", {})
+        available_space = ship.cargo_capacity
+        cargo: dict     = {}
+        cargo_cost      = 0.0
+
+        while available_space > 0:
+            remaining = [(k, qt) for k, qt in g.inventory.items.items() if qt > 0 and k not in cargo]
+            if not remaining:
+                break
+            item_choices = [
+                f"{ALL_ITEMS[k].name}  (have {qt})  ·  "
+                f"×{pmults.get(ALL_ITEMS[k].category.name, 1.0):.1f} at {port['name']}"
+                for k, qt in remaining
+            ]
+            item_choices.append("— Done loading cargo —")
+            pick = ChoiceDialog(
+                self.app,
+                f"Space available: {available_space}/{ship.cargo_capacity}\n"
+                f"Pick an item to load (or Done):",
+                item_choices,
+                "Load Cargo",
+            ).wait()
+            if pick is None or pick == len(item_choices) - 1:
+                break
+            ikey, imax = remaining[pick]
+            load_max   = min(imax, available_space)
+            qty_raw    = InputDialog(
+                self.app,
+                f"How many {ALL_ITEMS[ikey].name} to load (1–{load_max})?",
+                "Cargo Quantity",
+                str(load_max),
+            ).wait()
+            if qty_raw is None:
+                break
+            try:
+                qty = max(1, min(int(qty_raw), load_max))
+            except ValueError:
+                self.msg.err("Invalid quantity.")
+                continue
+            cargo[ikey]      = qty
+            cargo_cost      += ALL_ITEMS[ikey].base_price * qty
+            available_space -= qty
+            g.inventory.items[ikey] -= qty
+            if g.inventory.items[ikey] <= 0:
+                del g.inventory.items[ikey]
+
+        if not cargo:
+            self.msg.err("No cargo loaded — voyage cancelled.")
+            return
+
+        # Calculate voyage duration
+        import random as _rand
+        lo, hi     = SHIP_TYPES[ship.ship_type]["base_days"]
+        days_total = max(5, round(
+            _rand.randint(lo, hi) * port.get("days_mod", 1.0)
+            * ship.days_mult * (1.0 - captain.day_reduction)
+        ))
+
+        # Wages
+        total_wage = captain.wage_per_voyage + captain.crew_wage * 3
+        if g.inventory.gold < total_wage:
+            # Refund cargo
+            for k, qty in cargo.items():
+                g.inventory.items[k] = g.inventory.items.get(k, 0) + qty
+            self.msg.err(f"Need {total_wage:.0f}g for wages — not enough gold.")
+            return
+
+        summary = (
+            f"Ship:        {ship.name}  ({SHIP_TYPES[ship.ship_type]['name']})\n"
+            f"Captain:     {captain.title} {captain.name}\n"
+            f"Destination: {port['name']}\n"
+            f"Cargo:       {sum(cargo.values())} units  (~{cargo_cost:,.0f}g value)\n"
+            f"Voyage time: ~{days_total} days\n"
+            f"Wages:       {total_wage:.0f}g (captain + crew)\n"
+            f"Piracy risk: {ship.piracy_risk * captain.piracy_mult:.1%}  "
+            f"Wreck risk: {ship.wreck_risk * captain.wreck_mult:.1%}"
+        )
+        if not ConfirmDialog(self.app, summary, "Confirm Voyage").wait():
+            for k, qty in cargo.items():
+                g.inventory.items[k] = g.inventory.items.get(k, 0) + qty
+            return
+
+        g.inventory.gold -= total_wage
+        voyage = Voyage(
+            id=g.next_voyage_id,
+            ship_id=ship.id,
+            ship_name=ship.name,
+            captain_id=captain.id,
+            captain_name=f"{captain.title} {captain.name}",
+            destination_key=dest_key,
+            cargo=cargo,
+            cargo_cost=cargo_cost,
+            days_total=days_total,
+            days_remaining=days_total,
+            departure_day=g._absolute_day(),
+        )
+        g.next_voyage_id += 1
+        g.voyages.append(voyage)
+        ship.status    = "sailing"
+        ship.voyage_id = voyage.id
+        self.msg.ok(
+            f"⛵  {ship.name} has set sail for {port['name']}!  "
+            f"Expected back in ~{days_total} days."
+        )
+        self.app.refresh()
+
+    def _collect_results(self) -> None:
+        g = self.game
+        done = [v for v in g.voyages if v.status in ("arrived", "lost_piracy", "lost_wreck")]
+        if not done:
+            self.msg.err("No completed voyages to report on.")
+            return
+        lines = []
+        for v in done:
+            port_n = VOYAGE_PORTS.get(v.destination_key, {}).get("name", "?")
+            if v.status == "arrived":
+                lines.append(f"✅  {v.ship_name}: +{v.outcome_gold:,.0f}g from {port_n}")
+            elif v.status == "lost_piracy":
+                lines.append(f"☠  {v.outcome_text}")
+            else:
+                lines.append(f"💀  {v.outcome_text}")
+        self.msg.ok("\n".join(lines))
+        self.app.refresh()
+
+    def _clear_completed(self) -> None:
+        g = self.game
+        before = len(g.voyages)
+        g.voyages = [v for v in g.voyages if v.status == "sailing"]
+        cleared = before - len(g.voyages)
+        if cleared:
+            self.msg.ok(f"Cleared {cleared} completed voyage record(s).")
+        else:
+            self.msg.err("No completed voyages to clear.")
+        self.app.refresh()
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN MENU SCREEN  —  first fully implemented screen
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -10667,6 +11287,7 @@ class MainMenuScreen(Screen):
         ("Skills",        "skills",     "OPERATIONS",   "⚡", "Improve your character"),
         ("Smuggling Den", "smuggling",  "OPERATIONS",   "🦝", "Black market deals"),
         ("Gamble",        "gamble",     "OPERATIONS",   "🎲", "Try your luck at the Mystery Coffer"),
+        ("Voyage",        "voyage",     "OPERATIONS",   "⛵", "Send cargo on international sea voyages"),
         ("Market Info",   "market",     "INTELLIGENCE", "📊", "Prices & trade routes"),
         ("News & Events", "news",       "INTELLIGENCE", "📰", "World events & impacts"),
         ("Progress",      "progress",   "PLAYER",       "🏆", "Stats & achievements"),
@@ -10703,6 +11324,15 @@ class MainMenuScreen(Screen):
                                     bg=T["bg_panel"], fg=T["yellow"],
                                     padx=16, pady=6, anchor="e", justify="right")
         self._dash_alert.pack(anchor="e", fill="both", expand=True)
+
+        # ── Debug gold button (testing aid) ───────────────────────────────
+        tk.Button(dr, text="🪙 +5000g",
+                  font=FONT_FANTASY_S,
+                  bg="#1a3a1a", fg="#7dd444",
+                  relief="flat", bd=0,
+                  padx=6, pady=2,
+                  cursor="hand2",
+                  command=self._debug_add_gold).pack(side="right", padx=(0, 8), pady=4)
 
         # ── Card grid ─────────────────────────────────────────────────────
         _scroll = ScrollableFrame(outer)
@@ -10850,6 +11480,11 @@ class MainMenuScreen(Screen):
         self.game.save_game(silent=True)
         self.msg.ok("Game saved.")
 
+    def _debug_add_gold(self) -> None:
+        self.game.inventory.gold += 5000
+        self.app.refresh()
+        self.msg.ok("+5000g added (debug).")
+
     def _file_bankruptcy(self) -> None:
         """Wipe save, reset to a new game — no tutorial on restart."""
         if not ConfirmDialog(
@@ -10861,6 +11496,442 @@ class MainMenuScreen(Screen):
         ).wait():
             return
         self.app._do_bankruptcy_restart()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGISTER DIALOG  —  new account creation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _RegisterDialog(_BaseDialog):
+    """
+    Account creation dialog.  Collects merchant name, email, and password.
+    Returns True when an account is created (or email confirmation is pending),
+    None on cancel.
+    """
+
+    def __init__(self, parent: tk.Widget, app: "GameApp") -> None:
+        super().__init__(parent, "Create Merchant Account")
+        self.app    = app
+        self.result = None
+
+        body = tk.Frame(self, bg=_DIALOG_BG, padx=28, pady=20)
+        body.pack(fill="both", expand=True)
+
+        def _field(label_text: str, show: str = "") -> tk.Entry:
+            tk.Label(body, text=label_text, bg=_DIALOG_BG, fg=T["fg_dim"],
+                     font=FONT_FANTASY_S, anchor="w").pack(fill="x", pady=(8, 2))
+            frame = tk.Frame(body, bg=T["border"], pady=1)
+            frame.pack(fill="x")
+            e = tk.Entry(frame, font=FONT_FANTASY, show=show,
+                         bg=T["bg_button"], fg=T["fg"], relief="flat", bd=6,
+                         insertbackground=T["cyan"], width=34)
+            e.pack(fill="x")
+            return e
+
+        self._username_e = _field("Merchant Name  (your display name)")
+        self._email_e    = _field("Email Address")
+        self._pass_e     = _field("Password", show="•")
+        self._confirm_e  = _field("Confirm Password", show="•")
+
+        self._status = tk.Label(body, text="", bg=_DIALOG_BG, fg=T["red"],
+                                font=FONT_FANTASY_S, wraplength=340, justify="left")
+        self._status.pack(fill="x", pady=(12, 0))
+
+        btn_row = tk.Frame(body, bg=_DIALOG_BG)
+        btn_row.pack(fill="x", pady=(14, 0))
+
+        self._btn_create = ttk.Button(btn_row, text="  Create Account  ",
+                                      style="MT.TButton",
+                                      command=self._do_register)
+        self._btn_create.pack(side="left")
+        ttk.Button(btn_row, text="Cancel", style="Nav.TButton",
+                   command=self._on_cancel).pack(side="right")
+
+        self._confirm_e.bind("<Return>", lambda _: self._do_register())
+        self._email_e.bind("<Return>",   lambda _: self._pass_e.focus_set())
+        self._pass_e.bind("<Return>",    lambda _: self._confirm_e.focus_set())
+        self._center()
+
+    # ── Validation & network ──────────────────────────────────────────────────
+
+    def _do_register(self) -> None:
+        username = self._username_e.get().strip()
+        email    = self._email_e.get().strip()
+        password = self._pass_e.get()
+        confirm  = self._confirm_e.get()
+
+        if not username:
+            self._set_status("Please enter a merchant name.", T["red"]); return
+        if not email or "@" not in email:
+            self._set_status("Please enter a valid email address.", T["red"]); return
+        if len(password) < 6:
+            self._set_status("Password must be at least 6 characters.", T["red"]); return
+        if password != confirm:
+            self._set_status("Passwords do not match.", T["red"]); return
+        if not self.app.online:
+            self._set_status("Online services unavailable.", T["red"]); return
+
+        self._set_status("Creating account…", T["fg_dim"])
+        self._btn_create.config(state="disabled")
+
+        def _cb(res):
+            self.app.after(0, lambda: self._handle_result(res))
+
+        self.app.online.auth.sign_up(email, password, username, callback=_cb)
+
+    def _handle_result(self, res) -> None:
+        try:
+            if not res.success:
+                msg = res.error or "Registration failed."
+                if "already registered" in msg.lower() or "already exists" in msg.lower():
+                    msg = "An account with this email already exists."
+                elif "invalid email" in msg.lower():
+                    msg = "Please enter a valid email address."
+                elif "password" in msg.lower() and ("weak" in msg.lower() or "short" in msg.lower()):
+                    msg = "Password is too weak — use at least 8 characters."
+                self._set_status(msg, T["red"])
+                self._btn_create.config(state="normal")
+                return
+
+            action = (res.data or {}).get("action")
+            if action == "confirm_email":
+                self._set_status(
+                    "✦  Account created!  ✦\n"
+                    "A verification email has been sent to your inbox.\n"
+                    "Click the link, then sign in here.",
+                    T["green"],
+                )
+                self._btn_create.config(state="disabled")
+                self.after(3800, self.destroy)
+                self.result = True
+            elif action == "signed_up":
+                self.result = True
+                self.destroy()
+        except tk.TclError:
+            pass
+
+    def _set_status(self, text: str, color: str) -> None:
+        try:
+            self._status.config(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAUNCH SCREEN  —  full-window login / offline launcher shown at startup
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LaunchScreen(tk.Toplevel):
+    """
+    Full-window login overlay shown on startup when no remembered session exists.
+
+    .wait() blocks until the player authenticates or picks offline, returning:
+        "signed_in"  — player authenticated successfully
+        "offline"    — player chose to play without an account
+    """
+
+    def __init__(self, app: "GameApp") -> None:
+        super().__init__(app)
+        self.app     = app
+        self._result = "offline"
+
+        # Cover the GameApp window exactly (borderless, topmost)
+        self.overrideredirect(True)
+        self.configure(bg=T["bg"])
+        self.attributes("-topmost", True)
+        app.update_idletasks()
+        x = app.winfo_x()
+        y = app.winfo_y()
+        w = app.winfo_width()
+        h = app.winfo_height()
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Track parent geometry changes (resize / move) while we're visible
+        self._cfg_id = app.bind("<Configure>", self._sync_geometry, add="+")
+
+        self.grab_set()
+        self._build()
+
+    # ── Geometry sync ─────────────────────────────────────────────────────────
+
+    def _sync_geometry(self, _event: tk.Event = None) -> None:
+        try:
+            self.geometry(
+                f"{self.app.winfo_width()}x{self.app.winfo_height()}"
+                f"+{self.app.winfo_x()}+{self.app.winfo_y()}"
+            )
+        except tk.TclError:
+            pass
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        # Accent bands at top and bottom for a "framed" effect
+        tk.Frame(self, bg="#1a1006", height=36).pack(fill="x", side="top")
+        tk.Frame(self, bg="#1a1006", height=36).pack(fill="x", side="bottom")
+
+        # Middle area — the card is placed at the visual centre
+        mid = tk.Frame(self, bg=T["bg"])
+        mid.pack(fill="both", expand=True)
+
+        card_wrap = tk.Frame(mid, bg=T["bg"])
+        card_wrap.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Gold border → card body
+        border = tk.Frame(card_wrap, bg=T["border_light"], padx=2, pady=2)
+        border.pack()
+        card = tk.Frame(border, bg=T["bg_panel"], padx=40, pady=32)
+        card.pack()
+
+        # ── Game title ────────────────────────────────────────────────────
+        tk.Label(card,
+                 text="⚜   MERCHANT TYCOON   ⚜",
+                 bg=T["bg_panel"], fg=T["border_light"],
+                 font=FONT_FANTASY_TITLE).pack()
+        tk.Label(card,
+                 text="Expanded Edition",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S).pack(pady=(2, 0))
+
+        tk.Frame(card, bg=T["border_light"], height=1).pack(fill="x", pady=(12, 16))
+
+        tk.Label(card,
+                 text="  ✦   MERCHANT PORTAL   ✦",
+                 bg=T["bg_panel"], fg=T["cyan"],
+                 font=FONT_FANTASY_BOLD, anchor="w").pack(fill="x", pady=(0, 16))
+
+        # ── Email field ───────────────────────────────────────────────────
+        tk.Label(card, text="Email Address",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S, anchor="w").pack(fill="x")
+        self._email_var = tk.StringVar()
+        ef = tk.Frame(card, bg=T["border"], pady=1)
+        ef.pack(fill="x", pady=(2, 10))
+        self._email_e = tk.Entry(ef, textvariable=self._email_var,
+                                 font=FONT_FANTASY, bg=T["bg_button"],
+                                 fg=T["fg"], insertbackground=T["cyan"],
+                                 relief="flat", bd=6, width=34)
+        self._email_e.pack(fill="x")
+
+        # ── Password field ────────────────────────────────────────────────
+        tk.Label(card, text="Password",
+                 bg=T["bg_panel"], fg=T["fg_dim"],
+                 font=FONT_FANTASY_S, anchor="w").pack(fill="x")
+        pf = tk.Frame(card, bg=T["border"], pady=1)
+        pf.pack(fill="x", pady=(2, 4))
+        self._pass_e = tk.Entry(pf, font=FONT_FANTASY, show="•",
+                                bg=T["bg_button"], fg=T["fg"],
+                                insertbackground=T["cyan"],
+                                relief="flat", bd=6, width=34)
+        self._pass_e.pack(fill="x")
+
+        # ── Remember Me + Forgot Password ─────────────────────────────────
+        extra = tk.Frame(card, bg=T["bg_panel"])
+        extra.pack(fill="x", pady=(8, 14))
+
+        self._remember_var = tk.IntVar(value=1)
+        tk.Checkbutton(extra,
+                       text="Remember Me",
+                       variable=self._remember_var,
+                       bg=T["bg_panel"], fg=T["fg"],
+                       selectcolor=T["bg_button"],
+                       activebackground=T["bg_panel"],
+                       activeforeground=T["fg"],
+                       font=FONT_FANTASY_S,
+                       cursor="hand2").pack(side="left")
+
+        fp = tk.Label(extra, text="Forgot Password?",
+                      bg=T["bg_panel"], fg=T["border_light"],
+                      font=FONT_FANTASY_S, cursor="hand2")
+        fp.pack(side="right")
+        fp.bind("<Button-1>", lambda _: self._forgot_password())
+        fp.bind("<Enter>",    lambda e: e.widget.config(fg=T["cyan"]))
+        fp.bind("<Leave>",    lambda e: e.widget.config(fg=T["border_light"]))
+
+        # ── Sign In / Create Account ──────────────────────────────────────
+        btn_row = tk.Frame(card, bg=T["bg_panel"])
+        btn_row.pack(fill="x", pady=(0, 14))
+
+        self._signin_btn = ttk.Button(btn_row, text="   Sign In   ",
+                                      style="MT.TButton",
+                                      command=self._do_sign_in)
+        self._signin_btn.pack(side="left", padx=(0, 10))
+
+        ttk.Button(btn_row, text="   Create Account   ",
+                   style="Nav.TButton",
+                   command=self._do_register).pack(side="left")
+
+        # ── "or" separator ────────────────────────────────────────────────
+        sep = tk.Frame(card, bg=T["bg_panel"])
+        sep.pack(fill="x", pady=(0, 12))
+        tk.Frame(sep, bg=T["border"], height=1).pack(
+            side="left", fill="x", expand=True, pady=8)
+        tk.Label(sep, text="  or  ", bg=T["bg_panel"],
+                 fg=T["fg_dim"], font=FONT_FANTASY_S).pack(side="left")
+        tk.Frame(sep, bg=T["border"], height=1).pack(
+            side="left", fill="x", expand=True, pady=8)
+
+        # ── Play Offline ──────────────────────────────────────────────────
+        self._offline_btn = ttk.Button(card,
+                                       text="⚔   Play Offline  (local save only)",
+                                       style="Nav.TButton",
+                                       command=self._play_offline)
+        self._offline_btn.pack(fill="x")
+
+        # ── Status / feedback ─────────────────────────────────────────────
+        self._status_lbl = tk.Label(card, text="",
+                                    bg=T["bg_panel"], fg=T["fg_dim"],
+                                    font=FONT_FANTASY_S,
+                                    wraplength=400, justify="center")
+        self._status_lbl.pack(fill="x", pady=(12, 0))
+
+        # Keyboard shortcuts
+        self._pass_e.bind("<Return>",  lambda _: self._do_sign_in())
+        self._email_e.bind("<Return>", lambda _: self._pass_e.focus_set())
+
+        # Auto-focus email field after layout settles
+        self.after(120, self._email_e.focus_set)
+
+        # If online services failed to load, flag it
+        if not self.app.online:
+            self._set_status(
+                "Online services unavailable — only offline play is accessible.",
+                T["yellow"],
+            )
+            try:
+                self._signin_btn.config(state="disabled")
+            except tk.TclError:
+                pass
+
+    # ── Action handlers ───────────────────────────────────────────────────────
+
+    def _set_status(self, text: str, color: str = None) -> None:
+        try:
+            self._status_lbl.config(text=text, fg=color or T["fg_dim"])
+        except tk.TclError:
+            pass
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        try:
+            self._signin_btn.config(state=state)
+            self._offline_btn.config(state=state)
+            self._email_e.config(state=state)
+            self._pass_e.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _do_sign_in(self) -> None:
+        if not self.app.online:
+            self._set_status("Online services are unavailable. Use Play Offline.",
+                             T["yellow"])
+            return
+
+        email    = self._email_var.get().strip()
+        password = self._pass_e.get()
+
+        if not email or "@" not in email:
+            self._set_status("Please enter a valid email address.", T["red"]); return
+        if not password:
+            self._set_status("Please enter your password.", T["red"]); return
+
+        self._set_status("Signing in…", T["fg_dim"])
+        self._set_busy(True)
+
+        def _cb(res):
+            self.app.after(0, lambda: self._handle_sign_in(res))
+
+        self.app.online.auth.sign_in(email, password, callback=_cb)
+
+    def _handle_sign_in(self, res) -> None:
+        try:
+            if not res.success:
+                msg = res.error or "Sign-in failed."
+                msg_lo = msg.lower()
+                if "invalid login" in msg_lo or "invalid credentials" in msg_lo:
+                    msg = "Invalid email or password."
+                elif "email not confirmed" in msg_lo:
+                    msg = ("Email not confirmed.\n"
+                           "Check your inbox and click the verification link first.")
+                elif "too many requests" in msg_lo:
+                    msg = "Too many attempts. Please wait a moment and try again."
+                self._set_status(msg, T["red"])
+                self._set_busy(False)
+                return
+
+            # If "Remember Me" is unchecked, remove the session file so the
+            # next launch shows login again (in-memory JWT remains active).
+            if not self._remember_var.get():
+                self.app.online.auth.clear_saved_session()
+
+            self._result = "signed_in"
+            uname = self.app.online.auth.username or "Merchant"
+            self._set_status(f"Welcome back, {uname}!  ✦", T["green"])
+            self.after(750, self._close)
+        except tk.TclError:
+            pass
+
+    def _do_register(self) -> None:
+        if not self.app.online:
+            self._set_status("Online services unavailable.", T["red"]); return
+        _RegisterDialog(self, self.app).wait()
+
+    def _forgot_password(self) -> None:
+        if not self.app.online:
+            self._set_status("Online services unavailable.", T["red"]); return
+
+        prefill = self._email_var.get().strip()
+        asked = InputDialog(self, "Enter your account email address:",
+                            "Forgot Password", prefill).wait()
+        if not asked:
+            return
+        asked = asked.strip()
+        if not asked or "@" not in asked:
+            self._set_status("Please enter a valid email address.", T["red"]); return
+
+        self._set_status("Sending password reset email…", T["fg_dim"])
+
+        def _cb(res):
+            self.app.after(0, lambda: self._handle_reset(res, asked))
+
+        self.app.online.auth.request_password_reset(asked, callback=_cb)
+
+    def _handle_reset(self, res, email: str) -> None:
+        try:
+            if res.success:
+                self._set_status(
+                    f"Reset email sent to {email}.\n"
+                    "Click the link in the email to choose a new password.",
+                    T["green"],
+                )
+            else:
+                self._set_status(
+                    res.error or "Could not send reset email — check the address.",
+                    T["red"],
+                )
+        except tk.TclError:
+            pass
+
+    def _play_offline(self) -> None:
+        self._result = "offline"
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            self.app.unbind("<Configure>", self._cfg_id)
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def wait(self) -> str:
+        """Block until signed in or offline chosen.  Returns 'signed_in' or 'offline'."""
+        self.wait_window(self)
+        return self._result
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GAME APP  —  root window and navigation controller
@@ -10912,6 +11983,7 @@ class GameApp(tk.Tk):
         "help":       HelpScreen,
         "settings":   SettingsScreen,
         "gamble":     GambleScreen,
+        "voyage":     VoyageScreen,
     }
 
     def __init__(self) -> None:
@@ -10949,6 +12021,14 @@ class GameApp(tk.Tk):
         # Game model
         self.game = Game()
         self.profit_animations: bool = True   # toggle via Settings
+
+        # Online services (merchant_tycoon_online.py)  — silently disabled if
+        # the module is absent or Supabase is unreachable at import time.
+        try:
+            from merchant_tycoon_online import OnlineServices as _OnlineSvc
+            self.online: Optional[object] = _OnlineSvc()
+        except Exception:
+            self.online = None
 
         # Sound manager (pygame optional — silently disabled if not present)
         self.sound = SoundManager(_HERE)
@@ -11186,6 +12266,18 @@ class GameApp(tk.Tk):
         New game / load game flow — mirrors the CLI play() preamble
         but uses dialog boxes instead of input() / print().
         """
+        # ── Online: restore or request a session ────────────────────────────
+        _online_greeting: Optional[str] = None
+        if self.online:
+            had_session = self.online.startup()
+            if had_session:
+                # Silently resumed — greet after the main screen loads
+                _online_greeting = self.online.auth.username or "Merchant"
+            else:
+                result = LaunchScreen(self).wait()
+                if result == "signed_in" and self.online.auth.is_authenticated:
+                    _online_greeting = self.online.auth.username or "Merchant"
+
         is_new_game = True
 
         if os.path.exists(Game.SAVE_FILE):
@@ -11209,6 +12301,10 @@ class GameApp(tk.Tk):
             self.game.player_name = name or "Merchant"
 
         self.show("main")
+
+        if _online_greeting:
+            self.after(200, lambda: self.message_bar.ok(
+                f"✦  Signed in as {_online_greeting}  —  Online"))
 
         if is_new_game:
             # Defer slightly so the main screen finishes rendering first

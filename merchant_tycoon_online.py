@@ -64,7 +64,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,7 +849,9 @@ class LeaderboardManager:
         lifetime_gold: float = 0.0,
         title: str = "",
         player_name: str = "",
+        guild_id: str = "",
         guild_name: str = "",
+        guild_role: str = "",
         area: str = "",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
@@ -871,7 +873,9 @@ class LeaderboardManager:
                 "username":      username,
                 "player_name":   player_name or username,
                 "title":         title,
+                "guild_id":      guild_id or None,
                 "guild_name":    guild_name,
+                "guild_role":    guild_role,
                 "net_worth":     net_worth,
                 "score":         score,
                 "day":           day,
@@ -906,7 +910,7 @@ class LeaderboardManager:
             return self._client.get(
                 "/rest/v1/leaderboard",
                 params={
-                    "select": "user_id,username,player_name,title,guild_name,"
+                    "select": "user_id,username,player_name,title,guild_id,guild_name,guild_role,"
                               "net_worth,score,lifetime_gold,day,reputation,area,updated_at",
                     "order":  "net_worth.desc.nullsfirst",
                     "limit":  str(limit),
@@ -961,63 +965,359 @@ class LeaderboardManager:
 
 class GuildManager:
     """
-    Merchant guilds — players can create, browse, join, and leave guilds.
+    Merchant guilds — players can create, browse, join, manage, and personalize.
 
     Required Supabase SQL:
     ─────────────────────
-        create table guilds (
-            id           uuid primary key default gen_random_uuid(),
-            name         text not null unique,
-            description  text not null default '',
-            owner_id     uuid references auth.users not null,
-            member_count int  not null default 1,
-            created_at   timestamptz default now()
-        );
-        alter table guilds enable row level security;
-        create policy "read all"     on guilds for select using (true);
-        create policy "insert own"   on guilds for insert
-            with check (auth.uid() = owner_id);
-        create policy "owner update" on guilds for update
-            using (auth.uid() = owner_id);
-        create policy "owner delete" on guilds for delete
-            using (auth.uid() = owner_id);
-
-        create table guild_members (
-            guild_id  uuid references guilds(id) on delete cascade not null,
-            user_id   uuid references auth.users not null,
-            username  text not null,
-            role      text not null default 'member',  -- 'owner' | 'officer' | 'member'
-            joined_at timestamptz default now(),
-            primary key (guild_id, user_id)
-        );
-        alter table guild_members enable row level security;
-        create policy "read all"     on guild_members for select using (true);
-        create policy "insert self"  on guild_members for insert
-            with check (auth.uid() = user_id);
-        create policy "delete self"  on guild_members for delete
-            using (auth.uid() = user_id);
-
-        create table guild_invites (
-            id          uuid primary key default gen_random_uuid(),
-            guild_id    uuid references guilds(id) on delete cascade not null,
-            from_user   uuid references auth.users not null,
-            to_user     uuid references auth.users not null,
-            status      text not null default 'pending',  -- 'pending'|'accepted'|'declined'
-            created_at  timestamptz default now(),
-            unique (guild_id, to_user)
-        );
-        alter table guild_invites enable row level security;
-        create policy "read involved" on guild_invites for select
-            using (auth.uid() = from_user or auth.uid() = to_user);
-        create policy "insert member" on guild_invites for insert
-            with check (auth.uid() = from_user);
-        create policy "update invited" on guild_invites for update
-            using (auth.uid() = to_user);
+        See supabase_guild_migration.sql for the full schema, policies, and triggers.
     """
+
+    DEFAULT_ROLES: Tuple[Dict[str, Any], ...] = (
+        {
+            "role_key": "president",
+            "label": "President",
+            "rank": 1000,
+            "is_system": True,
+            "permissions": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+        },
+        {
+            "role_key": "vice_president",
+            "label": "Vice President",
+            "rank": 800,
+            "is_system": True,
+            "permissions": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+        },
+        {
+            "role_key": "governor",
+            "label": "Governor",
+            "rank": 650,
+            "is_system": True,
+            "permissions": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+        },
+        {
+            "role_key": "quartermaster",
+            "label": "Quartermaster",
+            "rank": 500,
+            "is_system": True,
+            "permissions": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": False,
+                "edit_guild_profile": False,
+            },
+        },
+        {
+            "role_key": "recruiter",
+            "label": "Recruiter",
+            "rank": 420,
+            "is_system": True,
+            "permissions": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": False,
+                "edit_guild_profile": False,
+            },
+        },
+        {
+            "role_key": "member",
+            "label": "Member",
+            "rank": 100,
+            "is_system": True,
+            "permissions": {
+                "invite_members": False,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": False,
+                "edit_guild_profile": False,
+            },
+        },
+    )
+
+    DEFAULT_POLICY: Dict[str, Any] = {
+        "recruitment_mode": "open",
+        "visibility": "public",
+        "allow_member_invites": False,
+        "minimum_reputation": 0,
+        "minimum_net_worth": 0.0,
+        "event_focus": "balanced",
+        "message_of_the_day": "",
+        "application_prompt": "",
+    }
+
+    MUTABLE_PERMISSIONS: Tuple[str, ...] = (
+        "invite_members",
+        "kick_members",
+        "assign_roles",
+        "edit_roles",
+        "edit_policies",
+        "edit_guild_profile",
+    )
 
     def __init__(self, client: OnlineClient, auth: AuthManager) -> None:
         self._client = client
         self._auth   = auth
+
+    @staticmethod
+    def _normalize_role_key(value: str) -> str:
+        cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in (value or "").strip())
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        cleaned = cleaned.strip("_") or "member"
+        aliases = {
+            "owner": "president",
+            "leader": "president",
+            "officer": "vice_president",
+            "admin": "governor",
+        }
+        return aliases.get(cleaned, cleaned)
+
+    @classmethod
+    def _normalize_permissions(cls, permissions: Optional[Dict[str, Any]] = None) -> Dict[str, bool]:
+        source = permissions if isinstance(permissions, dict) else {}
+        normalized: Dict[str, bool] = {}
+        for key in cls.MUTABLE_PERMISSIONS:
+            normalized[key] = bool(source.get(key, False))
+        return normalized
+
+    @staticmethod
+    def _is_missing_relation_error(result: OnlineResult, relation_name: str) -> bool:
+        if result.success:
+            return False
+        error = str(getattr(result, "error", "") or "").lower()
+        relation = relation_name.lower()
+        return relation in error and (
+            "does not exist" in error
+            or "could not find" in error
+            or "not found" in error
+        )
+
+    @staticmethod
+    def _is_row_level_security_error(result: OnlineResult) -> bool:
+        if result.success:
+            return False
+        error = str(getattr(result, "error", "") or "").lower()
+        return "row level security" in error or "rls" in error
+
+    def _current_membership(self) -> OnlineResult:
+        if not self._auth.is_authenticated:
+            return OnlineResult(success=False, error="Not signed in.")
+        result = self._client.get(
+            "/rest/v1/guild_members",
+            params={
+                "select": "guild_id,role,joined_at",
+                "user_id": f"eq.{self._auth.user_id}",
+                "limit": "1",
+            },
+        )
+        if not result.success:
+            return result
+        rows = result.data if isinstance(result.data, list) else []
+        return OnlineResult(success=True, data=rows[0] if rows else None)
+
+    def _find_owned_guild(self) -> OnlineResult:
+        if not self._auth.is_authenticated:
+            return OnlineResult(success=False, error="Not signed in.")
+        result = self._client.get(
+            "/rest/v1/guilds",
+            params={
+                "select": "id,name,description,motto,banner_color,owner_id,member_count,created_at,updated_at",
+                "owner_id": f"eq.{self._auth.user_id}",
+                "limit": "1",
+            },
+        )
+        if not result.success:
+            return result
+        rows = result.data if isinstance(result.data, list) else []
+        return OnlineResult(success=True, data=rows[0] if rows else None)
+
+    def _fetch_guild(self, guild_id: str) -> OnlineResult:
+        result = self._client.get(
+            "/rest/v1/guilds",
+            params={
+                "select": "id,name,description,motto,banner_color,owner_id,member_count,created_at,updated_at",
+                "id": f"eq.{guild_id}",
+                "limit": "1",
+            },
+        )
+        if not result.success:
+            return result
+        rows = result.data if isinstance(result.data, list) else []
+        return OnlineResult(success=True, data=rows[0] if rows else None)
+
+    def _fetch_policy(self, guild_id: str) -> OnlineResult:
+        result = self._client.get(
+            "/rest/v1/guild_policies",
+            params={
+                "select": "guild_id,recruitment_mode,visibility,allow_member_invites,minimum_reputation,minimum_net_worth,event_focus,message_of_the_day,application_prompt,updated_at",
+                "guild_id": f"eq.{guild_id}",
+                "limit": "1",
+            },
+        )
+        if self._is_missing_relation_error(result, "guild_policies"):
+            return OnlineResult(success=True, data=dict(self.DEFAULT_POLICY))
+        if not result.success:
+            return result
+        rows = result.data if isinstance(result.data, list) else []
+        return OnlineResult(success=True, data=rows[0] if rows else None)
+
+    def _fetch_roles(self, guild_id: str) -> OnlineResult:
+        result = self._client.get(
+            "/rest/v1/guild_roles",
+            params={
+                "select": "guild_id,role_key,label,rank,permissions,is_system,updated_at",
+                "guild_id": f"eq.{guild_id}",
+                "order": "rank.desc,label.asc",
+            },
+        )
+        if self._is_missing_relation_error(result, "guild_roles"):
+            return OnlineResult(success=True, data=[])
+        if not result.success:
+            return result
+        rows = result.data if isinstance(result.data, list) else []
+        for row in rows:
+            row["role_key"] = self._normalize_role_key(str(row.get("role_key", "") or "member"))
+            row["permissions"] = self._normalize_permissions(row.get("permissions"))
+        return OnlineResult(success=True, data=rows)
+
+    def _ensure_founder_membership(self, guild: Dict[str, Any]) -> OnlineResult:
+        guild_id = str(guild.get("id", "") or "")
+        owner_id = str(guild.get("owner_id", "") or "")
+        if not guild_id or not owner_id or owner_id != str(self._auth.user_id or ""):
+            return OnlineResult(success=True, data=False)
+
+        member_result = self._client.get(
+            "/rest/v1/guild_members",
+            params={
+                "select": "guild_id,user_id,role",
+                "guild_id": f"eq.{guild_id}",
+                "user_id": f"eq.{owner_id}",
+                "limit": "1",
+            },
+        )
+        if not member_result.success:
+            return member_result
+        existing = member_result.data if isinstance(member_result.data, list) else []
+        if existing:
+            current_role = self._normalize_role_key(str(existing[0].get("role", "member") or "member"))
+            if current_role != str(existing[0].get("role", "")):
+                self._client.patch(
+                    "/rest/v1/guild_members",
+                    body={"role": current_role},
+                    params={"guild_id": f"eq.{guild_id}", "user_id": f"eq.{owner_id}"},
+                )
+            return OnlineResult(success=True, data=False)
+
+        insert_result = self._client.post(
+            "/rest/v1/guild_members",
+            body={
+                "guild_id": guild_id,
+                "user_id": owner_id,
+                "username": self._auth.username or "Unknown Merchant",
+                "role": "president",
+            },
+        )
+        if not insert_result.success:
+            return insert_result
+        self._refresh_member_count(guild_id)
+        self._sync_self_guild_snapshot(guild_id=guild_id, guild_name=str(guild.get("name", "") or ""), guild_role="President")
+        return OnlineResult(success=True, data=True)
+
+    def _refresh_member_count(self, guild_id: str) -> None:
+        count_result = self._client.get(
+            "/rest/v1/guild_members",
+            params={"select": "user_id", "guild_id": f"eq.{guild_id}"},
+        )
+        if not count_result.success:
+            return
+        count = len(count_result.data) if isinstance(count_result.data, list) else 0
+        self._client.patch(
+            "/rest/v1/guilds",
+            body={"member_count": count, "updated_at": "now()"},
+            params={"id": f"eq.{guild_id}"},
+        )
+
+    def _sync_self_guild_snapshot(self, guild_id: str = "", guild_name: str = "", guild_role: str = "") -> None:
+        if not self._auth.is_authenticated:
+            return
+        snapshot = {
+            "guild_id": guild_id or None,
+            "guild_name": guild_name or "",
+            "guild_role": guild_role or "",
+            "updated_at": "now()",
+        }
+        self._client.patch(
+            "/rest/v1/profiles",
+            body=snapshot,
+            params={"id": f"eq.{self._auth.user_id}"},
+        )
+        self._client.patch(
+            "/rest/v1/leaderboard",
+            body=snapshot,
+            params={"user_id": f"eq.{self._auth.user_id}"},
+        )
+
+    def _seed_default_roles(self, guild_id: str) -> OnlineResult:
+        for role in self.DEFAULT_ROLES:
+            result = self._client.post(
+                "/rest/v1/guild_roles",
+                body={
+                    "guild_id": guild_id,
+                    "role_key": role["role_key"],
+                    "label": role["label"],
+                    "rank": int(role["rank"]),
+                    "permissions": role["permissions"],
+                    "is_system": bool(role.get("is_system", False)),
+                },
+                params={"on_conflict": "guild_id,role_key"},
+                extra_headers={"Prefer": "resolution=merge-duplicates"},
+            )
+            if not result.success:
+                return result
+        return OnlineResult(success=True, data=True)
+
+    @classmethod
+    def _default_role_map(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(role.get("role_key", "member") or "member"): {
+                **role,
+                "permissions": cls._normalize_permissions(role.get("permissions")),
+            }
+            for role in cls.DEFAULT_ROLES
+        }
+
+    def _ensure_default_policy(self, guild_id: str) -> OnlineResult:
+        return self._client.post(
+            "/rest/v1/guild_policies",
+            body={"guild_id": guild_id, **self.DEFAULT_POLICY},
+            params={"on_conflict": "guild_id"},
+            extra_headers={"Prefer": "resolution=merge-duplicates"},
+        )
 
     def create_guild(
         self,
@@ -1025,18 +1325,23 @@ class GuildManager:
         description: str = "",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Create a new guild and automatically join it as owner."""
+        """Create a new guild, seed default roles/policies, and join as president."""
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
 
-            # Insert the guild row
+            membership = self._current_membership()
+            if not membership.success:
+                return membership
+            if membership.data:
+                return OnlineResult(success=False, error="Leave your current guild before founding a new one.")
+
             guild_result = self._client.post(
                 "/rest/v1/guilds",
                 body={
-                    "name":         name,
-                    "description":  description,
-                    "owner_id":     self._auth.user_id,
+                    "name": name,
+                    "description": description,
+                    "owner_id": self._auth.user_id,
                     "member_count": 1,
                 },
                 extra_headers={"Prefer": "return=representation"},
@@ -1044,25 +1349,47 @@ class GuildManager:
             if not guild_result.success:
                 return guild_result
 
-            # Parse returned guild (may be a list or dict depending on Prefer header)
             rows = guild_result.data
             guild = (rows[0] if isinstance(rows, list) and rows
                      else rows if isinstance(rows, dict) else None)
             if not guild or not guild.get("id"):
-                return OnlineResult(success=False,
-                                    error="Guild created but response was unexpected.")
+                return OnlineResult(success=False, error="Guild created but response was unexpected.")
 
-            # Auto-join as owner
-            self._client.post(
+            guild_id = str(guild["id"])
+            member_result = self._client.post(
                 "/rest/v1/guild_members",
                 body={
-                    "guild_id": guild["id"],
-                    "user_id":  self._auth.user_id,
+                    "guild_id": guild_id,
+                    "user_id": self._auth.user_id,
                     "username": self._auth.username or "Unknown Merchant",
-                    "role":     "owner",
+                    "role": "president",
                 },
             )
-            return OnlineResult(success=True, data=guild)
+            if not member_result.success:
+                self._client.delete("/rest/v1/guilds", params={"id": f"eq.{guild_id}"})
+                return member_result
+
+            policy_result = self._ensure_default_policy(guild_id)
+            if not policy_result.success and not self._is_missing_relation_error(policy_result, "guild_policies"):
+                policy_fetch = self._fetch_policy(guild_id)
+                if not policy_fetch.success:
+                    self._client.delete("/rest/v1/guilds", params={"id": f"eq.{guild_id}"})
+                    return policy_result
+
+            roles_result = self._seed_default_roles(guild_id)
+            if not roles_result.success and not self._is_missing_relation_error(roles_result, "guild_roles"):
+                roles_fetch = self._fetch_roles(guild_id)
+                if not roles_fetch.success or not isinstance(roles_fetch.data, list) or not roles_fetch.data:
+                    if not self._is_row_level_security_error(roles_result):
+                        self._client.delete("/rest/v1/guilds", params={"id": f"eq.{guild_id}"})
+                        return roles_result
+
+            self._refresh_member_count(guild_id)
+            self._sync_self_guild_snapshot(guild_id=guild_id, guild_name=str(guild.get("name", "") or ""), guild_role="President")
+            dashboard = self.get_guild_dashboard(guild_id)
+            if dashboard is not None and dashboard.success:
+                return dashboard
+            return OnlineResult(success=True, data={**guild, "my_role": "president", "my_role_label": "President"})
 
         if callback is None:
             return _do()
@@ -1074,19 +1401,46 @@ class GuildManager:
         guild_id: str,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Join an existing guild as a member."""
+        """Join an existing guild as a member when recruitment is open."""
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
-            return self._client.post(
+            membership = self._current_membership()
+            if not membership.success:
+                return membership
+            if membership.data:
+                return OnlineResult(success=False, error="Leave your current guild before joining another.")
+
+            policy_result = self._fetch_policy(guild_id)
+            if not policy_result.success:
+                return policy_result
+            policy = policy_result.data if isinstance(policy_result.data, dict) else {}
+            recruitment_mode = str(policy.get("recruitment_mode", "open") or "open").lower()
+            if recruitment_mode != "open":
+                return OnlineResult(success=False, error="This guild is not currently open for direct joins.")
+
+            guild_result = self._fetch_guild(guild_id)
+            if not guild_result.success:
+                return guild_result
+            guild = guild_result.data if isinstance(guild_result.data, dict) else {}
+
+            result = self._client.post(
                 "/rest/v1/guild_members",
                 body={
                     "guild_id": guild_id,
-                    "user_id":  self._auth.user_id,
+                    "user_id": self._auth.user_id,
                     "username": self._auth.username or "Unknown Merchant",
-                    "role":     "member",
+                    "role": "member",
                 },
             )
+            if not result.success:
+                return result
+            self._refresh_member_count(guild_id)
+            self._sync_self_guild_snapshot(guild_id=guild_id, guild_name=str(guild.get("name", "") or ""), guild_role="Member")
+            dashboard = self.get_guild_dashboard(guild_id)
+            if dashboard is not None and dashboard.success:
+                return dashboard
+            return OnlineResult(success=True, data={"guild_id": guild_id, "my_role": "member", "my_role_label": "Member"})
 
         if callback is None:
             return _do()
@@ -1098,17 +1452,44 @@ class GuildManager:
         guild_id: str,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Leave a guild.  Does not disband it — owner must transfer or delete manually."""
+        """Leave a guild. A president must transfer leadership or disband if alone."""
         def _do() -> OnlineResult:
-            if not self._auth.is_authenticated:
-                return OnlineResult(success=False, error="Not signed in.")
-            return self._client.delete(
+            membership = self._current_membership()
+            if not membership.success:
+                return membership
+            member = membership.data if isinstance(membership.data, dict) else None
+            if not member or str(member.get("guild_id", "")) != guild_id:
+                return OnlineResult(success=False, error="You are not in that guild.")
+
+            members_result = self._client.get(
+                "/rest/v1/guild_members",
+                params={"select": "user_id", "guild_id": f"eq.{guild_id}"},
+            )
+            if not members_result.success:
+                return members_result
+            member_count = len(members_result.data) if isinstance(members_result.data, list) else 0
+            role_key = str(member.get("role", "member") or "member")
+
+            if role_key == "president" and member_count > 1:
+                return OnlineResult(success=False, error="Promote another member before the president can leave.")
+
+            if role_key == "president" and member_count <= 1:
+                result = self._client.delete("/rest/v1/guilds", params={"id": f"eq.{guild_id}"})
+                if result.success:
+                    self._sync_self_guild_snapshot()
+                return result
+
+            result = self._client.delete(
                 "/rest/v1/guild_members",
                 params={
                     "guild_id": f"eq.{guild_id}",
-                    "user_id":  f"eq.{self._auth.user_id}",
+                    "user_id": f"eq.{self._auth.user_id}",
                 },
             )
+            if result.success:
+                self._refresh_member_count(guild_id)
+                self._sync_self_guild_snapshot()
+            return result
 
         if callback is None:
             return _do()
@@ -1121,16 +1502,26 @@ class GuildManager:
         limit: int = 30,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """List guilds ordered by member count, optionally filtered by name."""
+        """List guilds ordered by member count, enriched with policy metadata."""
         def _do() -> OnlineResult:
             params: Dict[str, str] = {
-                "select": "id,name,description,member_count,created_at",
-                "order":  "member_count.desc",
-                "limit":  str(limit),
+                "select": "id,name,description,motto,banner_color,member_count,created_at,guild_policies(recruitment_mode,visibility,event_focus,minimum_reputation,minimum_net_worth)",
+                "order": "member_count.desc,name.asc",
+                "limit": str(limit),
             }
             if search:
                 params["name"] = f"ilike.*{search}*"
-            return self._client.get("/rest/v1/guilds", params=params)
+            result = self._client.get("/rest/v1/guilds", params=params)
+            if self._is_missing_relation_error(result, "guild_policies"):
+                fallback = {
+                    "select": "id,name,description,motto,banner_color,member_count,created_at",
+                    "order": "member_count.desc,name.asc",
+                    "limit": str(limit),
+                }
+                if search:
+                    fallback["name"] = f"ilike.*{search}*"
+                return self._client.get("/rest/v1/guilds", params=fallback)
+            return result
 
         if callback is None:
             return _do()
@@ -1140,40 +1531,137 @@ class GuildManager:
     def get_my_guild(
         self, callback: Optional[Callable] = None
     ) -> Optional[OnlineResult]:
-        """Return the guild the current player belongs to, or None if not in one."""
+        """Return the current player's guild with role and policy metadata."""
         def _do() -> OnlineResult:
-            if not self._auth.is_authenticated:
-                return OnlineResult(success=False, error="Not signed in.")
+            membership = self._current_membership()
+            if not membership.success:
+                return membership
+            row = membership.data if isinstance(membership.data, dict) else None
+            if not row:
+                owned = self._find_owned_guild()
+                if not owned.success:
+                    return owned
+                owned_guild = owned.data if isinstance(owned.data, dict) else None
+                if owned_guild:
+                    founder_fix = self._ensure_founder_membership(owned_guild)
+                    if not founder_fix.success:
+                        return founder_fix
+                    row = {"guild_id": owned_guild.get("id", ""), "role": "president"}
+            if not row:
+                return OnlineResult(success=True, data=None)
+            dashboard = self.get_guild_dashboard(str(row.get("guild_id", "")))
+            if dashboard is None:
+                return OnlineResult(success=False, error="Guild dashboard unavailable.")
+            if not dashboard.success:
+                return dashboard
+            data = dashboard.data if isinstance(dashboard.data, dict) else {}
+            guild = data.get("guild") if isinstance(data.get("guild"), dict) else None
+            if guild:
+                guild["my_role"] = row.get("role", "member")
+                role_map = {
+                    role.get("role_key"): role
+                    for role in data.get("roles", [])
+                    if isinstance(role, dict)
+                }
+                role_info = role_map.get(row.get("role", "member")) or {}
+                guild["my_role_label"] = role_info.get("label") or row.get("role", "member")
+                guild["permissions"] = role_info.get("permissions") or {}
+                guild["policy"] = data.get("policy") or {}
+            return OnlineResult(success=True, data=guild)
 
-            member_result = self._client.get(
-                "/rest/v1/guild_members",
-                params={
-                    "select":  "guild_id,role",
-                    "user_id": f"eq.{self._auth.user_id}",
-                    "limit":   "1",
-                },
-            )
-            if not member_result.success:
-                return member_result
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
 
-            rows = member_result.data if isinstance(member_result.data, list) else []
-            if not rows:
-                return OnlineResult(success=True, data=None)  # not in any guild
-
-            guild_id = rows[0]["guild_id"]
-            guild_result = self._client.get(
-                "/rest/v1/guilds",
-                params={
-                    "select": "id,name,description,member_count,owner_id,created_at",
-                    "id":     f"eq.{guild_id}",
-                    "limit":  "1",
-                },
-            )
+    def get_guild_dashboard(
+        self,
+        guild_id: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Fetch guild overview, members, roles, and policies in one payload."""
+        def _do() -> OnlineResult:
+            guild_result = self._fetch_guild(guild_id)
             if not guild_result.success:
                 return guild_result
+            guild = guild_result.data if isinstance(guild_result.data, dict) else None
+            if not guild:
+                return OnlineResult(success=True, data=None)
 
-            guild_rows = guild_result.data if isinstance(guild_result.data, list) else []
-            return OnlineResult(success=True, data=guild_rows[0] if guild_rows else None)
+            founder_fix = self._ensure_founder_membership(guild)
+            if not founder_fix.success:
+                return founder_fix
+
+            roles_result = self._fetch_roles(guild_id)
+            if not roles_result.success:
+                return roles_result
+            roles = roles_result.data if isinstance(roles_result.data, list) else []
+            if not roles:
+                seeded = self._seed_default_roles(guild_id)
+                if not seeded.success and not self._is_missing_relation_error(seeded, "guild_roles"):
+                    if not self._is_row_level_security_error(seeded):
+                        return seeded
+                else:
+                    roles_result = self._fetch_roles(guild_id)
+                    if not roles_result.success:
+                        return roles_result
+                    roles = roles_result.data if isinstance(roles_result.data, list) else []
+            default_role_map = self._default_role_map()
+            role_map = {
+                str(role.get("role_key", "member") or "member"): role
+                for role in roles if isinstance(role, dict)
+            }
+            for role_key, role in default_role_map.items():
+                role_map.setdefault(role_key, role)
+
+            policy_result = self._fetch_policy(guild_id)
+            if not policy_result.success:
+                return policy_result
+            policy = policy_result.data if isinstance(policy_result.data, dict) else dict(self.DEFAULT_POLICY)
+            if not isinstance(policy_result.data, dict):
+                ensured = self._ensure_default_policy(guild_id)
+                if not ensured.success and not self._is_missing_relation_error(ensured, "guild_policies"):
+                    return ensured
+                policy_result = self._fetch_policy(guild_id)
+                if not policy_result.success:
+                    return policy_result
+                policy = policy_result.data if isinstance(policy_result.data, dict) else dict(self.DEFAULT_POLICY)
+
+            members_result = self._client.get(
+                "/rest/v1/guild_members",
+                params={
+                    "select": "guild_id,user_id,username,role,joined_at,contribution_score",
+                    "guild_id": f"eq.{guild_id}",
+                    "order": "joined_at.asc",
+                },
+            )
+            if not members_result.success:
+                return members_result
+
+            members_raw = members_result.data if isinstance(members_result.data, list) else []
+            members: List[Dict[str, Any]] = []
+            for member in members_raw:
+                role_key = self._normalize_role_key(str(member.get("role", "member") or "member"))
+                role_info = role_map.get(role_key, default_role_map.get(role_key, {}))
+                members.append({
+                    **member,
+                    "role": role_key,
+                    "role_label": role_info.get("label") or role_key.replace("_", " ").title(),
+                    "role_rank": int(role_info.get("rank", 0) or 0),
+                    "permissions": self._normalize_permissions(role_info.get("permissions")),
+                })
+            members.sort(key=lambda item: (-int(item.get("role_rank", 0) or 0), str(item.get("joined_at", ""))))
+
+            membership = next((member for member in members if str(member.get("user_id", "")) == str(self._auth.user_id or "")), None)
+            permissions = membership.get("permissions", {}) if membership else {}
+            return OnlineResult(success=True, data={
+                "guild": guild,
+                "policy": policy,
+                "roles": roles,
+                "members": members,
+                "membership": membership,
+                "permissions": permissions,
+            })
 
         if callback is None:
             return _do()
@@ -1185,16 +1673,196 @@ class GuildManager:
         guild_id: str,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Fetch the member roster for a guild ordered by role then join date."""
+        """Fetch the member roster for a guild with role labels and permissions."""
         def _do() -> OnlineResult:
-            return self._client.get(
+            dashboard = self.get_guild_dashboard(guild_id)
+            if dashboard is None:
+                return OnlineResult(success=False, error="Guild dashboard unavailable.")
+            if not dashboard.success:
+                return dashboard
+            data = dashboard.data if isinstance(dashboard.data, dict) else {}
+            return OnlineResult(success=True, data=data.get("members", []))
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def get_guild_roles(
+        self,
+        guild_id: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Fetch all roles defined for a guild."""
+        if callback is None:
+            return self._fetch_roles(guild_id)
+        _run_async(lambda: self._fetch_roles(guild_id), callback)
+        return None
+
+    def update_guild(
+        self,
+        guild_id: str,
+        updates: Dict[str, Any],
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Update guild presentation fields like description, motto, or banner color."""
+        body = {key: value for key, value in updates.items() if key in {"description", "motto", "banner_color"}}
+        body["updated_at"] = "now()"
+
+        def _do() -> OnlineResult:
+            return self._client.patch(
+                "/rest/v1/guilds",
+                body=body,
+                params={"id": f"eq.{guild_id}"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def update_guild_policy(
+        self,
+        guild_id: str,
+        updates: Dict[str, Any],
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Upsert guild recruitment and culture policies."""
+        allowed = {
+            "recruitment_mode",
+            "visibility",
+            "allow_member_invites",
+            "minimum_reputation",
+            "minimum_net_worth",
+            "event_focus",
+            "message_of_the_day",
+            "application_prompt",
+        }
+        body = {key: value for key, value in updates.items() if key in allowed}
+        body["guild_id"] = guild_id
+        body["updated_at"] = "now()"
+
+        def _do() -> OnlineResult:
+            return self._client.post(
+                "/rest/v1/guild_policies",
+                body=body,
+                params={"on_conflict": "guild_id"},
+                extra_headers={"Prefer": "resolution=merge-duplicates"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def upsert_guild_role(
+        self,
+        guild_id: str,
+        role_key: str,
+        label: str,
+        rank: int,
+        permissions: Optional[Dict[str, Any]] = None,
+        *,
+        is_system: bool = False,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Create or update a guild role and its permissions."""
+        normalized_key = self._normalize_role_key(role_key)
+        normalized_permissions = self._normalize_permissions(permissions)
+
+        def _do() -> OnlineResult:
+            return self._client.post(
+                "/rest/v1/guild_roles",
+                body={
+                    "guild_id": guild_id,
+                    "role_key": normalized_key,
+                    "label": label.strip() or normalized_key.replace("_", " ").title(),
+                    "rank": int(rank),
+                    "permissions": normalized_permissions,
+                    "is_system": bool(is_system),
+                    "updated_at": "now()",
+                },
+                params={"on_conflict": "guild_id,role_key"},
+                extra_headers={"Prefer": "resolution=merge-duplicates"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def delete_guild_role(
+        self,
+        guild_id: str,
+        role_key: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Delete a custom role when no members are using it."""
+        normalized_key = self._normalize_role_key(role_key)
+
+        def _do() -> OnlineResult:
+            members_result = self._client.get(
                 "/rest/v1/guild_members",
                 params={
-                    "select":   "username,role,joined_at",
+                    "select": "user_id",
                     "guild_id": f"eq.{guild_id}",
-                    "order":    "role.asc,joined_at.asc",
+                    "role": f"eq.{normalized_key}",
+                    "limit": "1",
                 },
             )
+            if not members_result.success:
+                return members_result
+            if isinstance(members_result.data, list) and members_result.data:
+                return OnlineResult(success=False, error="Members are still assigned to that role.")
+            return self._client.delete(
+                "/rest/v1/guild_roles",
+                params={"guild_id": f"eq.{guild_id}", "role_key": f"eq.{normalized_key}"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def assign_member_role(
+        self,
+        guild_id: str,
+        user_id: str,
+        role_key: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Assign a new role to a guild member."""
+        normalized_key = self._normalize_role_key(role_key)
+
+        def _do() -> OnlineResult:
+            return self._client.patch(
+                "/rest/v1/guild_members",
+                body={"role": normalized_key},
+                params={"guild_id": f"eq.{guild_id}", "user_id": f"eq.{user_id}"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def remove_member(
+        self,
+        guild_id: str,
+        user_id: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Remove a member from the guild roster."""
+        def _do() -> OnlineResult:
+            result = self._client.delete(
+                "/rest/v1/guild_members",
+                params={"guild_id": f"eq.{guild_id}", "user_id": f"eq.{user_id}"},
+            )
+            if result.success:
+                self._refresh_member_count(guild_id)
+                if user_id == (self._auth.user_id or ""):
+                    self._sync_self_guild_snapshot()
+            return result
 
         if callback is None:
             return _do()
@@ -1207,10 +1875,16 @@ class GuildManager:
         to_user_id: str,
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Invite another player to your guild (you must be a member)."""
+        """Invite another player to your guild."""
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
+            membership = self._current_membership()
+            if not membership.success:
+                return membership
+            row = membership.data if isinstance(membership.data, dict) else None
+            if not row or str(row.get("guild_id", "")) != guild_id:
+                return OnlineResult(success=False, error="You must belong to that guild before inviting players.")
             return self._client.post(
                 "/rest/v1/guild_invites",
                 body={
@@ -1238,6 +1912,21 @@ class GuildManager:
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
+            invite_lookup = self._client.get(
+                "/rest/v1/guild_invites",
+                params={
+                    "select": "id,guild_id",
+                    "id": f"eq.{invite_id}",
+                    "to_user": f"eq.{self._auth.user_id}",
+                    "limit": "1",
+                },
+            )
+            if not invite_lookup.success:
+                return invite_lookup
+            invite_rows = invite_lookup.data if isinstance(invite_lookup.data, list) else []
+            if not invite_rows:
+                return OnlineResult(success=False, error="Invite not found.")
+            invite = invite_rows[0]
             status = "accepted" if accept else "declined"
             result = self._client.patch(
                 "/rest/v1/guild_invites",
@@ -1248,16 +1937,27 @@ class GuildManager:
                     "status":  "eq.pending",
                 },
             )
-            # If accepted, auto-join the guild
             if result.success and accept:
-                inv_result = self._client.get(
-                    "/rest/v1/guild_invites",
-                    params={"select": "guild_id", "id": f"eq.{invite_id}", "limit": "1"},
+                join_result = self._client.post(
+                    "/rest/v1/guild_members",
+                    body={
+                        "guild_id": invite["guild_id"],
+                        "user_id": self._auth.user_id,
+                        "username": self._auth.username or "Unknown Merchant",
+                        "role": "member",
+                    },
                 )
-                if inv_result.success:
-                    rows = inv_result.data if isinstance(inv_result.data, list) else []
-                    if rows:
-                        self.join_guild(rows[0]["guild_id"])
+                if not join_result.success:
+                    return join_result
+                guild_id = str(invite["guild_id"])
+                self._refresh_member_count(guild_id)
+                guild_result = self._fetch_guild(guild_id)
+                guild = guild_result.data if guild_result.success and isinstance(guild_result.data, dict) else {}
+                self._sync_self_guild_snapshot(
+                    guild_id=guild_id,
+                    guild_name=str(guild.get("name", "") or ""),
+                    guild_role="Member",
+                )
             return result
 
         if callback is None:
@@ -1589,6 +2289,9 @@ class ProfileManager:
         self,
         networth: float,
         area: str = "",
+        guild_id: str = "",
+        guild_name: str = "",
+        guild_role: str = "",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
         """
@@ -1603,6 +2306,9 @@ class ProfileManager:
         }
         if area:
             updates["last_area"] = area
+        updates["guild_id"] = guild_id or None
+        updates["guild_name"] = guild_name or ""
+        updates["guild_role"] = guild_role or ""
         return self.update_profile(updates, callback=callback)
 
 

@@ -41,6 +41,7 @@ import sys
 import os
 import time
 import random
+import shutil
 import weakref
 import json
 import base64
@@ -53,7 +54,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Type, Any
 
 # ── PySide6 ───────────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize, QRect,
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize, QRect, QRectF,
     QRunnable, QThreadPool, QObject, Signal, Slot, QAbstractAnimation,
     QParallelAnimationGroup, QSequentialAnimationGroup, Property,
     QByteArray, QEvent, QMimeData, QThread, QMetaObject, Q_ARG,
@@ -1522,6 +1523,62 @@ class MtButton(QPushButton):
             self._opacity_eff = None
         super().mouseReleaseEvent(event)
 
+
+class ProfileIconButton(QPushButton):
+    """Circular header button with a simple bust glyph for profile access."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__("", parent)
+        self._hovered = False
+        self.setToolTip("Profile")
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFixedSize(UIScale.px(40), UIScale.px(34))
+        self.setStyleSheet("QPushButton{background:transparent;border:none;padding:0px;}")
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        outer = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        hovered = self._hovered or self.isDown()
+        bg = Palette.rgba(P.bg_hover if hovered else P.bg_panel, 220 if hovered else 170)
+        border = QColor(P.gold if hovered else P.border)
+        fg = QColor(P.gold if hovered else P.fg_dim)
+
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(bg)
+        painter.drawEllipse(outer)
+
+        painter.setPen(QPen(fg, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        head = QRectF(
+            outer.center().x() - outer.width() * 0.13,
+            outer.top() + outer.height() * 0.22,
+            outer.width() * 0.26,
+            outer.height() * 0.26,
+        )
+        painter.drawEllipse(head)
+
+        shoulders = QRectF(
+            outer.center().x() - outer.width() * 0.26,
+            outer.top() + outer.height() * 0.46,
+            outer.width() * 0.52,
+            outer.height() * 0.28,
+        )
+        painter.drawArc(shoulders, 25 * 16, 130 * 16)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STATUS BAR  —  persistent HUD strip
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2433,7 +2490,7 @@ class GameHeader(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(
             UIScale.px(10), UIScale.px(4),
-            UIScale.px(8),  UIScale.px(4),
+            UIScale.px(12),  UIScale.px(4),
         )
         lay.setSpacing(0)
 
@@ -2495,7 +2552,7 @@ class GameHeader(QWidget):
         # ── Right: icon action buttons ───────────────────────────────────────
         def _icon_btn(sym: str, tip: str) -> QPushButton:
             btn = QPushButton(sym, self)
-            btn.setFixedSize(UIScale.px(34), UIScale.px(34))
+            btn.setFixedSize(UIScale.px(40), UIScale.px(34))
             btn.setToolTip(tip)
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.setStyleSheet(f"""
@@ -2503,8 +2560,8 @@ class GameHeader(QWidget):
                     background: transparent;
                     color: {P.fg_dim};
                     border: none;
-                    border-radius: {UIScale.px(4)}px;
-                    padding: 0px;
+                    border-radius: {UIScale.px(6)}px;
+                    padding: 0px {UIScale.px(6)}px;
                     font-family: 'Segoe UI Symbol';
                     font-size: {UIScale.px(16)}px;
                 }}
@@ -2516,7 +2573,7 @@ class GameHeader(QWidget):
             return btn
 
         self._inbox_btn   = _icon_btn(Sym.INBOX,     "Inbox")
-        self._profile_btn = _icon_btn(Sym.PROFILE,   "Profile")
+        self._profile_btn = ProfileIconButton(self)
         self._sync_btn    = _icon_btn(Sym.CLOUD,     "Cloud sync — click to save & sync")
         self._rest_btn    = _icon_btn(Sym.WAIT_REST, "Rest & Wait")
 
@@ -2541,15 +2598,15 @@ class GameHeader(QWidget):
         self._sync_lbl.setAlignment(
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
         )
-        self._sync_lbl.setMaximumWidth(UIScale.px(132))
+        self._sync_lbl.setMaximumWidth(UIScale.px(168))
 
         right = QHBoxLayout()
-        right.setSpacing(UIScale.px(2))
+        right.setSpacing(UIScale.px(4))
         right.addWidget(self._dbg_mail_btn)
         right.addWidget(self._dbg_gold_btn)
         right.addWidget(self._dbg_cloud_btn)
         right.addWidget(self._dbg_purge_btn)
-        right.addSpacing(UIScale.px(6))
+        right.addSpacing(UIScale.px(10))
         right.addWidget(self._rest_btn)
         right.addWidget(self._inbox_btn)
         right.addWidget(self._profile_btn)
@@ -2592,19 +2649,20 @@ class GameHeader(QWidget):
         self._day_lbl.setStyleSheet(f"color:{sea_c}; background:transparent;")
 
         # Slots
-        used = getattr(g, "slots_used", 0)
-        mxs  = getattr(g, "action_slots", 5)
+        used = int(getattr(g, "daily_time_units", getattr(g, "slots_used", 0)) or 0)
+        mxs  = int(getattr(g, "DAILY_TIME_UNITS", getattr(g, "action_slots", 5)) or 5)
         free = max(0, mxs - used)
         dots = Sym.SLOT_FULL * used + Sym.SLOT_EMPTY * free
         col  = P.red if free == 0 else P.amber if free <= 1 else P.fg_dim
-        self._slots_lbl.setText(f"{dots}  {free}/{mxs} action slots open")
+        self._slots_lbl.setText(f"{dots}  ({free} actions left)")
         self._slots_lbl.setStyleSheet(f"color:{col}; background:transparent;")
 
     def set_inbox_badge(self, n: int) -> None:
         """Update the inbox button to show an unread count."""
-        br  = UIScale.px(4)
+        br  = UIScale.px(6)
         fsz = UIScale.px(16)
-        _s  = (f"border:none; border-radius:{br}px; padding:0px;"
+        self._inbox_btn.setFixedSize(UIScale.px(54 if n > 0 else 40), UIScale.px(34))
+        _s  = (f"border:none; border-radius:{br}px; padding:0px {UIScale.px(6)}px;"
                f" font-family:'Segoe UI Symbol'; font-size:{fsz}px;")
         if n > 0:
             self._inbox_btn.setText(f"{Sym.INBOX}  {min(n, 9)}")
@@ -2856,7 +2914,10 @@ class NavRail(QWidget):
         menu.setToolTipsVisible(True)
         for screen_key, icon, label in items:
             action = menu.addAction(f"{icon}  {label}")
-            action.triggered.connect(lambda checked=False, target=screen_key: self._navigate_to(target))
+            if screen_key == "profile_hub":
+                action.triggered.connect(self._app._open_profile_dialog)
+            else:
+                action.triggered.connect(lambda checked=False, target=screen_key: self._navigate_to(target))
         anchor = btn.mapToGlobal(QPoint(btn.width() - UIScale.px(2), 0))
         menu.exec(anchor)
 
@@ -3160,14 +3221,22 @@ class GameApp(QMainWindow):
         self._session_start: float = time.time()
         self._last_synced_day: int = 0
         self._last_sync_time: Optional[float] = None
+        self._cached_disc: int = 0
+        self._cached_guild_id: str = ""
+        self._cached_guild_name: str = ""
+        self._cached_guild_role: str = ""
+        self._cloud_sync_timer = QTimer(self)
+        self._cloud_sync_timer.setInterval(3 * 60 * 1000)
+        self._cloud_sync_timer.timeout.connect(self._auto_save_and_sync)
 
         # ── Online services ──────────────────────────────────────────────
         try:
             from merchant_tycoon_online import OnlineServices as _OnlineSvc
             self.online = _OnlineSvc()
-            self.online.startup()
+            self._had_online_session = bool(self.online.startup())
         except Exception:
             self.online = None
+            self._had_online_session = False
 
         # ── Thread pool ──────────────────────────────────────────────────
         self._pool = QThreadPool.globalInstance()
@@ -3207,10 +3276,9 @@ class GameApp(QMainWindow):
         # ── Window close handler ─────────────────────────────────────────
         # (closeEvent is overridden below)
 
-        # ── Navigate to dashboard ─────────────────────────────────────────
+        # ── Launch/auth flow ──────────────────────────────────────────────
         # Deferred to after the event loop starts so sizing is finalised.
-        QTimer.singleShot(0, lambda: self.show_screen("dashboard")
-                          if "dashboard" in self.screens else None)
+        QTimer.singleShot(0, self._begin_startup_flow)
 
         # ── Sync status polling ───────────────────────────────────────────
         self._sync_status_timer = QTimer(self)
@@ -3246,14 +3314,15 @@ class GameApp(QMainWindow):
         root.addWidget(self.game_header)
         self.game_header._rest_btn.clicked.connect(self._open_wait_dialog)
         self.game_header._inbox_btn.clicked.connect(self._open_inbox_dialog)
+        self.game_header._profile_btn.clicked.connect(self._open_profile_dialog)
         self.game_header._sync_btn.clicked.connect(self._do_sync)
 
         # Thin gold separator
-        sep = QFrame(central)
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background:{P.border_light}; border:none;")
-        root.addWidget(sep)
+        self._header_sep = QFrame(central)
+        self._header_sep.setFrameShape(QFrame.Shape.HLine)
+        self._header_sep.setFixedHeight(1)
+        self._header_sep.setStyleSheet(f"background:{P.border_light}; border:none;")
+        root.addWidget(self._header_sep)
 
         # ── 3. Main area: nav rail (left) + content stack (right) ─────────
         main_area = QHBoxLayout()
@@ -3288,7 +3357,8 @@ class GameApp(QMainWindow):
 
     def _register_screens(self) -> None:
         """Instantiate every screen and add to the QStackedWidget."""
-        for name, cls in self._SCREEN_MAP.items():
+        screen_map = {"launch": LaunchScreen, **self._SCREEN_MAP}
+        for name, cls in screen_map.items():
             screen = cls(self)
             self.screens[name] = screen
             self.content_stack.addWidget(screen)
@@ -3308,6 +3378,8 @@ class GameApp(QMainWindow):
         if name not in self.screens:
             self.message_bar.err(f"Unknown screen: '{name}'")
             return
+
+        self._set_game_shell_visible(name != "launch")
 
         if self._stack and self._stack[-1] != name:
             # Notify outgoing screen
@@ -3468,6 +3540,220 @@ class GameApp(QMainWindow):
         dlg.exec()
         self._refresh_inbox_badge()
 
+    def _open_profile_dialog(self) -> None:
+        """Open the player profile popup dialog from the header button."""
+        dlg = ProfileDialog(self, self)
+        dlg.exec()
+
+    def _set_game_shell_visible(self, visible: bool) -> None:
+        if hasattr(self, "game_header"):
+            self.game_header.setVisible(visible)
+        if hasattr(self, "_header_sep"):
+            self._header_sep.setVisible(visible)
+        if hasattr(self, "nav_rail"):
+            self.nav_rail.setVisible(visible)
+        if hasattr(self, "app_footer"):
+            self.app_footer.setVisible(visible)
+        if hasattr(self, "message_bar"):
+            self.message_bar.setVisible(visible)
+
+    def _begin_startup_flow(self) -> None:
+        if self._had_online_session and self.online and self.online.auth.is_authenticated:
+            self._set_game_shell_visible(False)
+            self._complete_authenticated_startup(self.online.auth.username or "Merchant")
+            return
+        if "launch" in self.screens:
+            self._stack = ["launch"]
+            self.show_screen("launch")
+        elif "dashboard" in self.screens:
+            self._stack = ["dashboard"]
+            self.show_screen("dashboard")
+
+    def _stop_verification_server(self) -> None:
+        if self.online and hasattr(self.online, "verification"):
+            try:
+                self.online.verification.stop()
+            except Exception:
+                pass
+
+    def _peek_local_save(self, path: str, bound_user_id: str = "") -> Optional[Dict[str, Any]]:
+        if not path or not os.path.exists(path):
+            return None
+        probe = Game()
+        probe.SAVE_FILE = path
+        probe.bound_user_id = bound_user_id
+        if not probe.load_game():
+            return None
+        try:
+            stamp = os.path.getmtime(path)
+        except Exception:
+            stamp = 0.0
+        return {
+            "day": probe._absolute_day(),
+            "gold": float(getattr(probe.inventory, "gold", 0.0) or 0.0),
+            "timestamp": stamp,
+            "path": path,
+        }
+
+    @staticmethod
+    def _parse_remote_timestamp(value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _format_save_timestamp(self, value: Any) -> str:
+        if isinstance(value, (int, float)) and float(value) > 0:
+            try:
+                return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return "unknown"
+        parsed = self._parse_remote_timestamp(str(value or ""))
+        if parsed is None:
+            return "unknown"
+        try:
+            return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+
+    def _local_save_is_newer(self, local_meta: Dict[str, Any], cloud_meta: Dict[str, Any]) -> bool:
+        local_ts = float(local_meta.get("timestamp", 0.0) or 0.0)
+        remote_dt = self._parse_remote_timestamp(str(cloud_meta.get("updated_at", "") or ""))
+        if local_ts > 0 and remote_dt is not None:
+            try:
+                return local_ts >= remote_dt.timestamp()
+            except Exception:
+                pass
+        return int(local_meta.get("day", 0) or 0) >= int(cloud_meta.get("day", 0) or 0)
+
+    def _complete_offline_startup(self) -> None:
+        self.game.SAVE_FILE = Game.SAVE_FILE
+        self.game.bound_user_id = ""
+        self._resolve_startup_save(None)
+
+    def _complete_authenticated_startup(self, online_greeting: Optional[str]) -> None:
+        self._resolve_startup_save(online_greeting or "Merchant")
+
+    def _resolve_startup_save(self, online_greeting: Optional[str]) -> None:
+        is_online = bool(
+            online_greeting and self.online and getattr(self.online, "is_online", False)
+            and self.online.auth.user_id
+        )
+        is_new_game = True
+        cloud_meta: Optional[Dict[str, Any]] = None
+
+        if is_online and self.online and self.online.auth.user_id:
+            user_id = self.online.auth.user_id
+            acct_file = Game.save_path_for_user(user_id)
+            self.game.SAVE_FILE = acct_file
+            self.game.bound_user_id = user_id
+
+            has_local = os.path.exists(acct_file)
+            unbound_path = Game.SAVE_FILE
+            if not has_local and os.path.exists(unbound_path):
+                unbound_meta = self._peek_local_save(unbound_path)
+                if unbound_meta:
+                    bind_pick = BindSaveDialog(
+                        self,
+                        online_greeting or "Merchant",
+                        int(unbound_meta.get("day", 0) or 0),
+                        float(unbound_meta.get("gold", 0.0) or 0.0),
+                    ).choose()
+                    if bind_pick == "bind":
+                        shutil.copy2(unbound_path, acct_file)
+                        has_local = True
+        else:
+            self.game.SAVE_FILE = Game.SAVE_FILE
+            self.game.bound_user_id = ""
+            has_local = os.path.exists(self.game.SAVE_FILE)
+
+        local_meta = self._peek_local_save(self.game.SAVE_FILE, self.game.bound_user_id if is_online else "") if has_local else None
+
+        if is_online and self.online:
+            try:
+                meta_res = self.online.saves.list_saves()
+                if meta_res and getattr(meta_res, "success", False):
+                    rows = meta_res.data if isinstance(meta_res.data, list) else []
+                    if rows:
+                        cloud_meta = rows[0]
+            except Exception:
+                cloud_meta = None
+
+        if local_meta and cloud_meta and self.online:
+            local_newer = self._local_save_is_newer(local_meta, cloud_meta)
+            pick = CloudSaveChoiceDialog(
+                self,
+                username=online_greeting or "Merchant",
+                local_day=int(local_meta.get("day", 0) or 0),
+                local_ts=self._format_save_timestamp(local_meta.get("timestamp", 0.0)),
+                local_gold=float(local_meta.get("gold", 0.0) or 0.0),
+                cloud_day=int(cloud_meta.get("day", 0) or 0),
+                cloud_ts=self._format_save_timestamp(cloud_meta.get("updated_at", "")),
+                cloud_gold=float(cloud_meta.get("gold", 0.0) or 0.0),
+                local_newer=local_newer,
+            ).choose()
+
+            if pick == "cloud":
+                pull_res = self.online.saves.download_save()
+                if pull_res and getattr(pull_res, "success", False) and self._write_cloud_to_disk(pull_res) and self.game.load_game():
+                    is_new_game = False
+                    self._last_synced_day = self.game._absolute_day()
+                else:
+                    err = str(getattr(pull_res, "error", "no response") if pull_res else "no response")
+                    self.message_bar.warn(f"Cloud fetch failed ({err}) — local save loaded.")
+                    if local_meta and self.game.load_game():
+                        is_new_game = False
+                        self._last_synced_day = self.game._absolute_day()
+            elif pick == "local":
+                if self.game.load_game():
+                    is_new_game = False
+                    self._last_synced_day = self.game._absolute_day()
+                    QTimer.singleShot(2500, self._push_cloud_save)
+            else:
+                is_new_game = True
+
+        elif local_meta:
+            if self.game.load_game():
+                is_new_game = False
+                self._last_synced_day = self.game._absolute_day()
+
+        elif cloud_meta and self.online:
+            pull_res = self.online.saves.download_save()
+            if pull_res and getattr(pull_res, "success", False) and self._write_cloud_to_disk(pull_res) and self.game.load_game():
+                is_new_game = False
+                self._last_synced_day = self.game._absolute_day()
+            else:
+                self.message_bar.warn("Cloud load failed — starting a new game.")
+
+        if is_new_game:
+            if online_greeting:
+                self.game.player_name = online_greeting.strip() or "Merchant"
+            else:
+                default_name = self.game.player_name or "Merchant"
+                name = _popup_get_text(
+                    self,
+                    "New Game",
+                    "Enter your merchant name.",
+                    default=default_name,
+                    placeholder="Merchant",
+                    confirm_text="Start Game",
+                )
+                self.game.player_name = (name or default_name or "Merchant").strip() or "Merchant"
+
+        self._stop_verification_server()
+        self.goto("dashboard")
+        self.refresh()
+
+        if online_greeting:
+            self.message_bar.ok(f"Signed in as {online_greeting}.")
+            QTimer.singleShot(250, self._refresh_inbox_badge)
+            QTimer.singleShot(400, self._push_online_presence)
+            QTimer.singleShot(650, self._push_leaderboard)
+            QTimer.singleShot(900, self._update_sync_status)
+            QTimer.singleShot(1200, self._start_cloud_sync)
+
     def _do_sync(self) -> None:
         """Trigger a cloud save and update the sync status label."""
         if self.online is None:
@@ -3478,9 +3764,82 @@ class GameApp(QMainWindow):
         if hasattr(self, "game_header"):
             self.game_header.set_sync_status("syncing\u2026", P.amber)
         self._do_save()
+        self._push_online_presence()
+        self._push_leaderboard()
         self._push_cloud_save()
 
-    def _push_cloud_save(self) -> None:
+    def _start_cloud_sync(self) -> None:
+        if self.online is None or not getattr(self.online, "is_online", False):
+            self._cloud_sync_timer.stop()
+            return
+        if not self._cloud_sync_timer.isActive():
+            self._cloud_sync_timer.start()
+        self._auto_save_and_sync()
+
+    def _auto_save_and_sync(self) -> None:
+        if self.online is None or not getattr(self.online, "is_online", False):
+            self._cloud_sync_timer.stop()
+            self._update_sync_status()
+            return
+        try:
+            self._accumulate_session_time()
+            self.game.save_game(silent=True)
+        except Exception as exc:
+            self.message_bar.err(f"Auto-save failed: {exc}")
+            if hasattr(self, "game_header"):
+                self.game_header.set_sync_status("(sync failed)", P.red)
+            return
+        self._push_online_presence()
+        self._push_leaderboard()
+        self._push_cloud_save(show_failures=False)
+
+    def _push_online_presence(self) -> None:
+        """Push lightweight presence state for friends and public profile surfaces."""
+        online = getattr(self, "online", None)
+        if online is None or not getattr(online, "is_online", False):
+            return
+        try:
+            online.profile.update_presence(
+                self.game._net_worth(),
+                getattr(getattr(self.game, "current_area", None), "value", ""),
+                guild_id=getattr(self, "_cached_guild_id", "") or "",
+                guild_name=getattr(self, "_cached_guild_name", "") or "",
+                guild_role=getattr(self, "_cached_guild_role", "") or "",
+            )
+        except Exception:
+            pass
+
+    def _push_leaderboard(self, done_callback: Optional[Callable[[], None]] = None) -> None:
+        """Upsert the current player's leaderboard row."""
+        online = getattr(self, "online", None)
+        if online is None or not getattr(online, "is_online", False):
+            if done_callback is not None:
+                _queue_ui(self, done_callback)
+            return
+        try:
+            def _cb(_result: Any) -> None:
+                if done_callback is not None:
+                    _queue_ui(self, done_callback)
+
+            online.leaderboard.submit_score(
+                gold=self.game.inventory.gold,
+                reputation=self.game.reputation,
+                day=self.game._absolute_day(),
+                net_worth=self.game._net_worth(),
+                lifetime_gold=float(getattr(self.game, "lifetime_gold", self.game.inventory.gold) or self.game.inventory.gold),
+                title=str(getattr(self.game, "active_title", "") or ""),
+                player_name=self.game.player_name or "",
+                guild_id=getattr(self, "_cached_guild_id", "") or "",
+                guild_name=getattr(self, "_cached_guild_name", "") or "",
+                guild_role=getattr(self, "_cached_guild_role", "") or "",
+                area=getattr(getattr(self.game, "current_area", None), "value", ""),
+                callback=_cb,
+            )
+        except Exception:
+            if done_callback is not None:
+                _queue_ui(self, done_callback)
+
+    def _push_cloud_save(self, *, show_failures: bool = True) -> None:
         """Push the latest local save to cloud storage if online auth is active."""
         online = getattr(self, "online", None)
         if online is None or not getattr(online, "is_online", False):
@@ -3489,23 +3848,20 @@ class GameApp(QMainWindow):
         try:
             with open(self.game.SAVE_FILE, "rb") as f:
                 payload = f.read()
-            save_data = json.loads(
-                zlib.decompress(base64.b64decode(payload)).decode("utf-8")
-            )
         except Exception as exc:
-            self.message_bar.err(f"Cloud sync preparation failed: {exc}")
+            if show_failures:
+                self.message_bar.err(f"Cloud sync preparation failed: {exc}")
             if hasattr(self, "game_header"):
                 self.game_header.set_sync_status("(sync failed)", P.red)
             return
 
         meta = {
-            "player_name": getattr(self.game, "player_name", "Merchant"),
-            "day": getattr(self.game, "day", 1),
-            "year": getattr(self.game, "year", 1),
-            "season": getattr(getattr(self.game, "season", None), "name", "SPRING"),
-            "area": getattr(getattr(self.game, "current_area", None), "name", "CITY"),
-            "net_worth": getattr(self.game, "_net_worth", lambda: 0)(),
+            "day": self.game._absolute_day(),
+            "gold": float(getattr(self.game.inventory, "gold", 0.0) or 0.0),
+            "reputation": int(getattr(self.game, "reputation", 0) or 0),
+            "version": str(getattr(self.game, "version", 2) or 2),
         }
+        save_data = {"compressed_b64": base64.b64encode(payload).decode("ascii")}
 
         def _on_done(result: Any) -> None:
             def _apply() -> None:
@@ -3519,8 +3875,9 @@ class GameApp(QMainWindow):
                         getattr(result, "error", "Cloud sync failed.")
                         if result else "Cloud sync failed."
                     )
-                    self.message_bar.err(err_txt)
-            QTimer.singleShot(0, _apply)
+                    if show_failures:
+                        self.message_bar.err(err_txt)
+            _queue_ui(self, _apply)
 
         online.sync.push(save_data, meta=meta, slot=1, callback=_on_done)
 
@@ -3536,7 +3893,7 @@ class GameApp(QMainWindow):
             if queue_depth:
                 self.game_header.set_sync_status(f"(queued {queue_depth})", P.amber)
             else:
-                self.game_header.set_sync_status("(not synced yet)", P.amber)
+                self.game_header.set_sync_status("(awaiting first sync)", P.amber)
             return
         elapsed = int(time.time() - self._last_sync_time)
         if elapsed < 60:
@@ -3565,7 +3922,7 @@ class GameApp(QMainWindow):
                     if getattr(result, "success", False) else 0
                 )
                 self.game_header.set_inbox_badge(unread)
-            QTimer.singleShot(0, _apply)
+            _queue_ui(self, _apply)
 
         inbox.get_unread_count(callback=_on_done)
 
@@ -3602,6 +3959,15 @@ class GameApp(QMainWindow):
                 return False
             payload_b64 = str(data.get("payload_b64", "") or "")
             if not payload_b64:
+                save_blob = data.get("save_data", {})
+                if isinstance(save_blob, str):
+                    try:
+                        save_blob = json.loads(save_blob)
+                    except Exception:
+                        save_blob = {}
+                if isinstance(save_blob, dict):
+                    payload_b64 = str(save_blob.get("compressed_b64", "") or save_blob.get("payload_b64", "") or "")
+            if not payload_b64:
                 return False
             raw_bytes = base64.b64decode(payload_b64)
             os.makedirs(os.path.dirname(self.game.SAVE_FILE), exist_ok=True)
@@ -3617,7 +3983,7 @@ class GameApp(QMainWindow):
             return
         try:
             def _cb(res: Any) -> None:
-                QTimer.singleShot(0, lambda: self._apply_cloud_restore(res))
+                _queue_ui(self, lambda: self._apply_cloud_restore(res))
             self.online.sync.pull(callback=_cb)
             self.message_bar.info("Fetching cloud save...")
         except Exception:
@@ -4061,11 +4427,14 @@ class AppDialog(QDialog):
 
     def center_on_parent(self) -> None:
         par = self.parentWidget()
-        if par and hasattr(par, "geometry"):
-            pg = par.geometry()
+        host = par.window() if par is not None else None
+        if host and hasattr(host, "geometry"):
+            if self.width() <= UIScale.px(120) or self.height() <= UIScale.px(100):
+                self.adjustSize()
+            pg = host.geometry()
             self.move(
-                pg.x() + (pg.width() - self.width()) // 2,
-                pg.y() + (pg.height() - self.height()) // 2,
+                pg.x() + max(0, (pg.width() - self.width()) // 2),
+                pg.y() + max(0, (pg.height() - self.height()) // 2),
             )
 
 
@@ -5447,6 +5816,548 @@ def _popup_choose(
     return ChoiceListDialog(parent, title, prompt, items, confirm_text=confirm_text).choose()
 
 
+def _queue_ui(target: QObject, fn: Callable[[], None]) -> None:
+    """Run *fn* on the target object's thread at the next event-loop turn."""
+    QTimer.singleShot(0, target, fn)
+
+
+class RegisterDialog(AppDialog):
+    """Create-account dialog for the launch screen."""
+
+    def __init__(self, app: "GameApp", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent or app, "Create Merchant Account")
+        self._app = app
+        self._result_message = ""
+        self.setFixedWidth(UIScale.px(430))
+
+        root = self.body_layout(
+            margins=(UIScale.px(16), UIScale.px(14), UIScale.px(16), UIScale.px(16)),
+            spacing=UIScale.px(10),
+        )
+
+        intro = QLabel(
+            "Create an online merchant account to sync saves, climb the leaderboard, and use guilds and friends.",
+            self._body,
+        )
+        intro.setFont(Fonts.mixed)
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        root.addWidget(intro)
+
+        self._username = self._add_field(root, "Merchant Name")
+        self._email = self._add_field(root, "Email Address")
+        self._password = self._add_field(root, "Password", password=True)
+        self._confirm = self._add_field(root, "Confirm Password", password=True)
+
+        self._status = QLabel("", self._body)
+        self._status.setFont(Fonts.mixed_small)
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(f"color:{P.red}; background:transparent;")
+        root.addWidget(self._status)
+
+        btns = QHBoxLayout()
+        cancel_btn = MtButton("Cancel", self._body, role="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        self._create_btn = MtButton("Create Account", self._body)
+        self._create_btn.clicked.connect(self._do_register)
+        btns.addStretch()
+        btns.addWidget(cancel_btn)
+        btns.addWidget(self._create_btn)
+        root.addLayout(btns)
+
+        self.center_on_parent()
+        QTimer.singleShot(0, self._username.setFocus)
+
+    def _add_field(self, layout: QVBoxLayout, label: str, password: bool = False) -> QLineEdit:
+        lbl = QLabel(label, self._body)
+        lbl.setFont(Fonts.mixed_small)
+        lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        layout.addWidget(lbl)
+
+        edit = QLineEdit(self._body)
+        edit.setFont(Fonts.mixed_bold)
+        if password:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(edit)
+        return edit
+
+    def _set_status(self, text: str, color: str = "") -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color:{color or P.red}; background:transparent;")
+
+    def _set_busy(self, busy: bool) -> None:
+        self._create_btn.setEnabled(not busy)
+        self._username.setEnabled(not busy)
+        self._email.setEnabled(not busy)
+        self._password.setEnabled(not busy)
+        self._confirm.setEnabled(not busy)
+
+    def _do_register(self) -> None:
+        username = self._username.text().strip()
+        email = self._email.text().strip()
+        password = self._password.text()
+        confirm = self._confirm.text()
+
+        if not username:
+            self._set_status("Please enter a merchant name.")
+            return
+        if not email or "@" not in email:
+            self._set_status("Please enter a valid email address.")
+            return
+        if len(password) < 6:
+            self._set_status("Password must be at least 6 characters.")
+            return
+        if password != confirm:
+            self._set_status("Passwords do not match.")
+            return
+        if not self._app.online:
+            self._set_status("Online services are unavailable.")
+            return
+
+        self._set_busy(True)
+        self._set_status("Creating account…", P.fg_dim)
+
+        redirect_url = ""
+        if hasattr(self._app.online, "verification"):
+            self._app.online.verification.start()
+            redirect_url = self._app.online.verification.REDIRECT_URL
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_result(r))
+
+        self._app.online.auth.sign_up(
+            email,
+            password,
+            username,
+            redirect_to=redirect_url,
+            callback=_cb,
+        )
+
+    def _handle_result(self, res: Any) -> None:
+        if not getattr(res, "success", False):
+            msg = str(getattr(res, "error", "Registration failed.") or "Registration failed.")
+            msg_lo = msg.lower()
+            if "already registered" in msg_lo or "already exists" in msg_lo:
+                msg = "An account with this email already exists."
+            elif "invalid email" in msg_lo:
+                msg = "Please enter a valid email address."
+            elif "password" in msg_lo and ("weak" in msg_lo or "short" in msg_lo):
+                msg = "Password is too weak. Use at least 8 characters."
+            self._set_status(msg)
+            self._set_busy(False)
+            return
+
+        action = (getattr(res, "data", None) or {}).get("action")
+        if action == "confirm_email":
+            self._result_message = "Account created. Check your inbox, confirm your email, then sign in here."
+        else:
+            self._result_message = "Account created. You can sign in now."
+        self.accept()
+
+    def outcome_message(self) -> str:
+        return self._result_message
+
+
+class BindSaveDialog(AppDialog):
+    """Prompt to bind an unlinked local save to the signed-in account."""
+
+    def __init__(self, parent: Optional[QWidget], username: str, unbound_day: int, unbound_gold: float) -> None:
+        super().__init__(parent, f"Welcome, {username}!")
+        self._choice = "fresh"
+        self.setFixedWidth(UIScale.px(460))
+
+        root = self.body_layout(
+            margins=(UIScale.px(18), UIScale.px(16), UIScale.px(18), UIScale.px(18)),
+            spacing=UIScale.px(10),
+        )
+        title = QLabel("An unlinked local save was found on this device.", self._body)
+        title.setFont(Fonts.mixed_bold)
+        title.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        root.addWidget(title)
+
+        summary = QLabel(f"Day {unbound_day:,}  •  {unbound_gold:,.0f}g", self._body)
+        summary.setFont(Fonts.mono)
+        summary.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        root.addWidget(summary)
+
+        warn = QLabel(
+            "Linking copies this device save into your account-specific save slot. Future saves on this account will be bound to this profile.",
+            self._body,
+        )
+        warn.setWordWrap(True)
+        warn.setFont(Fonts.mixed_small)
+        warn.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        root.addWidget(warn)
+
+        btns = QHBoxLayout()
+        bind_btn = MtButton("Link Existing Save", self._body)
+        bind_btn.clicked.connect(lambda: self._pick("bind"))
+        fresh_btn = MtButton("Start Fresh", self._body, role="danger")
+        fresh_btn.clicked.connect(lambda: self._pick("fresh"))
+        btns.addWidget(bind_btn)
+        btns.addWidget(fresh_btn)
+        btns.addStretch()
+        root.addLayout(btns)
+
+        self.center_on_parent()
+
+    def _pick(self, value: str) -> None:
+        self._choice = value
+        self.accept()
+
+    def choose(self) -> str:
+        self.exec()
+        return self._choice
+
+
+class CloudSaveChoiceDialog(AppDialog):
+    """Choose between local and cloud saves after sign-in."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        *,
+        username: str,
+        local_day: int,
+        local_ts: str,
+        local_gold: float,
+        cloud_day: int,
+        cloud_ts: str,
+        cloud_gold: float,
+        local_newer: bool,
+    ) -> None:
+        super().__init__(parent, f"Welcome back, {username}!")
+        self._choice: Optional[str] = None
+        self.resize(UIScale.px(760), UIScale.px(360))
+
+        root = self.body_layout(
+            margins=(UIScale.px(18), UIScale.px(16), UIScale.px(18), UIScale.px(18)),
+            spacing=UIScale.px(14),
+        )
+        intro = QLabel("Choose which progress you want to continue with.", self._body)
+        intro.setFont(Fonts.mixed_bold)
+        intro.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        root.addWidget(intro)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(UIScale.px(14))
+        cards.addWidget(self._build_card(
+            "Local Save",
+            local_day,
+            local_gold,
+            local_ts,
+            local_newer,
+            "local",
+        ))
+        cards.addWidget(self._build_card(
+            "Cloud Save",
+            cloud_day,
+            cloud_gold,
+            cloud_ts,
+            not local_newer,
+            "cloud",
+        ))
+        root.addLayout(cards)
+
+        new_btn = MtButton("Start New Game Instead", self._body, role="danger")
+        new_btn.clicked.connect(self.reject)
+        root.addWidget(new_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.center_on_parent()
+
+    def _build_card(
+        self,
+        label: str,
+        day: int,
+        gold: float,
+        stamp: str,
+        newer: bool,
+        value: str,
+    ) -> QFrame:
+        frame = QFrame(self._body)
+        frame.setObjectName("dashPanel")
+        frame.setStyleSheet(
+            f"QFrame#dashPanel{{background:{P.bg_card}; border:1px solid {P.border_light if newer else P.border}; border-radius:{UIScale.px(8)}px;}}"
+        )
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(UIScale.px(16), UIScale.px(14), UIScale.px(16), UIScale.px(14))
+        lay.setSpacing(UIScale.px(8))
+
+        hdr = QLabel(label, frame)
+        hdr.setFont(Fonts.title)
+        hdr.setStyleSheet(f"color:{P.cream}; background:transparent;")
+        lay.addWidget(hdr)
+
+        badge = QLabel("Newer copy" if newer else "Available", frame)
+        badge.setFont(Fonts.mixed_small_bold)
+        badge.setStyleSheet(f"color:{P.gold if newer else P.fg_dim}; background:transparent;")
+        lay.addWidget(badge)
+
+        body = QLabel(
+            f"Day {day:,}\n{gold:,.0f}g\n{stamp}",
+            frame,
+        )
+        body.setFont(Fonts.mono_small)
+        body.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        lay.addWidget(body)
+        lay.addStretch()
+
+        btn = MtButton("Load This Save", frame, role="primary" if newer else "secondary")
+        btn.clicked.connect(lambda: self._pick(value))
+        lay.addWidget(btn)
+        return frame
+
+    def _pick(self, value: str) -> None:
+        self._choice = value
+        self.accept()
+
+    def choose(self) -> Optional[str]:
+        if self.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return self._choice
+
+
+class LaunchScreen(Screen):
+    """Startup auth screen shown before entering the main game shell."""
+
+    def build(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(UIScale.px(24), UIScale.px(24), UIScale.px(24), UIScale.px(24))
+        outer.setSpacing(0)
+
+        top_band = QFrame(self)
+        top_band.setFixedHeight(UIScale.px(30))
+        top_band.setStyleSheet(f"background:{P.bg_dialog_hdr}; border:none;")
+        outer.addWidget(top_band)
+
+        mid = QWidget(self)
+        mid.setStyleSheet(f"background:{P.bg};")
+        mid_lay = QVBoxLayout(mid)
+        mid_lay.setContentsMargins(0, 0, 0, 0)
+        mid_lay.addStretch()
+
+        wrap = QHBoxLayout()
+        wrap.addStretch()
+
+        card = QFrame(mid)
+        card.setObjectName("launchCard")
+        card.setStyleSheet(
+            f"QFrame#launchCard{{background:{P.bg_panel}; border:2px solid {P.border_light}; border-radius:{UIScale.px(10)}px;}}"
+        )
+        card.setFixedWidth(UIScale.px(520))
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(UIScale.px(28), UIScale.px(24), UIScale.px(28), UIScale.px(24))
+        card_lay.setSpacing(UIScale.px(10))
+
+        title = QLabel("MERCHANT TYCOON", card)
+        title.setFont(Fonts.title_large)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(f"color:{P.border_light}; background:transparent;")
+        card_lay.addWidget(title)
+
+        subtitle = QLabel("Expanded Edition", card)
+        subtitle.setFont(Fonts.mixed_small)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        card_lay.addWidget(subtitle)
+
+        line = QFrame(card)
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background:{P.border_light}; border:none;")
+        card_lay.addWidget(line)
+
+        portal = QLabel("Merchant Portal", card)
+        portal.setFont(Fonts.heading)
+        portal.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        card_lay.addWidget(portal)
+
+        self._email = self._field(card_lay, "Email Address")
+        self._password = self._field(card_lay, "Password", password=True)
+
+        extra = QHBoxLayout()
+        self._remember = QCheckBox("Remember me", card)
+        self._remember.setChecked(True)
+        self._remember.setFont(Fonts.mixed_small)
+        self._remember.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        extra.addWidget(self._remember)
+        extra.addStretch()
+        forgot_btn = QPushButton("Reset password", card)
+        forgot_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        forgot_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{P.border_light};border:none;padding:0px;}}"
+            f"QPushButton:hover{{color:{P.gold};}}"
+        )
+        forgot_btn.setFont(Fonts.mixed_small)
+        forgot_btn.clicked.connect(self._forgot_password)
+        extra.addWidget(forgot_btn)
+        card_lay.addLayout(extra)
+
+        btns = QHBoxLayout()
+        self._signin_btn = MtButton("Sign In", card)
+        self._signin_btn.clicked.connect(self._do_sign_in)
+        signup_btn = MtButton("Create Account", card, role="secondary")
+        signup_btn.clicked.connect(self._do_register)
+        btns.addWidget(self._signin_btn)
+        btns.addWidget(signup_btn)
+        card_lay.addLayout(btns)
+
+        sep_row = QHBoxLayout()
+        left_sep = QFrame(card)
+        left_sep.setFrameShape(QFrame.Shape.HLine)
+        left_sep.setStyleSheet(f"background:{P.border}; border:none;")
+        right_sep = QFrame(card)
+        right_sep.setFrameShape(QFrame.Shape.HLine)
+        right_sep.setStyleSheet(f"background:{P.border}; border:none;")
+        sep_row.addWidget(left_sep, 1)
+        or_lbl = QLabel("or", card)
+        or_lbl.setFont(Fonts.mixed_small)
+        or_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        sep_row.addWidget(or_lbl)
+        sep_row.addWidget(right_sep, 1)
+        card_lay.addLayout(sep_row)
+
+        self._offline_btn = MtButton("Play Offline (local save only)", card, role="nav")
+        self._offline_btn.clicked.connect(self._play_offline)
+        card_lay.addWidget(self._offline_btn)
+
+        self._status = QLabel("", card)
+        self._status.setWordWrap(True)
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setFont(Fonts.mixed_small)
+        self._status.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        card_lay.addWidget(self._status)
+
+        wrap.addWidget(card)
+        wrap.addStretch()
+        mid_lay.addLayout(wrap)
+        mid_lay.addStretch()
+        outer.addWidget(mid, 1)
+
+        bottom_band = QFrame(self)
+        bottom_band.setFixedHeight(UIScale.px(30))
+        bottom_band.setStyleSheet(f"background:{P.bg_dialog_hdr}; border:none;")
+        outer.addWidget(bottom_band)
+
+        self._email.returnPressed.connect(self._password.setFocus)
+        self._password.returnPressed.connect(self._do_sign_in)
+
+        if not self.app.online:
+            self._set_status("Online services are unavailable. You can still play offline.", P.amber)
+            self._signin_btn.setEnabled(False)
+
+    def on_show(self) -> None:
+        QTimer.singleShot(0, self._email.setFocus)
+
+    def _field(self, layout: QVBoxLayout, label: str, password: bool = False) -> QLineEdit:
+        lbl = QLabel(label, self)
+        lbl.setFont(Fonts.mixed_small)
+        lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        layout.addWidget(lbl)
+        edit = QLineEdit(self)
+        edit.setFont(Fonts.mixed_bold)
+        if password:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(edit)
+        return edit
+
+    def _set_status(self, text: str, color: str = "") -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color:{color or P.fg_dim}; background:transparent;")
+
+    def _set_busy(self, busy: bool) -> None:
+        self._signin_btn.setEnabled(not busy and bool(self.app.online))
+        self._offline_btn.setEnabled(not busy)
+        self._email.setEnabled(not busy)
+        self._password.setEnabled(not busy)
+        self._remember.setEnabled(not busy)
+
+    def _do_sign_in(self) -> None:
+        if not self.app.online:
+            self._set_status("Online services are unavailable. Use offline mode instead.", P.amber)
+            return
+
+        email = self._email.text().strip()
+        password = self._password.text()
+        if not email or "@" not in email:
+            self._set_status("Please enter a valid email address.", P.red)
+            return
+        if not password:
+            self._set_status("Please enter your password.", P.red)
+            return
+
+        self._set_busy(True)
+        self._set_status("Signing in…", P.fg_dim)
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_sign_in(r))
+
+        self.app.online.auth.sign_in(email, password, callback=_cb)
+
+    def _handle_sign_in(self, res: Any) -> None:
+        if not getattr(res, "success", False):
+            msg = str(getattr(res, "error", "Sign-in failed.") or "Sign-in failed.")
+            msg_lo = msg.lower()
+            if "invalid login" in msg_lo or "invalid credentials" in msg_lo:
+                msg = "Invalid email or password."
+            elif "email not confirmed" in msg_lo:
+                msg = "Email not confirmed. Check your inbox, then sign in again."
+            elif "too many requests" in msg_lo:
+                msg = "Too many attempts. Wait a moment and try again."
+            self._set_status(msg, P.red)
+            self._set_busy(False)
+            return
+
+        if not self._remember.isChecked():
+            self.app.online.auth.clear_saved_session()
+
+        username = self.app.online.auth.username or "Merchant"
+        self._set_status(f"Welcome back, {username}. Preparing your save data…", P.green)
+        QTimer.singleShot(250, lambda: self.app._complete_authenticated_startup(username))
+
+    def _do_register(self) -> None:
+        dlg = RegisterDialog(self.app, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._set_status(dlg.outcome_message(), P.green)
+
+    def _forgot_password(self) -> None:
+        if not self.app.online:
+            self._set_status("Online services are unavailable.", P.red)
+            return
+        email = _popup_get_text(
+            self,
+            "Reset Password",
+            "Enter the email address for your account.",
+            default=self._email.text().strip(),
+            placeholder="merchant@example.com",
+            confirm_text="Send Email",
+        )
+        if email is None:
+            return
+        email = email.strip()
+        if not email or "@" not in email:
+            self._set_status("Please enter a valid email address.", P.red)
+            return
+
+        self._set_status("Sending reset email…", P.fg_dim)
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, addr=email: self._handle_reset(r, addr))
+
+        self.app.online.auth.request_password_reset(email, callback=_cb)
+
+    def _handle_reset(self, res: Any, email: str) -> None:
+        if getattr(res, "success", False):
+            self._set_status(f"Reset email sent to {email}. Follow the link in your inbox.", P.green)
+            return
+        self._set_status(str(getattr(res, "error", "Could not send reset email.") or "Could not send reset email."), P.red)
+
+    def _play_offline(self) -> None:
+        self._set_busy(True)
+        self._set_status("Loading local save…", P.fg_dim)
+        QTimer.singleShot(100, self.app._complete_offline_startup)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIGNATURE DIALOG  —  parchment-style signing prompt for binding agreements
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6222,6 +7133,1258 @@ class InboxDialog(AppDialog):
         if hasattr(self._app, "game_header"):
             self._app.game_header.set_inbox_badge(0)
         self._load_messages()
+
+
+class ProfileDialog(AppDialog):
+    """Modal player profile dialog with identity, stats, and social summary."""
+
+    _STAT_COLS = [
+        ("label", "Statistic", 240),
+        ("value", "Value", 320),
+    ]
+    _FRIEND_COLS = [
+        ("status", "Status", 84),
+        ("merchant", "Merchant", 230),
+        ("net_worth", "Net Worth", 120, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+    ]
+
+    def __init__(self, app: "GameApp", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent or app, "Profile")
+        self._app = app
+        self._profile_data: Optional[Dict[str, Any]] = None
+        self._guild_data: Optional[Dict[str, Any]] = None
+        self._friends_data: List[Dict[str, Any]] = []
+        self._pending_data: List[Dict[str, Any]] = []
+        self.resize(UIScale.px(760), UIScale.px(700))
+        self._build()
+        self.refresh()
+        self.center_on_parent()
+
+    def _build(self) -> None:
+        root = self.body_layout(
+            margins=(UIScale.px(14), UIScale.px(12), UIScale.px(14), UIScale.px(14)),
+            spacing=UIScale.px(10),
+        )
+
+        hero = QFrame(self._body)
+        hero.setObjectName("dashPanel")
+        hero_lay = QVBoxLayout(hero)
+        hero_lay.setContentsMargins(UIScale.px(14), UIScale.px(12), UIScale.px(14), UIScale.px(12))
+        hero_lay.setSpacing(UIScale.px(6))
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(UIScale.px(8))
+        self._name_lbl = QLabel("Merchant", hero)
+        self._name_lbl.setFont(Fonts.title)
+        self._name_lbl.setStyleSheet(f"color:{P.cream}; background:transparent;")
+        name_row.addWidget(self._name_lbl)
+
+        self._disc_lbl = QLabel("", hero)
+        self._disc_lbl.setFont(Fonts.mono_small)
+        self._disc_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        name_row.addWidget(self._disc_lbl)
+        name_row.addStretch()
+
+        self._status_lbl = QLabel("Offline mode", hero)
+        self._status_lbl.setFont(Fonts.mixed_small_bold)
+        self._status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        name_row.addWidget(self._status_lbl)
+        hero_lay.addLayout(name_row)
+
+        self._title_lbl = QLabel("No title equipped", hero)
+        self._title_lbl.setFont(Fonts.mixed)
+        self._title_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        hero_lay.addWidget(self._title_lbl)
+
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(UIScale.px(12))
+        self._uuid_lbl = QLabel("UUID: —", hero)
+        self._uuid_lbl.setFont(Fonts.mono_small)
+        self._uuid_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        meta_row.addWidget(self._uuid_lbl)
+        self._email_lbl = QLabel("Email: —", hero)
+        self._email_lbl.setFont(Fonts.mono_small)
+        self._email_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        meta_row.addWidget(self._email_lbl)
+        meta_row.addStretch()
+        hero_lay.addLayout(meta_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(UIScale.px(6))
+        edit_name_btn = MtButton(f"{Sym.PROFILE}  Edit Name", hero, role="secondary")
+        edit_name_btn.clicked.connect(self._edit_name)
+        button_row.addWidget(edit_name_btn)
+        edit_title_btn = MtButton(f"{Sym.SKILLS}  Equip Title", hero, role="secondary")
+        edit_title_btn.clicked.connect(self._edit_title)
+        button_row.addWidget(edit_title_btn)
+        copy_uuid_btn = MtButton(f"{Sym.INFO}  Copy UUID", hero, role="secondary")
+        copy_uuid_btn.clicked.connect(self._copy_uuid)
+        button_row.addWidget(copy_uuid_btn)
+        button_row.addStretch()
+        social_btn = MtButton(f"{Sym.SOCIAL}  Open Social Hub", hero, role="primary")
+        social_btn.clicked.connect(self._open_social)
+        button_row.addWidget(social_btn)
+        hero_lay.addLayout(button_row)
+        root.addWidget(hero)
+
+        scroll = ScrollableFrame(self._body)
+        root.addWidget(scroll, 1)
+        body = QVBoxLayout(scroll.inner)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(UIScale.px(10))
+
+        stats_panel = QFrame(scroll.inner)
+        stats_panel.setObjectName("dashPanel")
+        stats_lay = QVBoxLayout(stats_panel)
+        stats_lay.setContentsMargins(UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(12))
+        stats_lay.setSpacing(UIScale.px(8))
+        stats_hdr = QLabel(f"{Sym.NETWORTH}  Player Stats", stats_panel)
+        stats_hdr.setFont(Fonts.mixed_bold)
+        stats_hdr.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        stats_lay.addWidget(stats_hdr)
+        self._stats_table = DataTable(stats_panel, self._STAT_COLS, row_height=24)
+        stats_lay.addWidget(self._stats_table)
+        body.addWidget(stats_panel)
+
+        social_panel = QFrame(scroll.inner)
+        social_panel.setObjectName("dashPanel")
+        social_lay = QVBoxLayout(social_panel)
+        social_lay.setContentsMargins(UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(12))
+        social_lay.setSpacing(UIScale.px(8))
+        social_hdr = QLabel(f"{Sym.SOCIAL}  Social Summary", social_panel)
+        social_hdr.setFont(Fonts.mixed_bold)
+        social_hdr.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        social_lay.addWidget(social_hdr)
+
+        self._guild_lbl = QLabel("Guild: Offline", social_panel)
+        self._guild_lbl.setFont(Fonts.mixed)
+        self._guild_lbl.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        social_lay.addWidget(self._guild_lbl)
+        self._friend_summary_lbl = QLabel("Friends: —", social_panel)
+        self._friend_summary_lbl.setFont(Fonts.mixed_small)
+        self._friend_summary_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        social_lay.addWidget(self._friend_summary_lbl)
+        self._recent_lbl = QLabel("Recent friends: —", social_panel)
+        self._recent_lbl.setWordWrap(True)
+        self._recent_lbl.setFont(Fonts.mixed_small)
+        self._recent_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        social_lay.addWidget(self._recent_lbl)
+        self._friends_table = DataTable(social_panel, self._FRIEND_COLS, row_height=24)
+        social_lay.addWidget(self._friends_table)
+        body.addWidget(social_panel)
+
+        progress_panel = QFrame(scroll.inner)
+        progress_panel.setObjectName("dashPanel")
+        progress_lay = QVBoxLayout(progress_panel)
+        progress_lay.setContentsMargins(UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(12))
+        progress_lay.setSpacing(UIScale.px(8))
+        progress_hdr = QLabel(f"{Sym.PROGRESS}  Progress", progress_panel)
+        progress_hdr.setFont(Fonts.mixed_bold)
+        progress_hdr.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        progress_lay.addWidget(progress_hdr)
+        self._ach_lbl = QLabel("Achievements: —", progress_panel)
+        self._ach_lbl.setFont(Fonts.mixed)
+        self._ach_lbl.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        progress_lay.addWidget(self._ach_lbl)
+        self._title_count_lbl = QLabel("Titles: —", progress_panel)
+        self._title_count_lbl.setFont(Fonts.mixed_small)
+        self._title_count_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        progress_lay.addWidget(self._title_count_lbl)
+        prog_btn_row = QHBoxLayout()
+        prog_btn_row.setSpacing(UIScale.px(6))
+        prog_btn = MtButton(f"{Sym.PROGRESS}  View Progress", progress_panel, role="secondary")
+        prog_btn.clicked.connect(self._open_progress)
+        prog_btn_row.addWidget(prog_btn)
+        settings_btn = MtButton(f"{Sym.SETTINGS}  Settings", progress_panel, role="secondary")
+        settings_btn.clicked.connect(self._open_settings)
+        prog_btn_row.addWidget(settings_btn)
+        prog_btn_row.addStretch()
+        progress_lay.addLayout(prog_btn_row)
+        body.addWidget(progress_panel)
+
+        options_panel = QFrame(scroll.inner)
+        options_panel.setObjectName("dashPanel")
+        options_lay = QHBoxLayout(options_panel)
+        options_lay.setContentsMargins(UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(10))
+        options_lay.setSpacing(UIScale.px(8))
+        self._sign_out_btn = MtButton(f"{Sym.NO}  Sign Out", options_panel, role="danger")
+        self._sign_out_btn.clicked.connect(self._sign_out)
+        options_lay.addWidget(self._sign_out_btn)
+        options_lay.addStretch()
+        body.addWidget(options_panel)
+        body.addStretch()
+
+    def refresh(self) -> None:
+        self._refresh_identity()
+        self._refresh_stats()
+        self._refresh_progress()
+        self._show_social_loading()
+        if self._app.online and self._app.online.is_online:
+            self._app._push_online_presence()
+            self._load_profile_async()
+            self._load_social_async()
+        else:
+            self._show_social_offline()
+
+    def _refresh_identity(self) -> None:
+        g = self._app.game
+        self._name_lbl.setText(g.player_name or "Merchant")
+        active_title = getattr(g, "active_title", "") or ""
+        title_def = TITLES_BY_ID.get(active_title)
+        self._title_lbl.setText(title_def["name"] if title_def else (active_title or "No title equipped"))
+
+        online = getattr(self._app, "online", None)
+        auth = getattr(online, "auth", None) if online else None
+        if not (online and online.is_online and auth):
+            self._disc_lbl.setText("")
+            self._status_lbl.setText("Offline mode")
+            self._status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            self._uuid_lbl.setText("UUID: —")
+            self._email_lbl.setText("Email: —")
+            self._sign_out_btn.setEnabled(False)
+            return
+
+        uid = auth.user_id or ""
+        disc = getattr(self._app, "_cached_disc", 0) or 0
+        self._disc_lbl.setText(f"#{disc:04d}" if disc else "")
+        self._status_lbl.setText("Online")
+        self._status_lbl.setStyleSheet(f"color:{P.green}; background:transparent;")
+        shown_uid = f"{uid[:8]}…{uid[-4:]}" if len(uid) > 12 else (uid or "—")
+        self._uuid_lbl.setText(f"UUID: {shown_uid}")
+        self._email_lbl.setText(f"Email: {self._obfuscate_email(auth.email or '—')}")
+        self._sign_out_btn.setEnabled(True)
+
+    def _refresh_stats(self) -> None:
+        g = self._app.game
+        total_secs = float(getattr(g, "time_played_seconds", 0.0) or 0.0)
+        if hasattr(self._app, "_session_start"):
+            total_secs += max(0.0, time.time() - self._app._session_start)
+        hours = int(total_secs // 3600)
+        minutes = int((total_secs % 3600) // 60)
+        rows = [
+            {"label": "Net Worth", "value": f"{g._net_worth():,.0f}g"},
+            {"label": "Gold (wallet)", "value": f"{g.inventory.gold:,.0f}g"},
+            {"label": "Bank Balance", "value": f"{g.bank_balance:,.2f}g"},
+            {"label": "Reputation", "value": str(g.reputation)},
+            {"label": "Time Played", "value": f"{hours}h {minutes}m"},
+            {"label": "Days In-Game", "value": str(g._absolute_day())},
+            {"label": "Current Area", "value": g.current_area.value},
+            {"label": "Lifetime Trades", "value": str(g.lifetime_trades)},
+            {"label": "Contracts Done", "value": str(g.ach_stats.get("contracts_completed", 0))},
+            {"label": "Titles Earned", "value": f"{len(getattr(g, 'earned_titles', []))}"},
+        ]
+        self._stats_table.load(rows)
+
+    def _refresh_progress(self) -> None:
+        g = self._app.game
+        ach_count = len(getattr(g, "achievements", set()))
+        total_ach = len(ACHIEVEMENTS)
+        title_count = len(getattr(g, "earned_titles", []))
+        self._ach_lbl.setText(f"Achievements: {ach_count} / {total_ach} unlocked")
+        self._title_count_lbl.setText(f"Titles: {title_count} / {len(TITLE_DEFINITIONS)} earned")
+
+    def _show_social_loading(self) -> None:
+        self._guild_lbl.setText("Guild: Loading…")
+        self._friend_summary_lbl.setText("Friends: Loading…")
+        self._recent_lbl.setText("Recent friends: Loading…")
+        self._friends_table.load([])
+
+    def _show_social_offline(self) -> None:
+        self._guild_lbl.setText("Guild: Offline")
+        self._friend_summary_lbl.setText("Friends: Sign in to use online social features")
+        self._recent_lbl.setText("Recent friends: —")
+        self._friends_table.load([])
+
+    def _load_profile_async(self) -> None:
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_profile_result(r))
+        self._app.online.profile.get_profile(callback=_cb)
+
+    def _load_social_async(self) -> None:
+        online = self._app.online
+        if not online:
+            return
+        def _guild_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_guild_result(r))
+        def _friends_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_friends_result(r))
+        def _pending_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_pending_result(r))
+        online.guilds.get_my_guild(callback=_guild_cb)
+        online.friends.list_friends_with_profiles(callback=_friends_cb)
+        online.friends.list_pending_requests(callback=_pending_cb)
+
+    def _apply_profile_result(self, res: Any) -> None:
+        if not self.isVisible():
+            return
+        if getattr(res, "success", False) and res.data is None:
+            username = self._app.online.auth.username or self._app.game.player_name or "Merchant"
+            def _create_cb(_result: Any) -> None:
+                _queue_ui(self, self._load_profile_async)
+            self._app.online.profile.create_profile(username=username, callback=_create_cb)
+            return
+        if not getattr(res, "success", False) or not isinstance(res.data, dict):
+            return
+        self._profile_data = res.data
+        disc = int(res.data.get("discriminator") or 0)
+        if disc:
+            self._app._cached_disc = disc
+            self._disc_lbl.setText(f"#{disc:04d}")
+        title_key = str(res.data.get("title", "") or "")
+        if title_key and not getattr(self._app.game, "active_title", ""):
+            self._app.game.active_title = title_key
+            title_def = TITLES_BY_ID.get(title_key)
+            self._title_lbl.setText(title_def["name"] if title_def else title_key)
+
+    def _apply_guild_result(self, res: Any) -> None:
+        self._guild_data = res.data if (getattr(res, "success", False) and isinstance(res.data, dict)) else None
+        if self._guild_data:
+            name = self._guild_data.get("name", "Unknown Guild")
+            count = int(self._guild_data.get("member_count", 0) or 0)
+            role_label = str(self._guild_data.get("my_role_label", self._guild_data.get("my_role", "")) or "")
+            self._app._cached_guild_id = str(self._guild_data.get("id", "") or "")
+            self._app._cached_guild_name = str(name or "")
+            self._app._cached_guild_role = role_label
+            role_text = f"  •  {role_label}" if role_label else ""
+            self._guild_lbl.setText(f"Guild: {name}{role_text}  •  {count} member{'s' if count != 1 else ''}")
+        else:
+            self._app._cached_guild_id = ""
+            self._app._cached_guild_name = ""
+            self._app._cached_guild_role = ""
+            self._guild_lbl.setText("Guild: No guild")
+
+    def _apply_friends_result(self, res: Any) -> None:
+        self._friends_data = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        self._render_social_summary()
+
+    def _apply_pending_result(self, res: Any) -> None:
+        self._pending_data = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        self._render_social_summary()
+
+    def _render_social_summary(self) -> None:
+        friend_count = len(self._friends_data)
+        pending_count = len(self._pending_data)
+        self._friend_summary_lbl.setText(f"Friends: {friend_count}  •  Pending requests: {pending_count}")
+        preview: List[str] = []
+        rows: List[Dict[str, Any]] = []
+        for item in self._friends_data[:5]:
+            profile = item.get("profile") or {}
+            status_text, _status_colour, tag = self._presence_label(profile.get("last_seen", ""))
+            name = self._player_label(profile)
+            nw = float(profile.get("last_networth", 0) or 0)
+            preview.append(name)
+            rows.append({
+                "status": status_text,
+                "merchant": name,
+                "net_worth": f"{nw:,.0f}g" if nw > 0 else "—",
+                "_tag": tag,
+            })
+        self._recent_lbl.setText("Recent friends: " + (", ".join(preview) if preview else "—"))
+        self._friends_table.load(rows)
+
+    def _edit_name(self) -> None:
+        current = self._app.game.player_name or "Merchant"
+        new_name = TextPromptDialog(
+            self,
+            "Edit Merchant Name",
+            "Enter your merchant name.",
+            default=current,
+            placeholder="Merchant name",
+            confirm_text="Save Name",
+        ).get_value()
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            self._app.message_bar.warn("Merchant name cannot be empty.")
+            return
+        self._app.game.player_name = new_name
+        self._app.message_bar.ok(f"Merchant name updated to {new_name}.")
+        online = self._app.online
+        if online and online.is_online:
+            try:
+                online.auth.update_username(new_name)
+                online.profile.update_profile({"username": new_name})
+            except Exception:
+                pass
+            self._app._push_leaderboard()
+        self.refresh()
+        self._app.refresh()
+
+    def _edit_title(self) -> None:
+        earned = list(getattr(self._app.game, "earned_titles", []))
+        options: List[str] = ["(No title)"]
+        label_to_id: Dict[str, str] = {"(No title)": ""}
+        for title_id in earned:
+            title_def = TITLES_BY_ID.get(title_id)
+            label = title_def["name"] if title_def else title_id
+            if label in label_to_id:
+                label = f"{label} [{title_id}]"
+            label_to_id[label] = title_id
+            options.append(label)
+        if len(options) == 1:
+            self._app.message_bar.info("Earn a title first, then equip it here.")
+            return
+        choice, ok = ChoiceListDialog(
+            self,
+            "Equip Title",
+            "Choose which earned title to display.",
+            options,
+            confirm_text="Equip",
+        ).choose()
+        if not ok:
+            return
+        title_id = label_to_id.get(choice, "")
+        self._app.game.active_title = title_id
+        if self._app.online and self._app.online.is_online:
+            try:
+                self._app.online.profile.set_active_title(title_id)
+            except Exception:
+                pass
+            self._app._push_leaderboard()
+        self.refresh()
+        self._app.refresh()
+        self._app.message_bar.ok("Active title updated.")
+
+    def _copy_uuid(self) -> None:
+        online = self._app.online
+        uid = online.auth.user_id if (online and online.is_online and online.auth.user_id) else ""
+        if not uid:
+            self._app.message_bar.warn("No UUID available while offline.")
+            return
+        QApplication.clipboard().setText(uid)
+        self._app.message_bar.ok("UUID copied to clipboard.")
+
+    def _open_social(self) -> None:
+        self.accept()
+        self._app.goto("social")
+
+    def _open_progress(self) -> None:
+        self.accept()
+        self._app.goto("progress")
+
+    def _open_settings(self) -> None:
+        self.accept()
+        self._app.goto("settings")
+
+    def _sign_out(self) -> None:
+        online = self._app.online
+        if not (online and online.is_online):
+            self._app.message_bar.warn("Not currently signed in.")
+            return
+        if not ConfirmDialog(
+            self,
+            "Sign Out",
+            "Sign out of your online account? Local play will remain available.",
+            confirm_text="Sign Out",
+            confirm_role="danger",
+        ).ask():
+            return
+
+        def _cb(_res: Any) -> None:
+            _queue_ui(self, self._after_sign_out)
+
+        online.auth.sign_out(callback=_cb)
+
+    def _after_sign_out(self) -> None:
+        self._app._cached_disc = 0
+        self._app._cached_guild_id = ""
+        self._app._cached_guild_name = ""
+        self._app._cached_guild_role = ""
+        self._app.game_header.set_inbox_badge(0)
+        self._app._update_sync_status()
+        self._app.message_bar.ok("Signed out successfully.")
+        self.refresh()
+        self._app.refresh()
+
+    @staticmethod
+    def _obfuscate_email(email: str) -> str:
+        if "@" not in email:
+            return email
+        local, domain = email.split("@", 1)
+        if len(local) <= 2:
+            return f"{'*' * len(local)}@{domain}"
+        return f"{local[:2]}{'*' * (len(local) - 2)}@{domain}"
+
+    @staticmethod
+    def _player_label(profile: Dict[str, Any]) -> str:
+        name = str(profile.get("username", "Unknown") or "Unknown")
+        disc = profile.get("discriminator", 0)
+        if isinstance(disc, int) and disc:
+            return f"{name} #{disc:04d}"
+        if disc:
+            return f"{name} #{disc}"
+        return name
+
+    @staticmethod
+    def _presence_label(last_seen: str) -> Tuple[str, str, str]:
+        if not last_seen:
+            return ("Offline", P.fg_dim, "dim")
+        try:
+            stamp = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            now = datetime.now(stamp.tzinfo) if stamp.tzinfo else datetime.utcnow()
+            age = (now - stamp).total_seconds()
+            if age < 300:
+                return ("Online", P.green, "green")
+            if age < 1800:
+                return ("Away", P.amber, "yellow")
+        except Exception:
+            pass
+        return ("Offline", P.fg_dim, "dim")
+
+
+class GuildRoleEditorDialog(AppDialog):
+    PERMISSION_LABELS: Tuple[Tuple[str, str], ...] = (
+        ("invite_members", "Invite members"),
+        ("kick_members", "Remove members"),
+        ("assign_roles", "Assign roles"),
+        ("edit_roles", "Edit roles"),
+        ("edit_policies", "Edit policies"),
+        ("edit_guild_profile", "Edit guild profile"),
+    )
+
+    def __init__(self, parent: Optional[QWidget], role: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(parent, "Guild Role")
+        self._role = role or {}
+        self.setFixedWidth(UIScale.px(460))
+
+        root = self.body_layout(
+            margins=(UIScale.px(16), UIScale.px(14), UIScale.px(16), UIScale.px(16)),
+            spacing=UIScale.px(10),
+        )
+
+        intro = QLabel("Define the role name, rank, and permissions. Higher rank appears higher in the roster.", self._body)
+        intro.setWordWrap(True)
+        intro.setFont(Fonts.mixed)
+        intro.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        root.addWidget(intro)
+
+        name_lbl = QLabel("Role name", self._body)
+        name_lbl.setFont(Fonts.mixed_small_bold)
+        root.addWidget(name_lbl)
+        self._name_edit = QLineEdit(self._body)
+        self._name_edit.setText(str(self._role.get("label", "") or ""))
+        self._name_edit.setPlaceholderText("Vice President")
+        self._name_edit.setFont(Fonts.mixed_bold)
+        root.addWidget(self._name_edit)
+
+        key_lbl = QLabel("Role key", self._body)
+        key_lbl.setFont(Fonts.mixed_small_bold)
+        root.addWidget(key_lbl)
+        self._key_edit = QLineEdit(self._body)
+        self._key_edit.setText(str(self._role.get("role_key", "") or ""))
+        self._key_edit.setPlaceholderText("vice_president")
+        self._key_edit.setFont(Fonts.mono_small)
+        root.addWidget(self._key_edit)
+
+        rank_lbl = QLabel("Role rank", self._body)
+        rank_lbl.setFont(Fonts.mixed_small_bold)
+        root.addWidget(rank_lbl)
+        self._rank_spin = QSpinBox(self._body)
+        self._rank_spin.setRange(1, 999)
+        self._rank_spin.setValue(int(self._role.get("rank", 100) or 100))
+        self._rank_spin.setFont(Fonts.mixed_bold)
+        root.addWidget(self._rank_spin)
+
+        perms_lbl = QLabel("Permissions", self._body)
+        perms_lbl.setFont(Fonts.mixed_small_bold)
+        root.addWidget(perms_lbl)
+
+        self._permission_checks: Dict[str, QCheckBox] = {}
+        perms = self._role.get("permissions") if isinstance(self._role.get("permissions"), dict) else {}
+        for key, label in self.PERMISSION_LABELS:
+            cb = QCheckBox(label, self._body)
+            cb.setChecked(bool(perms.get(key, False)))
+            cb.setFont(Fonts.mixed_small)
+            cb.setStyleSheet(f"color:{P.fg}; background:transparent;")
+            self._permission_checks[key] = cb
+            root.addWidget(cb)
+
+        role_key = str(self._role.get("role_key", "") or "")
+        if role_key:
+            self._key_edit.setEnabled(False)
+        if role_key == "president":
+            self._key_edit.setEnabled(False)
+            self._name_edit.setEnabled(False)
+            for cb in self._permission_checks.values():
+                cb.setEnabled(False)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = MtButton("Cancel", self._body, role="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = MtButton("Save Role", self._body)
+        save_btn.clicked.connect(self.accept)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        root.addLayout(btns)
+
+        self.center_on_parent()
+
+    def payload(self) -> Optional[Dict[str, Any]]:
+        if self.exec() != QDialog.DialogCode.Accepted:
+            return None
+        role_name = self._name_edit.text().strip() or self._key_edit.text().replace("_", " ").title().strip()
+        role_key = self._key_edit.text().strip() or role_name.lower().replace(" ", "_")
+        permissions = {key: cb.isChecked() for key, cb in self._permission_checks.items()}
+        return {
+            "role_key": role_key,
+            "label": role_name,
+            "rank": int(self._rank_spin.value()),
+            "permissions": permissions,
+        }
+
+
+class GuildPolicyEditorDialog(AppDialog):
+    def __init__(self, parent: Optional[QWidget], policy: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(parent, "Guild Policies")
+        self._policy = policy or {}
+        self.resize(UIScale.px(520), UIScale.px(560))
+
+        root = self.body_layout(
+            margins=(UIScale.px(16), UIScale.px(14), UIScale.px(16), UIScale.px(16)),
+            spacing=UIScale.px(10),
+        )
+
+        intro = QLabel("Set how your guild recruits, who can see it, and what culture you want members to feel in-game.", self._body)
+        intro.setWordWrap(True)
+        intro.setFont(Fonts.mixed)
+        intro.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        root.addWidget(intro)
+
+        self._recruitment = QComboBox(self._body)
+        self._recruitment.setFont(Fonts.mixed_small)
+        for value, label in (("open", "Open enlistment"), ("application", "Application required"), ("closed", "Closed / invite only")):
+            self._recruitment.addItem(label, value)
+        self._recruitment.setCurrentIndex(max(0, self._recruitment.findData(str(self._policy.get("recruitment_mode", "open") or "open"))))
+        root.addWidget(QLabel("Recruitment mode", self._body))
+        root.addWidget(self._recruitment)
+
+        self._visibility = QComboBox(self._body)
+        self._visibility.setFont(Fonts.mixed_small)
+        for value, label in (("public", "Public"), ("private", "Private")):
+            self._visibility.addItem(label, value)
+        self._visibility.setCurrentIndex(max(0, self._visibility.findData(str(self._policy.get("visibility", "public") or "public"))))
+        root.addWidget(QLabel("Visibility", self._body))
+        root.addWidget(self._visibility)
+
+        self._allow_member_invites = QCheckBox("Allow non-officers with permission to send invites", self._body)
+        self._allow_member_invites.setChecked(bool(self._policy.get("allow_member_invites", False)))
+        root.addWidget(self._allow_member_invites)
+
+        root.addWidget(QLabel("Minimum reputation", self._body))
+        self._min_rep = QSpinBox(self._body)
+        self._min_rep.setRange(0, 100000)
+        self._min_rep.setValue(int(self._policy.get("minimum_reputation", 0) or 0))
+        root.addWidget(self._min_rep)
+
+        root.addWidget(QLabel("Minimum net worth", self._body))
+        self._min_networth = QSpinBox(self._body)
+        self._min_networth.setRange(0, 2_000_000_000)
+        self._min_networth.setSingleStep(1000)
+        self._min_networth.setValue(int(float(self._policy.get("minimum_net_worth", 0) or 0)))
+        root.addWidget(self._min_networth)
+
+        self._focus = QComboBox(self._body)
+        self._focus.setFont(Fonts.mixed_small)
+        for value, label in (("balanced", "Balanced"), ("trade", "Trade empire"), ("industry", "Industry"), ("exploration", "Exploration"), ("social", "Social / community")):
+            self._focus.addItem(label, value)
+        self._focus.setCurrentIndex(max(0, self._focus.findData(str(self._policy.get("event_focus", "balanced") or "balanced"))))
+        root.addWidget(QLabel("Guild focus", self._body))
+        root.addWidget(self._focus)
+
+        root.addWidget(QLabel("Message of the day", self._body))
+        self._motd = QTextEdit(self._body)
+        self._motd.setFont(Fonts.mixed_small)
+        self._motd.setPlainText(str(self._policy.get("message_of_the_day", "") or ""))
+        self._motd.setFixedHeight(UIScale.px(90))
+        root.addWidget(self._motd)
+
+        root.addWidget(QLabel("Application prompt", self._body))
+        self._application_prompt = QTextEdit(self._body)
+        self._application_prompt.setFont(Fonts.mixed_small)
+        self._application_prompt.setPlainText(str(self._policy.get("application_prompt", "") or ""))
+        self._application_prompt.setFixedHeight(UIScale.px(90))
+        root.addWidget(self._application_prompt)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = MtButton("Cancel", self._body, role="secondary")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = MtButton("Save Policies", self._body)
+        save_btn.clicked.connect(self.accept)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        root.addLayout(btns)
+
+        self.center_on_parent()
+
+    def payload(self) -> Optional[Dict[str, Any]]:
+        if self.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return {
+            "recruitment_mode": self._recruitment.currentData(),
+            "visibility": self._visibility.currentData(),
+            "allow_member_invites": self._allow_member_invites.isChecked(),
+            "minimum_reputation": int(self._min_rep.value()),
+            "minimum_net_worth": float(self._min_networth.value()),
+            "event_focus": self._focus.currentData(),
+            "message_of_the_day": self._motd.toPlainText().strip(),
+            "application_prompt": self._application_prompt.toPlainText().strip(),
+        }
+
+
+class GuildManagementDialog(AppDialog):
+    _MEMBER_COLS = [
+        ("merchant", "Merchant", 210),
+        ("role", "Role", 160),
+        ("joined", "Joined", 140),
+        ("contribution", "Contribution", 120, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+    ]
+    _ROLE_COLS = [
+        ("label", "Role", 180),
+        ("rank", "Rank", 80, Qt.AlignmentFlag.AlignCenter),
+        ("permissions", "Permissions", 360),
+    ]
+
+    def __init__(self, app: "GameApp", guild_id: str, parent: Optional[QWidget] = None, on_change: Optional[Callable[[], None]] = None) -> None:
+        super().__init__(parent or app, "Guild Command")
+        self._app = app
+        self._guild_id = guild_id
+        self._on_change = on_change
+        self._dashboard: Dict[str, Any] = {}
+        self.setMinimumSize(UIScale.px(860), UIScale.px(640))
+        self.resize(UIScale.px(920), UIScale.px(720))
+        self._build()
+        self._load_dashboard()
+        self.center_on_parent()
+
+    def _build(self) -> None:
+        root = self.body_layout(
+            margins=(UIScale.px(14), UIScale.px(12), UIScale.px(14), UIScale.px(14)),
+            spacing=UIScale.px(10),
+        )
+
+        self._status_lbl = QLabel("Loading guild command deck…", self._body)
+        self._status_lbl.setFont(Fonts.mixed_small)
+        self._status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        root.addWidget(self._status_lbl)
+
+        self._tabs = QTabWidget(self._body)
+        root.addWidget(self._tabs, 1)
+
+        overview = QWidget(self._tabs)
+        ov_lay = QVBoxLayout(overview)
+        ov_lay.setContentsMargins(0, 0, 0, 0)
+        ov_lay.setSpacing(UIScale.px(8))
+        self._guild_name_lbl = QLabel("Guild", overview)
+        self._guild_name_lbl.setFont(Fonts.title)
+        self._guild_name_lbl.setStyleSheet(f"color:{P.cream}; background:transparent;")
+        ov_lay.addWidget(self._guild_name_lbl)
+        self._guild_meta_lbl = QLabel("", overview)
+        self._guild_meta_lbl.setFont(Fonts.mono_small)
+        self._guild_meta_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        ov_lay.addWidget(self._guild_meta_lbl)
+        self._guild_desc_lbl = QLabel("", overview)
+        self._guild_desc_lbl.setWordWrap(True)
+        self._guild_desc_lbl.setFont(Fonts.mixed)
+        self._guild_desc_lbl.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        ov_lay.addWidget(self._guild_desc_lbl)
+        self._guild_policy_lbl = QLabel("", overview)
+        self._guild_policy_lbl.setWordWrap(True)
+        self._guild_policy_lbl.setFont(Fonts.mixed_small)
+        self._guild_policy_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        ov_lay.addWidget(self._guild_policy_lbl)
+        ov_btns = QHBoxLayout()
+        self._edit_guild_btn = MtButton(f"{Sym.SETTINGS}  Edit Guild", overview, role="secondary")
+        self._edit_guild_btn.clicked.connect(self._edit_guild_profile)
+        ov_btns.addWidget(self._edit_guild_btn)
+        self._edit_policy_btn = MtButton(f"{Sym.INFO}  Edit Policies", overview, role="secondary")
+        self._edit_policy_btn.clicked.connect(self._edit_policies)
+        ov_btns.addWidget(self._edit_policy_btn)
+        ov_btns.addStretch()
+        self._refresh_btn = MtButton(f"{Sym.SYNC}  Refresh", overview, role="secondary")
+        self._refresh_btn.clicked.connect(self._load_dashboard)
+        ov_btns.addWidget(self._refresh_btn)
+        ov_lay.addLayout(ov_btns)
+        ov_lay.addStretch()
+        self._tabs.addTab(overview, f"{Sym.INFO}  Overview")
+
+        members = QWidget(self._tabs)
+        mem_lay = QVBoxLayout(members)
+        mem_lay.setContentsMargins(0, 0, 0, 0)
+        mem_lay.setSpacing(UIScale.px(8))
+        self._members_table = DataTable(members, self._MEMBER_COLS, row_height=24)
+        mem_lay.addWidget(self._members_table, 1)
+        mem_btns = QHBoxLayout()
+        self._invite_btn = MtButton(f"{Sym.YES}  Invite Merchant", members)
+        self._invite_btn.clicked.connect(self._invite_member)
+        mem_btns.addWidget(self._invite_btn)
+        self._assign_role_btn = MtButton(f"{Sym.SKILLS}  Assign Role", members, role="secondary")
+        self._assign_role_btn.clicked.connect(self._assign_selected_role)
+        mem_btns.addWidget(self._assign_role_btn)
+        self._kick_btn = MtButton(f"{Sym.NO}  Remove Member", members, role="danger")
+        self._kick_btn.clicked.connect(self._remove_selected_member)
+        mem_btns.addWidget(self._kick_btn)
+        mem_btns.addStretch()
+        mem_lay.addLayout(mem_btns)
+        self._tabs.addTab(members, f"{Sym.SOCIAL}  Members")
+
+        roles = QWidget(self._tabs)
+        role_lay = QVBoxLayout(roles)
+        role_lay.setContentsMargins(0, 0, 0, 0)
+        role_lay.setSpacing(UIScale.px(8))
+        self._roles_table = DataTable(roles, self._ROLE_COLS, row_height=24)
+        role_lay.addWidget(self._roles_table, 1)
+        role_btns = QHBoxLayout()
+        self._new_role_btn = MtButton(f"{Sym.YES}  New Role", roles)
+        self._new_role_btn.clicked.connect(self._create_role)
+        role_btns.addWidget(self._new_role_btn)
+        self._edit_role_btn = MtButton(f"{Sym.SETTINGS}  Edit Role", roles, role="secondary")
+        self._edit_role_btn.clicked.connect(self._edit_selected_role)
+        role_btns.addWidget(self._edit_role_btn)
+        self._delete_role_btn = MtButton(f"{Sym.NO}  Delete Role", roles, role="danger")
+        self._delete_role_btn.clicked.connect(self._delete_selected_role)
+        role_btns.addWidget(self._delete_role_btn)
+        role_btns.addStretch()
+        role_lay.addLayout(role_btns)
+        self._tabs.addTab(roles, f"{Sym.SKILLS}  Roles")
+
+    def _permissions(self) -> Dict[str, bool]:
+        perms = self._dashboard.get("permissions")
+        if isinstance(perms, dict) and perms:
+            return perms
+        membership = self._dashboard.get("membership") if isinstance(self._dashboard.get("membership"), dict) else {}
+        guild = self._dashboard.get("guild") if isinstance(self._dashboard.get("guild"), dict) else {}
+        current_user_id = str(self._app.online.auth.user_id if self._app.online and self._app.online.auth.user_id else "")
+        owner_id = str(guild.get("owner_id", "") or "")
+        if current_user_id and owner_id and current_user_id == owner_id:
+            return {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            }
+        role_key = str(membership.get("role", "member") or "member")
+        default_perms: Dict[str, Dict[str, bool]] = {
+            "owner": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+            "president": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+            "officer": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+            "vice_president": {
+                "invite_members": True,
+                "kick_members": True,
+                "assign_roles": True,
+                "edit_roles": True,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+            "governor": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": True,
+                "edit_guild_profile": True,
+            },
+            "quartermaster": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": False,
+                "edit_guild_profile": False,
+            },
+            "recruiter": {
+                "invite_members": True,
+                "kick_members": False,
+                "assign_roles": False,
+                "edit_roles": False,
+                "edit_policies": False,
+                "edit_guild_profile": False,
+            },
+        }
+        return default_perms.get(role_key, {})
+
+    def _can(self, permission: str) -> bool:
+        return bool(self._permissions().get(permission, False))
+
+    def _load_dashboard(self) -> None:
+        online = getattr(self._app, "online", None)
+        if not (online and online.is_online):
+            self._status_lbl.setText("Sign in to manage your guild.")
+            return
+        self._status_lbl.setText("Loading guild command deck…")
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_dashboard(r))
+
+        online.guilds.get_guild_dashboard(self._guild_id, callback=_cb)
+
+    def _apply_dashboard(self, res: Any) -> None:
+        if not getattr(res, "success", False) or not isinstance(res.data, dict):
+            self._status_lbl.setText(str(getattr(res, "error", "Guild command deck unavailable.")))
+            return
+        self._dashboard = res.data
+        guild = self._dashboard.get("guild") or {}
+        membership = self._dashboard.get("membership") or {}
+        policy = self._dashboard.get("policy") or {}
+        roles = self._dashboard.get("roles") or []
+        members = self._dashboard.get("members") or []
+
+        self._guild_name_lbl.setText(str(guild.get("name", "Guild") or "Guild"))
+        motto = str(guild.get("motto", "") or "")
+        description = str(guild.get("description", "") or "")
+        desc_text = description or "No description yet."
+        if motto:
+            desc_text = f"{motto}\n\n{desc_text}"
+        self._guild_desc_lbl.setText(desc_text)
+        self._guild_meta_lbl.setText(
+            f"Your role: {membership.get('role_label', membership.get('role', 'Member'))}  •  {int(guild.get('member_count', len(members)) or len(members))} members"
+        )
+        self._guild_policy_lbl.setText(
+            f"Recruitment: {str(policy.get('recruitment_mode', 'open') or 'open').replace('_', ' ').title()}  •  "
+            f"Visibility: {str(policy.get('visibility', 'public') or 'public').title()}  •  "
+            f"Focus: {str(policy.get('event_focus', 'balanced') or 'balanced').replace('_', ' ').title()}"
+        )
+
+        member_rows: List[Dict[str, Any]] = []
+        for member in members:
+            joined = str(member.get("joined_at", "") or "")
+            if "T" in joined:
+                joined = joined.split("T", 1)[0]
+            member_rows.append({
+                "merchant": str(member.get("username", "Unknown") or "Unknown"),
+                "role": str(member.get("role_label", member.get("role", "Member")) or "Member"),
+                "joined": joined or "—",
+                "contribution": f"{int(member.get('contribution_score', 0) or 0):,}",
+                "user_id": str(member.get("user_id", "") or ""),
+                "role_key": str(member.get("role", "member") or "member"),
+                "_tag": "cyan" if str(member.get("user_id", "") or "") == str(getattr(getattr(self._app, 'online', None), 'auth', None).user_id if getattr(self._app, 'online', None) else "") else "dim",
+            })
+        self._members_table.load(member_rows)
+
+        role_rows: List[Dict[str, Any]] = []
+        for role in roles:
+            perms = role.get("permissions") if isinstance(role.get("permissions"), dict) else {}
+            enabled = [label for key, label in GuildRoleEditorDialog.PERMISSION_LABELS if perms.get(key)]
+            role_rows.append({
+                "label": str(role.get("label", "Role") or "Role"),
+                "rank": str(int(role.get("rank", 0) or 0)),
+                "permissions": ", ".join(enabled) if enabled else "No elevated permissions",
+                "role_key": str(role.get("role_key", "member") or "member"),
+                "is_system": bool(role.get("is_system", False)),
+                "payload": role,
+                "_tag": "gold" if str(role.get("role_key", "")) == "president" else "dim",
+            })
+        self._roles_table.load(role_rows)
+
+        self._invite_btn.setEnabled(self._can("invite_members"))
+        self._assign_role_btn.setEnabled(self._can("assign_roles"))
+        self._kick_btn.setEnabled(self._can("kick_members"))
+        self._new_role_btn.setEnabled(self._can("edit_roles"))
+        self._edit_role_btn.setEnabled(self._can("edit_roles"))
+        self._delete_role_btn.setEnabled(self._can("edit_roles"))
+        self._edit_policy_btn.setEnabled(self._can("edit_policies"))
+        self._edit_guild_btn.setEnabled(self._can("edit_guild_profile"))
+        self._status_lbl.setText("Guild command deck synchronized.")
+
+    def _after_change(self, success_message: str) -> None:
+        self._app.message_bar.ok(success_message)
+        self._load_dashboard()
+        self._app._push_online_presence()
+        self._app._push_leaderboard()
+        if self._on_change is not None:
+            self._on_change()
+
+    def _invite_member(self) -> None:
+        if not self._can("invite_members"):
+            self._app.message_bar.warn("Your role cannot send guild invites.")
+            return
+        query = TextPromptDialog(
+            self,
+            "Invite Merchant",
+            "Search for a merchant by name tag or UUID.",
+            placeholder="Merchant #1234 or UUID",
+            confirm_text="Search",
+        ).get_value()
+        if not query:
+            return
+
+        def _search_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, q=query: self._handle_invite_search(r, q))
+
+        self._app.online.profile.search_players(query, callback=_search_cb)
+
+    def _handle_invite_search(self, res: Any, query: str) -> None:
+        if not getattr(res, "success", False):
+            self._app.message_bar.err(str(getattr(res, "error", "Search failed.")))
+            return
+        players = res.data if isinstance(res.data, list) else []
+        if not players:
+            self._app.message_bar.warn(f"No merchant matched {query}.")
+            return
+        player = players[0]
+        if len(players) > 1:
+            items: List[str] = []
+            mapping: Dict[str, Dict[str, Any]] = {}
+            for row in players:
+                disc = row.get("discriminator", 0)
+                suffix = f" #{int(disc):04d}" if isinstance(disc, int) and disc else (f" #{disc}" if disc else "")
+                label = f"{row.get('username', 'Unknown')}{suffix}  •  {float(row.get('last_networth', 0) or 0):,.0f}g NW"
+                mapping[label] = row
+                items.append(label)
+            choice, ok = ChoiceListDialog(self, "Choose Merchant", "Choose who to invite.", items, confirm_text="Invite").choose()
+            if not ok:
+                return
+            player = mapping[choice]
+        player_id = str(player.get("id") or "")
+        if not player_id:
+            self._app.message_bar.err("That merchant record is missing an ID.")
+            return
+
+        def _invite_cb(invite_res: Any) -> None:
+            _queue_ui(self, lambda r=invite_res: self._handle_invite_sent(r, str(player.get('username', 'merchant') or 'merchant')))
+
+        self._app.online.guilds.send_invite(self._guild_id, player_id, callback=_invite_cb)
+
+    def _handle_invite_sent(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self._after_change(f"Guild invite sent to {name}.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to send guild invite.")))
+
+    def _assign_selected_role(self) -> None:
+        if not self._can("assign_roles"):
+            self._app.message_bar.warn("Your role cannot assign guild roles.")
+            return
+        row = self._members_table.selected()
+        if not row:
+            self._app.message_bar.warn("Select a member first.")
+            return
+        user_id = str(row.get("user_id", "") or "")
+        if not user_id:
+            self._app.message_bar.err("That member record is missing an ID.")
+            return
+        if str(row.get("role_key", "")) == "president":
+            self._app.message_bar.warn("Use a dedicated leadership-transfer flow before changing the president role.")
+            return
+        role_rows = self._dashboard.get("roles") if isinstance(self._dashboard.get("roles"), list) else []
+        choices: List[str] = []
+        mapping: Dict[str, str] = {}
+        for role in role_rows:
+            role_key = str(role.get("role_key", "member") or "member")
+            if role_key == "president":
+                continue
+            label = f"{role.get('label', role_key)}  •  rank {int(role.get('rank', 0) or 0)}"
+            mapping[label] = role_key
+            choices.append(label)
+        if not choices:
+            self._app.message_bar.warn("No assignable roles are available yet.")
+            return
+        choice, ok = ChoiceListDialog(self, "Assign Guild Role", "Choose the new role for this member.", choices, confirm_text="Assign").choose()
+        if not ok:
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_role_assigned(r, str(row.get('merchant', 'member') or 'member')))
+
+        self._app.online.guilds.assign_member_role(self._guild_id, user_id, mapping[choice], callback=_cb)
+
+    def _handle_role_assigned(self, res: Any, merchant: str) -> None:
+        if getattr(res, "success", False):
+            self._after_change(f"Updated {merchant}'s guild role.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to assign role.")))
+
+    def _remove_selected_member(self) -> None:
+        if not self._can("kick_members"):
+            self._app.message_bar.warn("Your role cannot remove guild members.")
+            return
+        row = self._members_table.selected()
+        if not row:
+            self._app.message_bar.warn("Select a member first.")
+            return
+        if str(row.get("user_id", "") or "") == str(self._app.online.auth.user_id if self._app.online else ""):
+            self._app.message_bar.warn("Use Leave Guild for your own account.")
+            return
+        if str(row.get("role_key", "")) == "president":
+            self._app.message_bar.warn("Transfer leadership before removing the president.")
+            return
+        merchant = str(row.get("merchant", "member") or "member")
+        if not ConfirmDialog(self, "Remove Member", f"Remove {merchant} from the guild?", confirm_text="Remove", confirm_role="danger").ask():
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_member_removed(r, merchant))
+
+        self._app.online.guilds.remove_member(self._guild_id, str(row.get("user_id", "") or ""), callback=_cb)
+
+    def _handle_member_removed(self, res: Any, merchant: str) -> None:
+        if getattr(res, "success", False):
+            self._after_change(f"Removed {merchant} from the guild.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to remove member.")))
+
+    def _create_role(self) -> None:
+        if not self._can("edit_roles"):
+            self._app.message_bar.warn("Your role cannot edit guild roles.")
+            return
+        payload = GuildRoleEditorDialog(self).payload()
+        if payload is None:
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_role_saved(r, str(payload.get('label', 'role') or 'role')))
+
+        self._app.online.guilds.upsert_guild_role(
+            self._guild_id,
+            str(payload.get("role_key", "") or "member"),
+            str(payload.get("label", "Role") or "Role"),
+            int(payload.get("rank", 100) or 100),
+            payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {},
+            callback=_cb,
+        )
+
+    def _edit_selected_role(self) -> None:
+        if not self._can("edit_roles"):
+            self._app.message_bar.warn("Your role cannot edit guild roles.")
+            return
+        row = self._roles_table.selected()
+        if not row:
+            self._app.message_bar.warn("Select a role first.")
+            return
+        payload = GuildRoleEditorDialog(self, row.get("payload") if isinstance(row.get("payload"), dict) else None).payload()
+        if payload is None:
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_role_saved(r, str(payload.get('label', 'role') or 'role')))
+
+        self._app.online.guilds.upsert_guild_role(
+            self._guild_id,
+            str(payload.get("role_key", "") or row.get("role_key", "member")),
+            str(payload.get("label", row.get("label", "Role")) or row.get("label", "Role")),
+            int(payload.get("rank", row.get("rank", 100)) or 100),
+            payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {},
+            is_system=bool(row.get("is_system", False)),
+            callback=_cb,
+        )
+
+    def _handle_role_saved(self, res: Any, label: str) -> None:
+        if getattr(res, "success", False):
+            self._after_change(f"Saved guild role {label}.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to save role.")))
+
+    def _delete_selected_role(self) -> None:
+        if not self._can("edit_roles"):
+            self._app.message_bar.warn("Your role cannot edit guild roles.")
+            return
+        row = self._roles_table.selected()
+        if not row:
+            self._app.message_bar.warn("Select a role first.")
+            return
+        role_key = str(row.get("role_key", "") or "")
+        if role_key in {"president", "member"}:
+            self._app.message_bar.warn("Core system roles cannot be deleted.")
+            return
+        label = str(row.get("label", "role") or "role")
+        if not ConfirmDialog(self, "Delete Role", f"Delete {label}? Members must be reassigned first.", confirm_text="Delete", confirm_role="danger").ask():
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_role_deleted(r, label))
+
+        self._app.online.guilds.delete_guild_role(self._guild_id, role_key, callback=_cb)
+
+    def _handle_role_deleted(self, res: Any, label: str) -> None:
+        if getattr(res, "success", False):
+            self._after_change(f"Deleted guild role {label}.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to delete role.")))
+
+    def _edit_policies(self) -> None:
+        if not self._can("edit_policies"):
+            self._app.message_bar.warn("Your role cannot edit guild policies.")
+            return
+        payload = GuildPolicyEditorDialog(self, self._dashboard.get("policy") if isinstance(self._dashboard.get("policy"), dict) else None).payload()
+        if payload is None:
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_policy_saved(r))
+
+        self._app.online.guilds.update_guild_policy(self._guild_id, payload, callback=_cb)
+
+    def _handle_policy_saved(self, res: Any) -> None:
+        if getattr(res, "success", False):
+            self._after_change("Updated guild policies.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to update guild policies.")))
+
+    def _edit_guild_profile(self) -> None:
+        if not self._can("edit_guild_profile"):
+            self._app.message_bar.warn("Your role cannot edit guild details.")
+            return
+        guild = self._dashboard.get("guild") if isinstance(self._dashboard.get("guild"), dict) else {}
+        motto = TextPromptDialog(
+            self,
+            "Guild Motto",
+            "Set a short motto or rallying phrase.",
+            default=str(guild.get("motto", "") or ""),
+            placeholder="We profit together.",
+            confirm_text="Continue",
+        ).get_value()
+        if motto is None:
+            return
+        description = TextPromptDialog(
+            self,
+            "Guild Description",
+            "Describe the guild's mission and vibe.",
+            default=str(guild.get("description", "") or ""),
+            placeholder="A disciplined trading coalition.",
+            confirm_text="Save Guild",
+        ).get_value()
+        if description is None:
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_guild_profile_saved(r))
+
+        self._app.online.guilds.update_guild(
+            self._guild_id,
+            {"motto": motto.strip(), "description": description.strip()},
+            callback=_cb,
+        )
+
+    def _handle_guild_profile_saved(self, res: Any) -> None:
+        if getattr(res, "success", False):
+            self._after_change("Updated guild details.")
+            return
+        self._app.message_bar.err(str(getattr(res, "error", "Failed to update guild details.")))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -13876,6 +16039,837 @@ class VoyageScreen(Screen):
         self.app.refresh()
 
 
+class SocialScreen(Screen):
+    """Online social hub: leaderboard, friends, and guilds."""
+
+    _LB_COLS = [
+        ("rank", "#", 64, Qt.AlignmentFlag.AlignCenter),
+        ("merchant", "Merchant", 220),
+        ("title", "Title", 180),
+        ("guild", "Guild", 170),
+        ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+        ("area", "Area", 120),
+    ]
+    _PENDING_COLS = [
+        ("merchant", "Merchant", 280),
+        ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+    ]
+    _FRIEND_COLS = [
+        ("status", "Status", 84),
+        ("merchant", "Merchant", 260),
+        ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+        ("seen", "Last Seen", 160),
+    ]
+    _GUILD_COLS = [
+        ("name", "Guild", 220),
+        ("members", "Members", 90, Qt.AlignmentFlag.AlignCenter),
+        ("focus", "Focus", 120),
+        ("description", "Description", 400),
+    ]
+    _INVITE_COLS = [
+        ("guild", "Guild", 220),
+        ("from", "Invited By", 220),
+        ("sent", "Sent", 140),
+    ]
+
+    def build(self) -> None:
+        self._lb_rows: List[Dict[str, Any]] = []
+        self._pending_rows: List[Dict[str, Any]] = []
+        self._friends_rows: List[Dict[str, Any]] = []
+        self._guild_rows: List[Dict[str, Any]] = []
+        self._guild_invite_rows: List[Dict[str, Any]] = []
+        self._my_guild: Optional[Dict[str, Any]] = None
+        self._my_rank: int = 0
+        self._lb_last_fetch: float = 0.0
+
+        self._lb_refresh_timer = QTimer(self)
+        self._lb_refresh_timer.setInterval(60_000)
+        self._lb_refresh_timer.timeout.connect(lambda: self._load_leaderboard(force=True))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(UIScale.px(14), UIScale.px(12), UIScale.px(14), UIScale.px(12))
+        root.setSpacing(UIScale.px(10))
+
+        root.addWidget(self.section_label("Social Hub"))
+
+        self._tabs = QTabWidget(self)
+        self._tabs.setFont(Fonts.mixed_small)
+        self._tabs.currentChanged.connect(lambda _index: self._load_active_tab(force=False))
+        root.addWidget(self._tabs, 1)
+
+        self._build_leaderboard_tab()
+        self._build_friends_tab()
+        self._build_guilds_tab()
+
+        foot = QHBoxLayout()
+        foot.addWidget(self.back_button())
+        foot.addStretch()
+        root.addLayout(foot)
+
+    def on_show(self) -> None:
+        self._lb_refresh_timer.start()
+        self._load_active_tab(force=True)
+        self.app._push_online_presence()
+
+    def on_hide(self) -> None:
+        self._lb_refresh_timer.stop()
+
+    def refresh(self) -> None:
+        self._render_lb_footer()
+        self._render_guild_summary()
+
+    def _build_leaderboard_tab(self) -> None:
+        tab = QWidget(self)
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(UIScale.px(8))
+
+        hdr = QHBoxLayout()
+        title = QLabel(f"{Sym.PROGRESS}  Global leaderboard ranked by net worth", tab)
+        title.setFont(Fonts.mixed_bold)
+        title.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self._lb_status_lbl = QLabel("", tab)
+        self._lb_status_lbl.setFont(Fonts.mono_small)
+        self._lb_status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        hdr.addWidget(self._lb_status_lbl)
+        refresh_btn = MtButton(f"{Sym.SYNC}  Refresh", tab, role="secondary")
+        refresh_btn.clicked.connect(lambda: self._load_leaderboard(force=True))
+        hdr.addWidget(refresh_btn)
+        lay.addLayout(hdr)
+
+        self._lb_table = DataTable(tab, self._LB_COLS, row_height=26)
+        lay.addWidget(self._lb_table, 1)
+
+        self._lb_footer_lbl = QLabel("", tab)
+        self._lb_footer_lbl.setWordWrap(True)
+        self._lb_footer_lbl.setFont(Fonts.mixed_small_bold)
+        self._lb_footer_lbl.setStyleSheet(
+            f"color:{P.gold}; background:{P.bg_panel}; border:1px solid {P.border}; padding:{UIScale.px(8)}px;"
+        )
+        lay.addWidget(self._lb_footer_lbl)
+
+        self._tabs.addTab(tab, f"{Sym.PROGRESS}  Leaderboard")
+
+    def _build_friends_tab(self) -> None:
+        tab = QWidget(self)
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(UIScale.px(8))
+
+        hdr = QHBoxLayout()
+        title = QLabel(f"{Sym.SOCIAL}  Friends and pending requests", tab)
+        title.setFont(Fonts.mixed_bold)
+        title.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self._friends_status_lbl = QLabel("", tab)
+        self._friends_status_lbl.setFont(Fonts.mono_small)
+        self._friends_status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        hdr.addWidget(self._friends_status_lbl)
+        friends_refresh_btn = MtButton(f"{Sym.SYNC}  Refresh", tab, role="secondary")
+        friends_refresh_btn.clicked.connect(lambda: self._load_friends(force=True))
+        hdr.addWidget(friends_refresh_btn)
+        lay.addLayout(hdr)
+
+        search_row = QHBoxLayout()
+        self._friend_query = QLineEdit(tab)
+        self._friend_query.setPlaceholderText("Search by Name #1234 or UUID")
+        self._friend_query.setFont(Fonts.mixed)
+        self._friend_query.returnPressed.connect(self._send_friend_request)
+        search_row.addWidget(self._friend_query, 1)
+        add_btn = MtButton(f"{Sym.INBOX}  Send Request", tab)
+        add_btn.clicked.connect(self._send_friend_request)
+        search_row.addWidget(add_btn)
+        lay.addLayout(search_row)
+
+        pending_frame = QFrame(tab)
+        pending_frame.setObjectName("dashPanel")
+        pending_lay = QVBoxLayout(pending_frame)
+        pending_lay.setContentsMargins(UIScale.px(10), UIScale.px(10), UIScale.px(10), UIScale.px(10))
+        pending_lay.setSpacing(UIScale.px(8))
+        pending_hdr = QLabel("Pending Requests", pending_frame)
+        pending_hdr.setFont(Fonts.mixed_bold)
+        pending_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        pending_lay.addWidget(pending_hdr)
+        self._pending_table = DataTable(pending_frame, self._PENDING_COLS, row_height=24)
+        pending_lay.addWidget(self._pending_table)
+        pending_btns = QHBoxLayout()
+        accept_btn = MtButton(f"{Sym.YES}  Accept", pending_frame, role="secondary")
+        accept_btn.clicked.connect(lambda: self._respond_to_request(True))
+        pending_btns.addWidget(accept_btn)
+        decline_btn = MtButton(f"{Sym.NO}  Decline", pending_frame, role="danger")
+        decline_btn.clicked.connect(lambda: self._respond_to_request(False))
+        pending_btns.addWidget(decline_btn)
+        pending_btns.addStretch()
+        pending_lay.addLayout(pending_btns)
+        lay.addWidget(pending_frame)
+
+        friends_frame = QFrame(tab)
+        friends_frame.setObjectName("dashPanel")
+        friends_lay = QVBoxLayout(friends_frame)
+        friends_lay.setContentsMargins(UIScale.px(10), UIScale.px(10), UIScale.px(10), UIScale.px(10))
+        friends_lay.setSpacing(UIScale.px(8))
+        friends_hdr = QLabel("Your Friends", friends_frame)
+        friends_hdr.setFont(Fonts.mixed_bold)
+        friends_hdr.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        friends_lay.addWidget(friends_hdr)
+        self._friends_table = DataTable(friends_frame, self._FRIEND_COLS, row_height=24)
+        friends_lay.addWidget(self._friends_table, 1)
+        friends_btns = QHBoxLayout()
+        remove_btn = MtButton(f"{Sym.NO}  Remove Friend", friends_frame, role="danger")
+        remove_btn.clicked.connect(self._remove_friend)
+        friends_btns.addWidget(remove_btn)
+        friends_btns.addStretch()
+        friends_lay.addLayout(friends_btns)
+        lay.addWidget(friends_frame, 1)
+
+        self._tabs.addTab(tab, f"{Sym.SOCIAL}  Friends")
+
+    def _build_guilds_tab(self) -> None:
+        tab = QWidget(self)
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(UIScale.px(8))
+
+        hdr = QHBoxLayout()
+        title = QLabel(f"{Sym.INFLUENCE}  Guild roster and discovery", tab)
+        title.setFont(Fonts.mixed_bold)
+        title.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self._guilds_status_lbl = QLabel("", tab)
+        self._guilds_status_lbl.setFont(Fonts.mono_small)
+        self._guilds_status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        hdr.addWidget(self._guilds_status_lbl)
+        guild_refresh_btn = MtButton(f"{Sym.SYNC}  Refresh", tab, role="secondary")
+        guild_refresh_btn.clicked.connect(lambda: self._load_guilds(force=True))
+        hdr.addWidget(guild_refresh_btn)
+        lay.addLayout(hdr)
+
+        self._guild_summary = QFrame(tab)
+        self._guild_summary.setObjectName("dashPanel")
+        sum_lay = QVBoxLayout(self._guild_summary)
+        sum_lay.setContentsMargins(UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(10))
+        sum_lay.setSpacing(UIScale.px(6))
+        self._guild_name_lbl = QLabel("No guild", self._guild_summary)
+        self._guild_name_lbl.setFont(Fonts.title)
+        self._guild_name_lbl.setStyleSheet(f"color:{P.cream}; background:transparent;")
+        sum_lay.addWidget(self._guild_name_lbl)
+        self._guild_desc_lbl = QLabel("Sign in to browse or found a guild.", self._guild_summary)
+        self._guild_desc_lbl.setWordWrap(True)
+        self._guild_desc_lbl.setFont(Fonts.mixed_small)
+        self._guild_desc_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        sum_lay.addWidget(self._guild_desc_lbl)
+        self._guild_meta_lbl = QLabel("", self._guild_summary)
+        self._guild_meta_lbl.setFont(Fonts.mono_small)
+        self._guild_meta_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        sum_lay.addWidget(self._guild_meta_lbl)
+        sum_btns = QHBoxLayout()
+        create_btn = MtButton(f"{Sym.YES}  Found Guild", self._guild_summary)
+        create_btn.clicked.connect(self._create_guild)
+        sum_btns.addWidget(create_btn)
+        self._manage_guild_btn = MtButton(f"{Sym.SETTINGS}  Manage Guild", self._guild_summary, role="secondary")
+        self._manage_guild_btn.clicked.connect(self._open_guild_management)
+        sum_btns.addWidget(self._manage_guild_btn)
+        leave_btn = MtButton(f"{Sym.NO}  Leave Guild", self._guild_summary, role="danger")
+        leave_btn.clicked.connect(self._leave_guild)
+        sum_btns.addWidget(leave_btn)
+        sum_btns.addStretch()
+        self._join_btn = MtButton(f"{Sym.INFO}  Join Selected", self._guild_summary, role="secondary")
+        self._join_btn.clicked.connect(self._join_selected_guild)
+        sum_btns.addWidget(self._join_btn)
+        sum_lay.addLayout(sum_btns)
+        lay.addWidget(self._guild_summary)
+
+        self._guilds_table = DataTable(tab, self._GUILD_COLS, row_height=24)
+        lay.addWidget(self._guilds_table, 1)
+
+        invite_frame = QFrame(tab)
+        invite_frame.setObjectName("dashPanel")
+        invite_lay = QVBoxLayout(invite_frame)
+        invite_lay.setContentsMargins(UIScale.px(10), UIScale.px(10), UIScale.px(10), UIScale.px(10))
+        invite_lay.setSpacing(UIScale.px(8))
+        invite_hdr = QLabel("Pending Invites", invite_frame)
+        invite_hdr.setFont(Fonts.mixed_bold)
+        invite_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        invite_lay.addWidget(invite_hdr)
+        self._guild_invites_table = DataTable(invite_frame, self._INVITE_COLS, row_height=24)
+        invite_lay.addWidget(self._guild_invites_table)
+        invite_btns = QHBoxLayout()
+        accept_invite_btn = MtButton(f"{Sym.YES}  Accept", invite_frame, role="secondary")
+        accept_invite_btn.clicked.connect(lambda: self._respond_to_selected_guild_invite(True))
+        invite_btns.addWidget(accept_invite_btn)
+        decline_invite_btn = MtButton(f"{Sym.NO}  Decline", invite_frame, role="danger")
+        decline_invite_btn.clicked.connect(lambda: self._respond_to_selected_guild_invite(False))
+        invite_btns.addWidget(decline_invite_btn)
+        invite_btns.addStretch()
+        invite_lay.addLayout(invite_btns)
+        lay.addWidget(invite_frame)
+
+        self._tabs.addTab(tab, f"{Sym.INFLUENCE}  Guilds")
+
+    def _active_tab_key(self) -> str:
+        index = self._tabs.currentIndex()
+        if index == 0:
+            return "leaderboard"
+        if index == 1:
+            return "friends"
+        return "guilds"
+
+    def _load_active_tab(self, force: bool = False) -> None:
+        key = self._active_tab_key()
+        if key == "leaderboard":
+            self._load_leaderboard(force=force)
+        elif key == "friends":
+            self._load_friends(force=force)
+        else:
+            self._load_guilds(force=force)
+
+    def _load_leaderboard(self, force: bool = False) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            self._lb_status_lbl.setText("Sign in to view the global board")
+            self._lb_table.load([])
+            self._lb_footer_lbl.setText("Sign in to submit a score and see your rank.")
+            return
+        if not force and self._lb_rows and (time.time() - self._lb_last_fetch) < 30.0:
+            return
+        self._lb_status_lbl.setText("Loading…")
+        self.app._push_online_presence()
+        self.app._push_leaderboard(done_callback=self._fetch_leaderboard)
+
+    def _fetch_leaderboard(self) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            return
+        def _top_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_leaderboard(r))
+        def _rank_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_rank(r))
+        self.app.online.leaderboard.fetch_top_scores(limit=100, callback=_top_cb)
+        self.app.online.leaderboard.fetch_my_rank(callback=_rank_cb)
+
+    def _apply_leaderboard(self, res: Any) -> None:
+        if not getattr(res, "success", False):
+            self._lb_status_lbl.setText(getattr(res, "error", "Leaderboard unavailable"))
+            return
+        raw_rows = res.data if isinstance(res.data, list) else []
+        self._lb_last_fetch = time.time()
+        self._lb_status_lbl.setText(f"Top {len(raw_rows)} merchants")
+        my_uid = self.app.online.auth.user_id if self.app.online else ""
+        rows: List[Dict[str, Any]] = []
+        for idx, row in enumerate(raw_rows, start=1):
+            title_raw = str(row.get("title", "") or "")
+            title_def = TITLES_BY_ID.get(title_raw)
+            title_text = title_def["name"] if title_def else (title_raw or "—")
+            is_me = row.get("user_id", "") == my_uid
+            tag = "gold" if idx <= 3 else ("cyan" if is_me else "dim")
+            rows.append({
+                "rank": ("🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"#{idx}"),
+                "merchant": row.get("player_name") or row.get("username") or "Unknown",
+                "title": title_text,
+                "guild": self._guild_cell_text(row),
+                "net_worth": f"{float(row.get('net_worth', 0) or 0):,.0f}g",
+                "area": row.get("area") or "—",
+                "_tag": tag,
+            })
+        self._lb_rows = rows
+        self._lb_table.load(rows)
+        self._render_lb_footer()
+
+    def _apply_rank(self, res: Any) -> None:
+        self._my_rank = int(res.data.get("rank", 0) or 0) if (getattr(res, "success", False) and isinstance(res.data, dict)) else 0
+        self._render_lb_footer()
+
+    def _render_lb_footer(self) -> None:
+        g = self.game
+        if self._my_rank <= 0:
+            self._lb_footer_lbl.setText("Submit a score to appear on the leaderboard.")
+            return
+        title_def = TITLES_BY_ID.get(getattr(g, "active_title", "") or "")
+        title_text = f"  •  {title_def['name']}" if title_def else ""
+        guild_text = f"  •  {self.app._cached_guild_name}" if getattr(self.app, "_cached_guild_name", "") else ""
+        role_text = f" ({self.app._cached_guild_role})" if getattr(self.app, "_cached_guild_role", "") else ""
+        self._lb_footer_lbl.setText(
+            f"Your rank: #{self._my_rank:,}  •  {g.player_name or 'Merchant'}{title_text}{guild_text}{role_text}  •  {g._net_worth():,.0f}g net worth"
+        )
+
+    def _load_friends(self, force: bool = False) -> None:
+        del force
+        if not (self.app.online and self.app.online.is_online):
+            self._friends_status_lbl.setText("Sign in to manage friends")
+            self._pending_table.load([])
+            self._friends_table.load([])
+            return
+        self._friends_status_lbl.setText("Loading…")
+        def _pending_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_pending(r))
+        def _friends_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_friends(r))
+        self.app.online.friends.list_pending_requests(callback=_pending_cb)
+        self.app.online.friends.list_friends_with_profiles(callback=_friends_cb)
+
+    def _apply_pending(self, res: Any) -> None:
+        raw = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        rows: List[Dict[str, Any]] = []
+        for item in raw:
+            profile = item.get("profiles") or {}
+            rows.append({
+                "merchant": self._player_label(profile),
+                "net_worth": f"{float(profile.get('last_networth', 0) or 0):,.0f}g",
+                "requester_id": item.get("requester_id", ""),
+                "_tag": "yellow",
+            })
+        self._pending_rows = rows
+        self._pending_table.load(rows)
+        self._update_friend_status()
+
+    def _apply_friends(self, res: Any) -> None:
+        raw = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        rows: List[Dict[str, Any]] = []
+        for item in raw:
+            profile = item.get("profile") or {}
+            status_text, last_seen_text, tag = self._friend_presence(profile.get("last_seen", ""))
+            net_worth = float(profile.get("last_networth", 0) or 0)
+            rows.append({
+                "status": status_text,
+                "merchant": self._player_label(profile),
+                "net_worth": f"{net_worth:,.0f}g" if net_worth > 0 else "—",
+                "seen": last_seen_text,
+                "friend_id": item.get("friend_id", ""),
+                "_tag": tag,
+            })
+        self._friends_rows = rows
+        self._friends_table.load(rows)
+        self._update_friend_status()
+
+    def _update_friend_status(self) -> None:
+        self._friends_status_lbl.setText(f"{len(self._friends_rows)} friends  •  {len(self._pending_rows)} pending")
+
+    def _send_friend_request(self) -> None:
+        query = self._friend_query.text().strip()
+        if not query:
+            self.msg.warn("Enter a merchant name or UUID to search.")
+            return
+        if not (self.app.online and self.app.online.is_online):
+            self.msg.warn("Sign in to send friend requests.")
+            return
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, q=query: self._handle_friend_search(r, q))
+        self.app.online.profile.search_players(query, callback=_cb)
+
+    def _handle_friend_search(self, res: Any, query: str) -> None:
+        if not getattr(res, "success", False):
+            self.msg.err(getattr(res, "error", "Search failed."))
+            return
+        players = res.data if isinstance(res.data, list) else []
+        if not players:
+            self.msg.warn(f"No merchant found matching {query}.")
+            return
+        player = players[0]
+        if len(players) > 1:
+            label_map: Dict[str, Dict[str, Any]] = {}
+            items: List[str] = []
+            for item in players:
+                label = f"{self._player_label(item)}  •  {float(item.get('last_networth', 0) or 0):,.0f}g NW"
+                if label in label_map:
+                    suffix = str(item.get("id", ""))[:8]
+                    label = f"{label}  •  {suffix}"
+                label_map[label] = item
+                items.append(label)
+            choice, ok = ChoiceListDialog(
+                self,
+                "Choose Merchant",
+                "Multiple merchants matched your search. Choose one.",
+                items,
+                confirm_text="Send Request",
+            ).choose()
+            if not ok:
+                return
+            player = label_map[choice]
+        player_id = str(player.get("id") or player.get("user_id") or "")
+        if not player_id:
+            self.msg.err("Could not resolve that merchant's ID.")
+            return
+        if player_id == (self.app.online.auth.user_id if self.app.online else ""):
+            self.msg.warn("That is your own account.")
+            return
+        label = self._player_label(player)
+        def _send_cb(send_res: Any) -> None:
+            _queue_ui(self, lambda r=send_res, name=label: self._after_send_request(r, name))
+        self.app.online.friends.send_request(player_id, callback=_send_cb)
+
+    def _after_send_request(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self.msg.ok(f"Friend request sent to {name}.")
+            self._friend_query.clear()
+            return
+        error = str(getattr(res, "error", "Failed to send request.") or "Failed to send request.")
+        if "duplicate" in error.lower() or "unique" in error.lower():
+            error = f"A pending request with {name} already exists."
+        self.msg.err(error)
+
+    def _respond_to_request(self, accept: bool) -> None:
+        row = self._pending_table.selected()
+        if not row:
+            self.msg.warn("Select a pending request first.")
+            return
+        requester_id = str(row.get("requester_id", "") or "")
+        if not requester_id:
+            self.msg.err("That request is missing its requester ID.")
+            return
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, accepted=accept: self._after_respond(r, row, accepted))
+        self.app.online.friends.respond_to_request(requester_id, accept, callback=_cb)
+
+    def _after_respond(self, res: Any, row: Dict[str, Any], accept: bool) -> None:
+        if getattr(res, "success", False):
+            self.msg.ok(f"Accepted {row.get('merchant', 'request')}." if accept else "Request declined.")
+            self._load_friends(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to respond to request."))
+
+    def _remove_friend(self) -> None:
+        row = self._friends_table.selected()
+        if not row:
+            self.msg.warn("Select a friend first.")
+            return
+        friend_id = str(row.get("friend_id", "") or "")
+        name = str(row.get("merchant", "that friend") or "that friend")
+        if not friend_id:
+            self.msg.err("That friend entry is missing its player ID.")
+            return
+        if not ConfirmDialog(
+            self,
+            "Remove Friend",
+            f"Remove {name} from your friends list?",
+            confirm_text="Remove",
+            confirm_role="danger",
+        ).ask():
+            return
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, friend_name=name: self._after_remove_friend(r, friend_name))
+        self.app.online.friends.remove_friend(friend_id, callback=_cb)
+
+    def _after_remove_friend(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self.msg.ok(f"Removed {name} from your friends list.")
+            self._load_friends(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to remove friend."))
+
+    def _load_guilds(self, force: bool = False) -> None:
+        del force
+        if not (self.app.online and self.app.online.is_online):
+            self._guilds_status_lbl.setText("Sign in to access guilds")
+            self._guild_rows = []
+            self._guild_invite_rows = []
+            self._guilds_table.load([])
+            self._guild_invites_table.load([])
+            self._my_guild = None
+            self.app._cached_guild_id = ""
+            self.app._cached_guild_name = ""
+            self.app._cached_guild_role = ""
+            self._render_guild_summary()
+            return
+        self._guilds_status_lbl.setText("Loading…")
+        def _mine_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_my_guild(r))
+        def _list_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_guild_list(r))
+        def _invite_cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_guild_invites(r))
+        self.app.online.guilds.get_my_guild(callback=_mine_cb)
+        self.app.online.guilds.list_guilds(limit=25, callback=_list_cb)
+        self.app.online.guilds.list_my_invites(callback=_invite_cb)
+
+    def _apply_my_guild(self, res: Any) -> None:
+        self._my_guild = res.data if (getattr(res, "success", False) and isinstance(res.data, dict)) else None
+        if self._my_guild:
+            self.app._cached_guild_id = str(self._my_guild.get("id", "") or "")
+            self.app._cached_guild_name = str(self._my_guild.get("name", "") or "")
+            self.app._cached_guild_role = str(self._my_guild.get("my_role_label", self._my_guild.get("my_role", "")) or "")
+        else:
+            self.app._cached_guild_id = ""
+            self.app._cached_guild_name = ""
+            self.app._cached_guild_role = ""
+        self._render_guild_summary()
+
+    def _apply_guild_list(self, res: Any) -> None:
+        raw = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        my_id = self._my_guild.get("id") if self._my_guild else ""
+        rows: List[Dict[str, Any]] = []
+        for guild in raw:
+            desc = str(guild.get("description", "") or "")
+            policy = guild.get("guild_policies")
+            if isinstance(policy, list):
+                policy = policy[0] if policy else {}
+            if not isinstance(policy, dict):
+                policy = {}
+            focus = str(policy.get("event_focus", "balanced") or "balanced").replace("_", " ").title()
+            recruitment = str(policy.get("recruitment_mode", "open") or "open").replace("_", " ").title()
+            rows.append({
+                "name": guild.get("name") or "Unknown",
+                "members": str(int(guild.get("member_count", 0) or 0)),
+                "focus": focus,
+                "description": f"[{recruitment}] {desc if len(desc) <= 70 else desc[:69] + '…'}",
+                "guild_id": guild.get("id", ""),
+                "recruitment_mode": str(policy.get("recruitment_mode", "open") or "open"),
+                "minimum_reputation": int(policy.get("minimum_reputation", 0) or 0),
+                "minimum_net_worth": float(policy.get("minimum_net_worth", 0) or 0.0),
+                "_tag": "cyan" if guild.get("id", "") == my_id else "dim",
+            })
+        self._guild_rows = rows
+        self._guilds_table.load(rows)
+        self._guilds_status_lbl.setText(f"{len(rows)} guilds available")
+        self._render_guild_summary()
+
+    def _apply_guild_invites(self, res: Any) -> None:
+        raw = res.data if (getattr(res, "success", False) and isinstance(res.data, list)) else []
+        rows: List[Dict[str, Any]] = []
+        for item in raw:
+            sent = str(item.get("created_at", "") or "")
+            if "T" in sent:
+                sent = sent.split("T", 1)[0]
+            guild_info = item.get("guilds") or {}
+            rows.append({
+                "guild": str(guild_info.get("name", "Unknown Guild") if isinstance(guild_info, dict) else "Unknown Guild"),
+                "from": str(item.get("from_user", "Unknown") or "Unknown"),
+                "sent": sent or "—",
+                "invite_id": str(item.get("id", "") or ""),
+                "guild_id": str(item.get("guild_id", "") or ""),
+                "_tag": "yellow",
+            })
+        self._guild_invite_rows = rows
+        self._guild_invites_table.load(rows)
+
+    def _render_guild_summary(self) -> None:
+        if self._my_guild:
+            name = self._my_guild.get("name", "Unknown Guild")
+            desc = self._my_guild.get("description") or "No description."
+            count = int(self._my_guild.get("member_count", 0) or 0)
+            role_label = str(self._my_guild.get("my_role_label", self._my_guild.get("my_role", "")) or "")
+            policy = self._my_guild.get("policy") if isinstance(self._my_guild.get("policy"), dict) else {}
+            focus = str(policy.get("event_focus", "balanced") or "balanced").replace("_", " ").title()
+            self._guild_name_lbl.setText(str(name))
+            self._guild_desc_lbl.setText(str(desc))
+            role_text = f"  •  {role_label}" if role_label else ""
+            self._guild_meta_lbl.setText(f"{count} member{'s' if count != 1 else ''}{role_text}  •  {focus}")
+            self._join_btn.setEnabled(False)
+            self._manage_guild_btn.setEnabled(True)
+        else:
+            self._guild_name_lbl.setText("No guild membership")
+            self._guild_desc_lbl.setText("Found your own guild or join one from the directory below.")
+            self._guild_meta_lbl.setText("")
+            self._join_btn.setEnabled(True)
+            self._manage_guild_btn.setEnabled(False)
+
+    def _open_guild_management(self) -> None:
+        if not self._my_guild:
+            self.msg.warn("Join or found a guild first.")
+            return
+        guild_id = str(self._my_guild.get("id", "") or "")
+        if not guild_id:
+            self.msg.err("Your guild is missing its ID.")
+            return
+        GuildManagementDialog(self.app, guild_id, self, on_change=lambda: self._load_guilds(force=True)).exec()
+
+    def _create_guild(self) -> None:
+        if not (self.app.online and self.app.online.is_online):
+            self.msg.warn("Sign in to create a guild.")
+            return
+        if self._my_guild:
+            self.msg.warn("Leave your current guild before founding a new one.")
+            return
+        name = TextPromptDialog(
+            self,
+            "Found a Guild",
+            "Choose a guild name.",
+            placeholder="Guild name",
+            confirm_text="Continue",
+        ).get_value()
+        if name is None:
+            return
+        name = name.strip()
+        if len(name) < 3:
+            self.msg.warn("Guild name must be at least 3 characters.")
+            return
+        desc = TextPromptDialog(
+            self,
+            "Guild Description",
+            "Add a short description for your guild.",
+            placeholder="Optional description",
+            confirm_text="Found Guild",
+        ).get_value()
+        description = (desc or "").strip()
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, guild_name=name: self._after_create_guild(r, guild_name))
+        self.app.online.guilds.create_guild(name, description, callback=_cb)
+
+    def _after_create_guild(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self._cache_guild_from_result(res.data)
+            self.msg.ok(f"Founded {name}.")
+            self.app._push_online_presence()
+            self.app._push_leaderboard()
+            self._load_guilds(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to create guild."))
+
+    def _join_selected_guild(self) -> None:
+        if self._my_guild:
+            self.msg.warn("Leave your current guild before joining another.")
+            return
+        row = self._guilds_table.selected()
+        if not row:
+            self.msg.warn("Select a guild to join.")
+            return
+        guild_id = str(row.get("guild_id", "") or "")
+        name = str(row.get("name", "that guild") or "that guild")
+        if not guild_id:
+            self.msg.err("That guild entry is missing its ID.")
+            return
+        recruitment_mode = str(row.get("recruitment_mode", "open") or "open").lower()
+        if recruitment_mode != "open":
+            self.msg.warn("That guild is not open for direct joining right now.")
+            return
+        min_rep = int(row.get("minimum_reputation", 0) or 0)
+        if int(getattr(self.game, "reputation", 0) or 0) < min_rep:
+            self.msg.warn(f"You need at least {min_rep} reputation to join {name}.")
+            return
+        min_net_worth = float(row.get("minimum_net_worth", 0) or 0.0)
+        if float(self.game._net_worth() or 0.0) < min_net_worth:
+            self.msg.warn(f"You need at least {min_net_worth:,.0f}g net worth to join {name}.")
+            return
+        if not ConfirmDialog(
+            self,
+            "Join Guild",
+            f"Join {name}?",
+            confirm_text="Join Guild",
+        ).ask():
+            return
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, guild_name=name: self._after_join_guild(r, guild_name))
+        self.app.online.guilds.join_guild(guild_id, callback=_cb)
+
+    def _after_join_guild(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self._cache_guild_from_result(res.data)
+            self.msg.ok(f"Joined {name}.")
+            self.app._push_online_presence()
+            self.app._push_leaderboard()
+            self._load_guilds(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to join guild."))
+
+    def _leave_guild(self) -> None:
+        if not self._my_guild:
+            self.msg.warn("You are not currently in a guild.")
+            return
+        guild_id = str(self._my_guild.get("id", "") or "")
+        name = str(self._my_guild.get("name", "your guild") or "your guild")
+        if not ConfirmDialog(
+            self,
+            "Leave Guild",
+            f"Leave {name}?",
+            confirm_text="Leave Guild",
+            confirm_role="danger",
+        ).ask():
+            return
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, guild_name=name: self._after_leave_guild(r, guild_name))
+        self.app.online.guilds.leave_guild(guild_id, callback=_cb)
+
+    def _after_leave_guild(self, res: Any, name: str) -> None:
+        if getattr(res, "success", False):
+            self.msg.ok(f"Left {name}.")
+            self.app._cached_guild_id = ""
+            self.app._cached_guild_name = ""
+            self.app._cached_guild_role = ""
+            self.app._push_online_presence()
+            self.app._push_leaderboard()
+            self._load_guilds(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to leave guild."))
+
+    def _respond_to_selected_guild_invite(self, accept: bool) -> None:
+        row = self._guild_invites_table.selected()
+        if not row:
+            self.msg.warn("Select a guild invite first.")
+            return
+        invite_id = str(row.get("invite_id", "") or "")
+        if not invite_id:
+            self.msg.err("That invite is missing its ID.")
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, accepted=accept, guild_name=str(row.get('guild', 'guild') or 'guild'): self._after_respond_guild_invite(r, accepted, guild_name))
+
+        self.app.online.guilds.respond_to_invite(invite_id, accept, callback=_cb)
+
+    def _after_respond_guild_invite(self, res: Any, accept: bool, guild_name: str) -> None:
+        if getattr(res, "success", False):
+            self.msg.ok(f"Joined {guild_name}." if accept else f"Declined invite from {guild_name}.")
+            self._load_guilds(force=True)
+            return
+        self.msg.err(getattr(res, "error", "Failed to respond to guild invite."))
+
+    def _cache_guild_from_result(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        guild = payload.get("guild") if isinstance(payload.get("guild"), dict) else payload
+        membership = payload.get("membership") if isinstance(payload.get("membership"), dict) else {}
+        if not isinstance(guild, dict):
+            return
+        self.app._cached_guild_id = str(guild.get("id", guild.get("guild_id", "")) or "")
+        self.app._cached_guild_name = str(guild.get("name", guild.get("guild_name", "")) or "")
+        role_label = str(
+            membership.get("role_label", "")
+            or payload.get("my_role_label", "")
+            or guild.get("my_role_label", "")
+            or payload.get("my_role", "")
+            or guild.get("my_role", "")
+            or ""
+        )
+        self.app._cached_guild_role = role_label
+
+    @staticmethod
+    def _guild_cell_text(row: Dict[str, Any]) -> str:
+        guild_name = str(row.get("guild_name", "") or "")
+        guild_role = str(row.get("guild_role", "") or "")
+        if not guild_name:
+            return "—"
+        return f"{guild_name} • {guild_role}" if guild_role else guild_name
+
+    @staticmethod
+    def _player_label(profile: Dict[str, Any]) -> str:
+        name = str(profile.get("username", "Unknown") or "Unknown")
+        disc = profile.get("discriminator", 0)
+        if isinstance(disc, int) and disc:
+            return f"{name} #{disc:04d}"
+        if disc:
+            return f"{name} #{disc}"
+        return name
+
+    @staticmethod
+    def _friend_presence(last_seen: str) -> Tuple[str, str, str]:
+        if not last_seen:
+            return ("Offline", "Offline", "dim")
+        try:
+            stamp = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            now = datetime.now(stamp.tzinfo) if stamp.tzinfo else datetime.utcnow()
+            age = (now - stamp).total_seconds()
+            if age < 300:
+                return ("● Online", "Now", "green")
+            if age < 1800:
+                mins = max(1, int(age // 60))
+                return ("◑ Away", f"{mins}m ago", "yellow")
+            hours = max(1, int(age // 3600))
+            return ("○ Offline", f"{hours}h ago", "dim")
+        except Exception:
+            return ("○ Offline", "Unknown", "dim")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS SCREEN  —  full settings & preferences panel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -14512,7 +17506,6 @@ MarketInfoScreen   = _make_stub("Market Info")
 HelpScreen         = _make_stub("Help")
 SettingsScreen     = _SettingsScreen
 GambleScreen       = _make_stub("Gambling")
-SocialScreen       = _make_stub("Social")
 
 
 # ── Register screens in GameApp._SCREEN_MAP ──────────────────────────────────

@@ -790,6 +790,8 @@ class LeaderboardManager:
         -- Performance index for ranking queries
         create index if not exists leaderboard_net_worth_idx
             on leaderboard (net_worth desc nulls last);
+        create index if not exists leaderboard_reputation_idx
+            on leaderboard (reputation desc nulls last);
 
         -- RLS (unchanged)
         alter table leaderboard enable row level security;
@@ -825,6 +827,8 @@ class LeaderboardManager:
             using (auth.uid() = user_id);
         create index leaderboard_net_worth_idx
             on leaderboard (net_worth desc nulls last);
+        create index leaderboard_reputation_idx
+            on leaderboard (reputation desc nulls last);
     """
 
     def __init__(self, client: OnlineClient, auth: AuthManager) -> None:
@@ -903,16 +907,18 @@ class LeaderboardManager:
     def fetch_top_scores(
         self,
         limit: int = 100,
+        metric: str = "net_worth",
         callback: Optional[Callable] = None,
     ) -> Optional[OnlineResult]:
-        """Fetch the top *limit* entries ordered by net_worth descending."""
+        """Fetch the top *limit* entries ordered by the requested metric descending."""
         def _do() -> OnlineResult:
+            order_col = "reputation" if metric == "reputation" else "net_worth"
             return self._client.get(
                 "/rest/v1/leaderboard",
                 params={
                     "select": "user_id,username,player_name,title,guild_id,guild_name,guild_role,"
                               "net_worth,score,lifetime_gold,day,reputation,area,updated_at",
-                    "order":  "net_worth.desc.nullsfirst",
+                    "order":  f"{order_col}.desc.nullsfirst",
                     "limit":  str(limit),
                 },
             )
@@ -923,16 +929,18 @@ class LeaderboardManager:
         return None
 
     def fetch_my_rank(
-        self, callback: Optional[Callable] = None
+        self, metric: str = "net_worth", callback: Optional[Callable] = None
     ) -> Optional[OnlineResult]:
-        """Return {"rank": int, "net_worth": float} for the current player."""
+        """Return {"rank": int, "value": float|int} for the current player and metric."""
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
 
+            metric_col = "reputation" if metric == "reputation" else "net_worth"
+
             my_result = self._client.get(
                 "/rest/v1/leaderboard",
-                params={"select": "net_worth",
+                params={"select": metric_col,
                         "user_id": f"eq.{self._auth.user_id}", "limit": "1"},
             )
             if not my_result.success:
@@ -940,18 +948,18 @@ class LeaderboardManager:
             rows = my_result.data if isinstance(my_result.data, list) else []
             if not rows:
                 return OnlineResult(success=False, error="No leaderboard entry found.")
-            my_nw = rows[0].get("net_worth", 0.0)
+            my_value = rows[0].get(metric_col, 0.0)
 
             above_result = self._client.get(
                 "/rest/v1/leaderboard",
-                params={"select": "user_id", "net_worth": f"gt.{my_nw}"},
+                params={"select": "user_id", metric_col: f"gt.{my_value}"},
             )
             if not above_result.success:
                 return above_result
 
             above_count = len(above_result.data) if isinstance(above_result.data, list) else 0
             return OnlineResult(success=True,
-                                data={"rank": above_count + 1, "net_worth": my_nw})
+                                data={"rank": above_count + 1, "value": my_value, "metric": metric_col})
 
         if callback is None:
             return _do()
@@ -2470,14 +2478,50 @@ class FriendsManager:
         def _do() -> OnlineResult:
             if not self._auth.is_authenticated:
                 return OnlineResult(success=False, error="Not signed in.")
-            return self._client.get(
+            pending = self._client.get(
                 "/rest/v1/friends",
                 params={
-                    "select":       "requester_id,created_at,profiles(username,discriminator,last_networth)",
+                    "select":       "requester_id,created_at",
                     "addressee_id": f"eq.{self._auth.user_id}",
                     "status":       "eq.pending",
+                    "order":        "created_at.asc",
+                    "limit":        "100",
                 },
             )
+            if not pending.success:
+                return pending
+
+            rows = pending.data if isinstance(pending.data, list) else []
+            if not rows:
+                return OnlineResult(success=True, data=[])
+
+            requester_ids = [str(row.get("requester_id", "") or "") for row in rows if str(row.get("requester_id", "") or "")]
+            if not requester_ids:
+                return OnlineResult(success=True, data=[])
+
+            ids_csv = ",".join(requester_ids)
+            profiles = self._client.get(
+                "/rest/v1/profiles",
+                params={
+                    "select": "id,username,discriminator,last_seen,last_networth",
+                    "id":     f"in.({ids_csv})",
+                    "limit":  "100",
+                },
+            )
+            profiles_by_id: Dict[str, Dict] = {}
+            if profiles.success and isinstance(profiles.data, list):
+                for profile in profiles.data:
+                    profiles_by_id[str(profile.get("id", "") or "")] = profile
+
+            combined = [
+                {
+                    "requester_id": row.get("requester_id", ""),
+                    "created_at": row.get("created_at"),
+                    "profile": profiles_by_id.get(str(row.get("requester_id", "") or ""), {}),
+                }
+                for row in rows
+            ]
+            return OnlineResult(success=True, data=combined)
 
         if callback is None:
             return _do()

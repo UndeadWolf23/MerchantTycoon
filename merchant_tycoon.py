@@ -23,10 +23,11 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import math
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 from copy import deepcopy
 from collections import deque
+from datetime import date
 
 # ─────────────────────────────────────────────────────────────────────────────
 # USER DATA DIRECTORY  —  AppData/Roaming on Windows, ~/.config elsewhere
@@ -152,10 +153,23 @@ class Item:
     area_produced: Optional[List[str]] = None # areas that naturally produce this
     description: str = ""
 
+
+CAT_TREAT_KEY = "cat_treat"
+
 @dataclass
 class PricePoint:
     day: int
     price: float
+
+@dataclass
+class InfluenceEffect:
+    item_key: str
+    start_day: int
+    peak_delta: float
+    ramp_days: int
+    hold_days: int
+    decay_days: int
+    kind: str = "campaign"
 
 @dataclass
 class Contract:
@@ -207,12 +221,12 @@ DEFAULT_HOTKEYS: Dict[str, str] = {
 
 @dataclass
 class GameSettings:
-    difficulty:    str   = "normal"  # "easy" / "normal" / "hard" / "brutal"
     autosave:      bool  = True      # autosave every in-game day
     ui_scale:      float = 1.0       # display / font scale (0.75 – 2.0)
-    music_volume:  float = 0.5       # 0.0 – 1.0
+    music_volume:  float = 0.3       # 0.0 – 1.0
     sfx_volume:    float = 0.7       # 0.0 – 1.0
     music_enabled: bool  = True
+    click_sound_enabled: bool = True
     profit_flash:          bool  = True      # golden flash on large earnings
     double_click_action:   bool  = True      # double-click table rows to perform primary action
     right_click_haggle:    bool  = True      # right-click buy table item to haggle
@@ -221,43 +235,45 @@ class GameSettings:
     hotkeys:               Dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_HOTKEYS)
     )
+    difficulty:    str   = "standard"  # retained only for legacy save compatibility
 
-    # Derived difficulty multipliers ──────────────────────────────────────────
+    # Standardized economy multipliers ───────────────────────────────────────
     @property
     def cost_mult(self) -> float:
-        """Multiplier on all outgoing costs (living, travel, wages, upkeep)."""
-        return {"easy": 0.70, "normal": 1.0, "hard": 1.35, "brutal": 1.80}[self.difficulty]
+        """Costs now use a single standardized balance profile for all players."""
+        return 1.0
 
     @property
     def price_sell_mult(self) -> float:
-        """Multiplier on sell prices received (harder = less for you)."""
-        return {"easy": 1.10, "normal": 1.0, "hard": 0.90, "brutal": 0.80}[self.difficulty]
+        """Sell prices now use a single standardized balance profile for all players."""
+        return 1.0
 
     @property
     def event_freq_mult(self) -> float:
-        """Multiplier on random event frequency."""
-        return {"easy": 0.60, "normal": 1.0, "hard": 1.40, "brutal": 2.00}[self.difficulty]
+        """Random events now use a single standardized balance profile for all players."""
+        return 1.0
 
     @property
     def attack_mult(self) -> float:
-        """Multiplier on travel attack/incident probability."""
-        return {"easy": 0.50, "normal": 1.0, "hard": 1.50, "brutal": 2.50}[self.difficulty]
+        """Travel risks now use a single standardized balance profile for all players."""
+        return 1.0
 
     SETTINGS_FILE: str = os.path.join(_USER_DATA_DIR, "settings.json")
 
     def save(self):
         with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "difficulty":    self.difficulty,
                 "autosave":      self.autosave,
                 "ui_scale":      self.ui_scale,
                 "music_volume":  self.music_volume,
                 "sfx_volume":    self.sfx_volume,
                 "music_enabled": self.music_enabled,
+                "click_sound_enabled": self.click_sound_enabled,
                 "profit_flash":         self.profit_flash,
                 "double_click_action":   self.double_click_action,
                 "right_click_haggle":    self.right_click_haggle,
                 "enable_signatures":     self.enable_signatures,
+                "gamble_mercy":          self.gamble_mercy,
                 "hotkeys":               self.hotkeys,
             }, f)
 
@@ -266,16 +282,18 @@ class GameSettings:
             try:
                 with open(self.SETTINGS_FILE, encoding="utf-8") as f:
                     d = json.load(f)
-                self.difficulty    = d.get("difficulty",    "normal")
+                self.difficulty    = "standard"
                 self.autosave      = d.get("autosave",      True)
                 self.ui_scale      = float(d.get("ui_scale",      1.0))
-                self.music_volume  = float(d.get("music_volume",  0.5))
+                self.music_volume  = float(d.get("music_volume",  0.3))
                 self.sfx_volume    = float(d.get("sfx_volume",    0.7))
                 self.music_enabled = bool(d.get("music_enabled",  True))
+                self.click_sound_enabled = bool(d.get("click_sound_enabled", True))
                 self.profit_flash         = bool(d.get("profit_flash",         True))
                 self.double_click_action  = bool(d.get("double_click_action",   True))
                 self.right_click_haggle   = bool(d.get("right_click_haggle",    True))
                 self.enable_signatures    = bool(d.get("enable_signatures",     True))
+                self.gamble_mercy         = int(d.get("gamble_mercy", 0))
                 # Merge saved hotkeys with defaults (new actions get default binding)
                 raw_hk = d.get("hotkeys", {})
                 if isinstance(raw_hk, dict):
@@ -380,37 +398,37 @@ LICENSE_INFO: Dict = {
         "tier": "starter",
     },
     LicenseType.BUSINESS:  {
-        "cost": 150,  "rep": 10, "banking": 0,
+        "cost": 150,  "rep": 20, "banking": 0,
         "desc": "Grants the right to purchase and operate businesses.",
         "unlocks": "Access the Manage Businesses menu and buy any listed business.",
         "tier": "basic",
     },
     LicenseType.CONTRACTS: {
-        "cost": 200,  "rep": 15, "banking": 0,
+        "cost": 200,  "rep": 30, "banking": 0,
         "desc": "Official seal for taking on formal delivery contracts.",
         "unlocks": "Accept delivery contracts and earn bonuses for on-time completion.",
         "tier": "basic",
     },
     LicenseType.LENDER:    {
-        "cost": 600,  "rep": 40, "banking": 1,
+        "cost": 600,  "rep": 75, "banking": 1,
         "desc": "Authorises you to lend money directly to citizens.",
         "unlocks": "Issue citizen loans and collect weekly interest payments.",
         "tier": "advanced",
     },
     LicenseType.FUND_MGR:  {
-        "cost": 2000, "rep": 60, "banking": 3,
+        "cost": 2000, "rep": 140, "banking": 3,
         "desc": "Qualifies you to manage private investment funds and trade stocks.",
         "unlocks": "Access the Stock Exchange and accept fund management clients.",
         "tier": "elite",
     },
     LicenseType.REAL_ESTATE: {
-        "cost": 1500, "rep": 55, "banking": 2,
+        "cost": 1500, "rep": 110, "banking": 2,
         "desc": "Grants the right to purchase, develop, and lease real estate and land.",
         "unlocks": "Browse property listings, buy land plots, construct buildings, repair & flip properties, and earn lease income.",
         "tier": "elite",
     },
     LicenseType.VOYAGE: {
-        "cost": 3000, "rep": 100, "banking": 0,
+        "cost": 3000, "rep": 220, "banking": 0,
         "desc": "A royal charter authorising you to outfit ships for international trade voyages.",
         "unlocks": "Buy ships, hire captains, load cargo, and send voyages to distant ports for massive profits.",
         "tier": "elite",
@@ -2027,6 +2045,7 @@ ALL_ITEMS: Dict[str, Item] = {
     "blubber":      Item("blubber",      "Whale Blubber",  35,   ItemCategory.RAW_MATERIAL,  "uncommon",  2.0, area_produced=["COAST", "TUNDRA"], description="Used for oil and light."),
 
     # ── Food & Drink ──────────────────────────────────────────────────────
+    "cat_treat":    Item("cat_treat",    "Cat Treat",      0,    ItemCategory.FOOD,          "legendary", 0.0, description="A suspiciously warm treat that seems determined to stay with you."),
     "fish":         Item("fish",         "Salted Fish",    15,   ItemCategory.FOOD,          "common",    1.0, area_produced=["COAST"], seasonal_bonus=Season.SUMMER, description="Preserves well."),
     "bread":        Item("bread",        "Bread",          18,   ItemCategory.FOOD,          "common",    0.8, description="Baked from wheat."),
     "ale":          Item("ale",          "Ale",            20,   ItemCategory.FOOD,          "common",    1.2, seasonal_bonus=Season.AUTUMN, description="Brewed from barley."),
@@ -2288,6 +2307,7 @@ class AreaMarket:
         }
         self.history:       Dict[str, deque] = {k: deque(maxlen=self.HISTORY_LEN) for k in self.item_keys}
         self.active_events: List[str]        = []
+        self.active_influences: List[InfluenceEffect] = []
         self.days_passed = 0
         self.travel_risk_override: float = 0.0  # extra risk; decays daily
 
@@ -2322,19 +2342,175 @@ class AreaMarket:
         discount = min(0.98, 0.92 + trading_skill * 0.01)
         return round(mid * discount, 2)
 
+    def bulk_order_discount(self, item_key: str, qty: int) -> float:
+        if item_key not in self.item_keys or qty < 5:
+            return 0.0
+        item = ALL_ITEMS.get(item_key)
+        if not item:
+            return 0.0
+        stock = max(1, self.stock.get(item_key, 0))
+        natural = max(1, self.natural_stock.get(item_key, stock))
+        stock_factor = max(0.35, min(1.10, stock / max(1.0, natural * 0.60)))
+        order_factor = min(0.08, math.sqrt(max(0, qty - 4)) * 0.006 + (qty / natural) * 0.05)
+        rarity_factor = {
+            "common": 1.00,
+            "uncommon": 0.88,
+            "rare": 0.70,
+            "legendary": 0.50,
+        }.get(getattr(item, "rarity", "common"), 0.85)
+        return round(max(0.0, min(0.08, order_factor * stock_factor * rarity_factor)), 4)
+
+    @staticmethod
+    def _combine_discounts(*discounts: float) -> float:
+        remaining = 1.0
+        for discount in discounts:
+            if discount <= 0:
+                continue
+            remaining *= (1.0 - min(0.95, discount))
+        return round(max(0.0, 1.0 - remaining), 4)
+
+    def quote_buy_total(self, item_key: str, qty: int, season: Season,
+                        trading_skill: int = 1, extra_discount: float = 0.0) -> float:
+        unit_price = self.get_buy_price(item_key, season, trading_skill)
+        total_discount = self._combine_discounts(
+            self.bulk_order_discount(item_key, qty),
+            extra_discount,
+        )
+        return round(unit_price * qty * (1.0 - total_discount), 2)
+
+    def schedule_influence(self, item_key: str, start_day: int,
+                           kind: str = "campaign") -> Optional[InfluenceEffect]:
+        if item_key not in self.item_keys:
+            return None
+        if kind == "campaign":
+            effect = InfluenceEffect(
+                item_key=item_key,
+                start_day=start_day,
+                peak_delta=random.uniform(0.16, 0.30),
+                ramp_days=random.randint(3, 6),
+                hold_days=random.randint(2, 4),
+                decay_days=random.randint(5, 9),
+                kind=kind,
+            )
+        else:
+            effect = InfluenceEffect(
+                item_key=item_key,
+                start_day=start_day,
+                peak_delta=-random.uniform(0.12, 0.24),
+                ramp_days=random.randint(2, 5),
+                hold_days=random.randint(1, 3),
+                decay_days=random.randint(4, 8),
+                kind=kind,
+            )
+        self.active_influences.append(effect)
+        return effect
+
+    def _effect_strength(self, effect: InfluenceEffect, abs_day: int) -> float:
+        elapsed = max(0, abs_day - effect.start_day)
+        ramp_end = effect.ramp_days
+        hold_end = ramp_end + effect.hold_days
+        decay_end = hold_end + effect.decay_days
+        if elapsed <= 0:
+            return 0.0
+        if elapsed <= ramp_end:
+            return effect.peak_delta * (elapsed / max(1, effect.ramp_days))
+        if elapsed <= hold_end:
+            return effect.peak_delta
+        if elapsed <= decay_end:
+            remaining = decay_end - elapsed
+            return effect.peak_delta * (remaining / max(1, effect.decay_days))
+        return 0.0
+
+    def active_influence_summary(self, item_key: str, abs_day: int) -> Dict[str, float]:
+        active: List[InfluenceEffect] = []
+        net_delta = 0.0
+        days_left = 0
+        for effect in self.active_influences:
+            strength = self._effect_strength(effect, abs_day)
+            total_days = effect.ramp_days + effect.hold_days + effect.decay_days
+            if effect.item_key == item_key and strength:
+                active.append(effect)
+                net_delta += strength
+                days_left = max(days_left, effect.start_day + total_days - abs_day)
+        label = "Campaign" if net_delta > 0.01 else "Slander" if net_delta < -0.01 else "Idle"
+        return {
+            "delta": round(net_delta, 4),
+            "days_left": max(0, days_left),
+            "count": len(active),
+            "label": label,
+        }
+
+    def to_save(self) -> Dict[str, object]:
+        return {
+            "stock": dict(self.stock),
+            "pressure": dict(self.pressure),
+            "history": {
+                key: [{"day": pp.day, "price": pp.price} for pp in points]
+                for key, points in self.history.items()
+            },
+            "active_events": list(self.active_events),
+            "active_influences": [asdict(effect) for effect in self.active_influences],
+            "days_passed": self.days_passed,
+            "travel_risk_override": self.travel_risk_override,
+        }
+
+    def from_save(self, data: Dict[str, object]) -> None:
+        stock_data = data.get("stock", {}) if isinstance(data, dict) else {}
+        if isinstance(stock_data, dict):
+            for key in self.item_keys:
+                if key in stock_data:
+                    self.stock[key] = int(stock_data[key])
+        pressure_data = data.get("pressure", {}) if isinstance(data, dict) else {}
+        if isinstance(pressure_data, dict):
+            for key in self.item_keys:
+                if key in pressure_data:
+                    self.pressure[key] = float(pressure_data[key])
+        history_data = data.get("history", {}) if isinstance(data, dict) else {}
+        if isinstance(history_data, dict):
+            for key in self.item_keys:
+                saved_points = history_data.get(key, [])
+                points = deque(maxlen=self.HISTORY_LEN)
+                if isinstance(saved_points, list):
+                    for entry in saved_points[-self.HISTORY_LEN:]:
+                        try:
+                            points.append(PricePoint(day=int(entry["day"]), price=float(entry["price"])))
+                        except Exception:
+                            pass
+                self.history[key] = points
+        self.active_events = [str(e) for e in data.get("active_events", [])][:8] if isinstance(data, dict) else []
+        self.active_influences = []
+        infl_data = data.get("active_influences", []) if isinstance(data, dict) else []
+        if isinstance(infl_data, list):
+            for entry in infl_data:
+                try:
+                    self.active_influences.append(InfluenceEffect(
+                        item_key=str(entry["item_key"]),
+                        start_day=int(entry["start_day"]),
+                        peak_delta=float(entry["peak_delta"]),
+                        ramp_days=int(entry["ramp_days"]),
+                        hold_days=int(entry["hold_days"]),
+                        decay_days=int(entry["decay_days"]),
+                        kind=str(entry.get("kind", "campaign")),
+                    ))
+                except Exception:
+                    pass
+        self.days_passed = int(data.get("days_passed", self.days_passed)) if isinstance(data, dict) else self.days_passed
+        self.travel_risk_override = float(data.get("travel_risk_override", self.travel_risk_override)) if isinstance(data, dict) else self.travel_risk_override
+
     # ── Transactions ─────────────────────────────────────────────────────────
 
-    def buy_from_market(self, item_key: str, qty: int, season: Season, trading_skill: int = 1) -> float:
+    def buy_from_market(self, item_key: str, qty: int, season: Season,
+                        trading_skill: int = 1, extra_discount: float = 0.0) -> float:
         if item_key not in self.item_keys:
             return -1.0
         if self.stock.get(item_key, 0) < qty:
             return -2.0
-        price = self.get_buy_price(item_key, season, trading_skill)
+        total = self.quote_buy_total(item_key, qty, season, trading_skill, extra_discount)
         self.stock[item_key] -= qty
         impact = min(0.22, math.sqrt(qty) * self.BUY_IMPACT)
         self.pressure[item_key] = min(self.MAX_PRESSURE,
                                       self.pressure[item_key] + impact)
-        return round(price * qty, 2)
+        return total
 
     def sell_to_market(self, item_key: str, qty: int, season: Season, trading_skill: int = 1) -> float:
         if item_key not in self.item_keys:
@@ -2355,13 +2531,26 @@ class AreaMarket:
 
     # ── Daily update ─────────────────────────────────────────────────────────
 
-    def update(self, season: Season):
+    def update(self, season: Season, abs_day: Optional[int] = None):
         """Called once per in-game day: restock, mean-revert pressure, history."""
         self.days_passed += 1
+        if abs_day is None:
+            abs_day = self.days_passed
+        self.active_influences = [
+            effect for effect in self.active_influences
+            if self._effect_strength(effect, abs_day) != 0.0
+            or abs_day <= effect.start_day
+        ]
         for k in self.item_keys:
             # Mean-revert pressure toward natural value (~5 days to half-recover)
             nat = self.natural_pressure[k]
-            self.pressure[k] += (nat - self.pressure[k]) * self.REVERT_RATE
+            influence_delta = sum(
+                self._effect_strength(effect, abs_day)
+                for effect in self.active_influences
+                if effect.item_key == k
+            )
+            target_pressure = max(self.MIN_PRESSURE, min(self.MAX_PRESSURE, nat + influence_delta))
+            self.pressure[k] += (target_pressure - self.pressure[k]) * self.REVERT_RATE
             self.pressure[k]  = max(self.MIN_PRESSURE,
                                     min(self.MAX_PRESSURE, self.pressure[k]))
 
@@ -2633,7 +2822,9 @@ class Inventory:
         new_qty  = old_qty + qty
         self.cost_basis[key] = (old_cost * old_qty + price_per_unit * qty) / max(new_qty, 1)
 
-    def remove(self, key: str, qty: int) -> bool:
+    def remove(self, key: str, qty: int, *, force: bool = False) -> bool:
+        if key == CAT_TREAT_KEY and not force:
+            return False
         if self.items.get(key, 0) >= qty:
             self.items[key] -= qty
             if self.items[key] == 0:
@@ -2936,6 +3127,7 @@ class Game:
             "lifetime_loss_count": 0,   # how many times sold at a loss
         }
         self.influence_cooldowns: Dict[str, int] = {}  # "{area}:{item}:{action}" → expiry abs_day
+        self.daily_haggles: Dict[str, Dict[str, object]] = {}
         # ── Titles ────────────────────────────────────────────────────────
         self.earned_titles: List[str] = []   # list of earned title IDs
         self.active_title:  str       = ""   # currently equipped title ID
@@ -2952,7 +3144,138 @@ class Game:
         # ── Account binding ────────────────────────────────────────────────────
         self.bound_user_id: str = ""   # Supabase user_id this save is locked to
         self._load_error:   str = ""   # set by load_game on account-mismatch
+        self.new_game_tutorial_offered: bool = False
+        self.new_game_tutorial_completed: bool = False
+        self.cat_state: Dict[str, Any] = self._default_cat_state()
         self._generate_captains()
+
+    @staticmethod
+    def _default_cat_state() -> Dict[str, Any]:
+        return {
+            "paw_found": False,
+            "treat_used": False,
+            "adoption_resolved": False,
+            "cat_adopted": False,
+            "cat_left": False,
+            "cat_name": "",
+            "last_pet_real_day": "",
+        }
+
+    def _normalize_cat_state(self, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        merged = dict(self._default_cat_state())
+        if isinstance(state, dict):
+            merged.update(state)
+        merged["paw_found"] = bool(merged.get("paw_found", False))
+        merged["treat_used"] = bool(merged.get("treat_used", False))
+        merged["adoption_resolved"] = bool(merged.get("adoption_resolved", False))
+        merged["cat_adopted"] = bool(merged.get("cat_adopted", False))
+        merged["cat_left"] = bool(merged.get("cat_left", False))
+        merged["cat_name"] = str(merged.get("cat_name", "") or "").strip()
+        merged["last_pet_real_day"] = str(merged.get("last_pet_real_day", "") or "")
+        if merged["cat_adopted"]:
+            merged["adoption_resolved"] = True
+            merged["cat_left"] = False
+        if merged["cat_left"]:
+            merged["adoption_resolved"] = True
+            merged["cat_adopted"] = False
+            merged["cat_name"] = ""
+        if merged["treat_used"]:
+            merged["paw_found"] = True
+        return merged
+
+    def is_fresh_profile(self) -> bool:
+        return (
+            self.day == 1
+            and self.year == 1
+            and self.season == Season.SPRING
+            and self.current_area == Area.CITY
+            and round(float(getattr(self.inventory, "gold", 0.0) or 0.0), 2) == 750.0
+            and not getattr(self.inventory, "items", {})
+            and abs(float(self.bank_balance or 0.0)) < 0.01
+            and int(self.reputation) == 50
+            and int(self.heat) == 0
+            and int(self.daily_time_units) == 0
+            and abs(float(self.total_profit or 0.0)) < 0.01
+            and int(self.lifetime_trades) == 0
+            and not self.businesses
+            and not self.contracts
+            and not self.loans
+            and not self.cds
+            and not self.citizen_loans
+            and not self.stock_holdings
+            and not self.fund_clients
+            and self.business_manager is None
+            and not self.real_estate
+            and not self.land_plots
+            and not self.hired_managers
+            and not self.ships
+            and not self.voyages
+            and not self.news_feed
+            and not self.event_log
+            and not self.trade_log
+            and len(self.licenses) == 1
+            and LicenseType.MERCHANT in self.licenses
+        )
+
+    def should_offer_new_game_tutorial(self) -> bool:
+        return self.is_fresh_profile() and not self.new_game_tutorial_offered
+
+    def item_is_locked(self, key: str) -> bool:
+        return key == CAT_TREAT_KEY and self.inventory.has(CAT_TREAT_KEY)
+
+    def has_cat_treat(self) -> bool:
+        return self.inventory.has(CAT_TREAT_KEY)
+
+    def cat_help_unlocked(self) -> bool:
+        return bool(self.cat_state.get("paw_found", False) or self.has_cat_treat() or self.cat_state.get("treat_used", False) or self.cat_state.get("adoption_resolved", False))
+
+    def discover_cat_treat(self) -> bool:
+        self.cat_state["paw_found"] = True
+        if self.has_cat_treat():
+            return False
+        self.inventory.add(CAT_TREAT_KEY, 1)
+        return True
+
+    def use_cat_treat(self) -> bool:
+        if not self.has_cat_treat() or self.cat_state.get("adoption_resolved", False):
+            return False
+        if not self.inventory.remove(CAT_TREAT_KEY, 1, force=True):
+            return False
+        self.cat_state["paw_found"] = True
+        self.cat_state["treat_used"] = True
+        return True
+
+    def adopt_cat(self, name: str) -> str:
+        final_name = str(name or "").strip()[:15] or "Stray"
+        self.inventory.items.pop(CAT_TREAT_KEY, None)
+        self.inventory.cost_basis.pop(CAT_TREAT_KEY, None)
+        self.cat_state["paw_found"] = True
+        self.cat_state["treat_used"] = True
+        self.cat_state["adoption_resolved"] = True
+        self.cat_state["cat_adopted"] = True
+        self.cat_state["cat_left"] = False
+        self.cat_state["cat_name"] = final_name
+        return final_name
+
+    def decline_cat(self) -> None:
+        self.inventory.items.pop(CAT_TREAT_KEY, None)
+        self.inventory.cost_basis.pop(CAT_TREAT_KEY, None)
+        self.cat_state["paw_found"] = True
+        self.cat_state["treat_used"] = True
+        self.cat_state["adoption_resolved"] = True
+        self.cat_state["cat_adopted"] = False
+        self.cat_state["cat_left"] = True
+        self.cat_state["cat_name"] = ""
+
+    def can_pet_cat_today(self) -> bool:
+        return bool(self.cat_state.get("cat_adopted", False)) and self.cat_state.get("last_pet_real_day", "") != date.today().isoformat()
+
+    def pet_cat(self) -> int:
+        if not self.can_pet_cat_today():
+            return 0
+        gained = self._gain_reputation(20)
+        self.cat_state["last_pet_real_day"] = date.today().isoformat()
+        return gained
 
     def _generate_captains(self) -> None:
         """Generate a pool of 6 hireable captains at game start."""
@@ -2985,12 +3308,12 @@ class Game:
             self.next_captain_id += 1
 
     def _living_cost(self) -> float:
-        """Living cost fluctuates daily ±30%, scaled by difficulty."""
+        """Living cost fluctuates daily ±30% on the standardized economy."""
         fluctuation = random.uniform(0.70, 1.30)
         return round(self.BASE_LIVING_COST * fluctuation * self.settings.cost_mult, 2)
 
     def _sell_mult(self) -> float:
-        """Effective sell-price multiplier: difficulty × reputation penalty × title bonus."""
+        """Effective sell-price multiplier: standardized economy × reputation penalty × title bonus."""
         rep_penalty = 1.0
         if self.reputation < 40:
             # Linear penalty: rep 0→0.78, rep 20→0.87, rep 40→1.0
@@ -3227,12 +3550,79 @@ class Game:
     def _absolute_day(self) -> int:
         return (self.year - 1) * 360 + self.day
 
+    def _haggle_key(self, area: Area, item_key: str) -> str:
+        return f"{area.name}:{item_key}"
+
+    def _haggle_record(self, area: Area, item_key: str) -> Dict[str, object]:
+        today = self._absolute_day()
+        key = self._haggle_key(area, item_key)
+        record = self.daily_haggles.get(key)
+        if not isinstance(record, dict) or int(record.get("day", -1)) != today:
+            record = {"day": today, "attempts": 0, "discount": 0.0, "displeased": False}
+            self.daily_haggles[key] = record
+        return record
+
+    def current_haggle_discount(self, area: Area, item_key: str) -> float:
+        record = self._haggle_record(area, item_key)
+        if bool(record.get("displeased", False)):
+            return 0.0
+        return float(record.get("discount", 0.0) or 0.0)
+
+    def haggle_attempts_today(self, area: Area, item_key: str) -> int:
+        return int(self._haggle_record(area, item_key).get("attempts", 0))
+
+    def clear_haggle_offer(self, area: Area, item_key: str) -> None:
+        self._haggle_record(area, item_key)["discount"] = 0.0
+
+    def try_haggle(self, area: Area, item_key: str) -> Dict[str, object]:
+        record = self._haggle_record(area, item_key)
+        attempts = int(record.get("attempts", 0))
+        if attempts >= 2:
+            record["attempts"] = attempts + 1
+            record["discount"] = 0.0
+            record["displeased"] = True
+            return {"status": "refused", "attempts": int(record["attempts"]), "discount": 0.0, "chance": 0.0}
+
+        chance = 0.10 + self.skills.haggling * 0.08
+        min_discount = 0.05
+        max_discount = 0.15 + self.skills.haggling * 0.02
+        if attempts == 1:
+            chance = max(0.05, chance * 0.65)
+            min_discount = 0.02
+            max_discount = 0.08 + self.skills.haggling * 0.015
+
+        attempts += 1
+        record["attempts"] = attempts
+        record["displeased"] = False
+        if random.random() < chance:
+            discount = round(random.uniform(min_discount, max_discount), 4)
+            record["discount"] = discount
+            return {"status": "success", "attempts": attempts, "discount": discount, "chance": chance}
+
+        record["discount"] = 0.0
+        return {"status": "failed", "attempts": attempts, "discount": 0.0, "chance": chance}
+
     def _season_from_day(self) -> Season:
         idx = ((self.day - 1) // self.DAYS_PER_SEASON) % self.SEASONS_PER_YEAR
         return list(Season)[idx]
 
     def _max_carry_weight(self) -> float:
-        return 100.0 + self.skills.logistics * 20.0
+        return 100.0 + self.skills.logistics * 30.0
+
+    def _gain_reputation(self, amount: int) -> int:
+        gain = max(0, int(amount))
+        if gain <= 0:
+            return 0
+        self.reputation = max(0, self.reputation + gain)
+        return gain
+
+    def _lose_reputation(self, amount: int) -> int:
+        loss = max(0, int(amount))
+        if loss <= 0:
+            return 0
+        applied = min(self.reputation, loss)
+        self.reputation = max(0, self.reputation - loss)
+        return applied
 
     def _current_weight(self) -> float:
         return sum(ALL_ITEMS[k].weight * v for k, v in self.inventory.items.items() if k in ALL_ITEMS)
@@ -3862,7 +4252,7 @@ class Game:
                 value = needed * con.price_per_unit + con.reward_bonus
                 self.inventory.remove(con.item_key, needed)
                 self.inventory.gold += value
-                self.reputation      = min(100, self.reputation + 2)
+                self._gain_reputation(2)
                 self.total_profit   += value
                 self._track_stat("contracts_completed")
                 if days_left > 0:
@@ -4342,11 +4732,13 @@ class Game:
 
     def _rep_label(self) -> str:
         r = self.reputation
-        if r < 20:   return c("Outlaw",     RED)
-        if r < 40:   return c("Suspect",    YELLOW)
-        if r < 60:   return c("Neutral",    WHITE)
-        if r < 80:   return c("Trusted",    GREEN)
-        return               c("Legendary", CYAN)
+        if r < 0:      return c("Outlaw", RED)
+        if r < 100:    return c("Unknown", WHITE)
+        if r < 250:    return c("Recognized", GREEN)
+        if r < 500:    return c("Renowned", CYAN)
+        if r < 1000:   return c("Famed", MAGENTA)
+        if r < 10000:  return c("Legendary", YELLOW)
+        return                 c("Mythic", BRIGHT_YELLOW)
 
     def _log_event(self, msg: str):
         self.event_log.appendleft(f"[Y{self.year} D{self.day}] {msg}")
@@ -4467,11 +4859,9 @@ class Game:
 
         # ── SYSTEM ───────────────────────────────────────────────────────
         print()
-        diff_col = {"easy": GREEN, "normal": CYAN,
-                    "hard": YELLOW, "brutal": RED}.get(self.settings.difficulty, CYAN)
         as_txt   = c("[AS]", GREEN) if self.settings.autosave else c("[AS off]", GREY)
-        diff_txt = c(self.settings.difficulty.capitalize(), diff_col)
-        print(f"  {key('SAVE')} Save   {key('O')} Options·{diff_txt} {as_txt}   {key('Q')} Quit   {key('?')} Help")
+        std_txt  = c("Standard balance", CYAN)
+        print(f"  {key('SAVE')} Save   {key('O')} Options·{std_txt} {as_txt}   {key('Q')} Quit   {key('?')} Help")
 
     # ── Trading ──────────────────────────────────────────────────────────────
 
@@ -4839,18 +5229,18 @@ class Game:
             err("Invalid input.")
             return
 
-        # Haggling chance = 10% + 8% per haggling level
-        chance = 0.10 + self.skills.haggling * 0.08
-        discount = 0.0
-        if random.random() < chance:
-            discount = random.uniform(0.05, 0.15 + self.skills.haggling * 0.02)
-            ok(f"Haggling succeeded! {int(discount*100)}% discount.")
+        haggle = self.try_haggle(self.current_area, item_key)
+        status = str(haggle.get("status", "failed"))
+        discount = float(haggle.get("discount", 0.0) or 0.0)
+        if status == "success":
+            ok(f"Haggling succeeded! {int(discount * 100)}% extra discount.")
+        elif status == "refused":
+            warn("The merchant is displeased. Third haggle attempt today refused and prior offers are gone.")
         else:
-            warn("Haggling failed — paying full price.")
+            warn("Haggling failed — any special offer on this item is gone for now.")
 
-        original_price = market.get_buy_price(item_key, self.season, self.skills.trading)
-        final_price = round(original_price * (1 - discount), 2)
-        total = final_price * qty
+        total = market.quote_buy_total(item_key, qty, self.season, self.skills.trading, discount)
+        final_price = round(total / max(1, qty), 2)
 
         cap = self._max_carry_weight()
         cur_w = self._current_weight()
@@ -4863,12 +5253,11 @@ class Game:
             err(f"Not enough gold. Need {total:.2f}g, have {self.inventory.gold:.2f}g")
             return
 
-        result = market.buy_from_market(item_key, qty, self.season, self.skills.trading)
+        result = market.buy_from_market(item_key, qty, self.season, self.skills.trading, discount)
         if result < 0:
             err("Transaction failed.")
             return
-        # apply discount retroactively
-        actual_total = final_price * qty
+        actual_total = result
         self.inventory.gold -= actual_total
         self.inventory.record_purchase(item_key, qty, final_price)
         self.inventory.add(item_key, qty)
@@ -5050,7 +5439,7 @@ class Game:
         # ── Travel expenses ───────────────────────────────────────────────
         travel_cost = round(days_travel * 3.0 * self.settings.cost_mult, 1)
         print(f"\n  {GREY}Travel cost: {c(f'{travel_cost:.1f}g', YELLOW)} "
-              f"({days_travel}d × 3g base × {self.settings.cost_mult:.2f} difficulty){RESET}")
+              f"({days_travel}d × 3g base){RESET}")
         if self.inventory.gold < travel_cost:
             err("Not enough gold to cover travel expenses!")
             return
@@ -5656,7 +6045,7 @@ class Game:
                 self.inventory.gold -= payoff
                 self.loans.pop(idx)
                 ok("Loan fully repaid!")
-                self.reputation = min(100, self.reputation + 5)
+                self._gain_reputation(5)
                 self._gain_skill_xp(SkillType.BANKING, 15)
                 self._track_stat("loans_repaid")
                 self._check_achievements()
@@ -5859,7 +6248,7 @@ class Game:
             if days_left >= 0:
                 earnings += con.reward_bonus
                 ok(f"Contract fulfilled on time! Earned {c(f'+{earnings:.2f}g', GREEN)}")
-                self.reputation = min(100, self.reputation + 3)
+                self._gain_reputation(3)
                 # ── Achievement tracking ──────────────────────────────────
                 self._track_stat("contracts_completed")
                 self._track_stat("contracts_ontime")
@@ -6253,7 +6642,7 @@ class Game:
             market = self.markets[self.current_area]
             rep_col = RED if self.reputation < 40 else YELLOW if self.reputation < 70 else GREEN
             print(header(f"SOCIAL & INFLUENCE  —  {self.current_area.value}"))
-            print(f"  Reputation: {c(f'{self.reputation}/100', rep_col)}  ({self._rep_label()})")
+            print(f"  Reputation: {c(str(self.reputation), rep_col)}  ({self._rep_label()})")
             print(f"  Gold (wallet): {c(f'{self.inventory.gold:.0f}g', YELLOW)}")
             print(f"\n  {CYAN}1{RESET}. Donate to local causes     "
                   f"{GREY}· spend gold, raise rep{RESET}")
@@ -6271,10 +6660,10 @@ class Game:
                 # ── DONATE ────────────────────────────────────────────────
                 print(header("DONATE TO LOCAL CAUSES"))
                 rep_col2 = RED if self.reputation < 40 else YELLOW if self.reputation < 70 else GREEN
-                print(f"  Current rep: {c(f'{self.reputation}/100', rep_col2)}")
+                print(f"  Current rep: {c(str(self.reputation), rep_col2)}")
                 print(f"  Donating gold to local guilds, temples and orphanages raises your standing.")
                 print(f"  {GREY}Rep gain = roughly 1 point per 15g donated.{RESET}")
-                print(f"  {GREY}Diminishing returns kick in toward rep 90+.{RESET}")
+                print(f"  {GREY}Diminishing returns begin once your reputation climbs past 100.{RESET}")
                 print(f"\n  Presets:")
                 presets = [
                     (20,  "A modest gesture."),
@@ -6283,7 +6672,8 @@ class Game:
                     (300, "A legendary act of generosity."),
                 ]
                 for i, (amt, note) in enumerate(presets, 1):
-                    rep_gain = max(1, int(amt / 15) - max(0, (self.reputation - 80) // 10))
+                    rep_penalty = max(0, (self.reputation - 100) // 100)
+                    rep_gain = max(1, int(amt / 15) - rep_penalty)
                     print(f"  {CYAN}{i}{RESET}. Donate {c(f'{amt}g', YELLOW)}  "
                           f"→  +{rep_gain} rep  {GREY}({note}){RESET}")
                 print(f"  {CYAN}5{RESET}. Custom amount")
@@ -6303,12 +6693,12 @@ class Game:
                     if donate_amt > self.inventory.gold:
                         err(f"Not enough gold. Have {self.inventory.gold:.0f}g.")
                         continue
-                    rep_gain = max(1, int(donate_amt / 15) - max(0, (self.reputation - 80) // 10))
-                    rep_gain = min(rep_gain, 100 - self.reputation)  # can't exceed 100
+                    rep_penalty = max(0, (self.reputation - 100) // 100)
+                    rep_gain = max(1, int(donate_amt / 15) - rep_penalty)
                     self.inventory.gold -= donate_amt
-                    self.reputation = min(100, self.reputation + rep_gain)
+                    self._gain_reputation(rep_gain)
                     ok(f"Donated {donate_amt:.0f}g to {self.current_area.value}. "
-                       f"Reputation +{rep_gain}  →  {self.reputation}/100")
+                       f"Reputation +{rep_gain}  →  {self.reputation}")
                     self._log_event(f"Donated {donate_amt:.0f}g in {self.current_area.value}  (+{rep_gain} rep)")
                     headline = random.choice([
                         f"Wealthy merchant makes generous donation in {self.current_area.value}.",
@@ -6326,17 +6716,16 @@ class Game:
                 # ── CAMPAIGN ──────────────────────────────────────────────
                 print(header("CAMPAIGN FOR AN ITEM"))
                 print(f"  Hire criers and post bills to stoke demand for a specific item.")
-                print(f"  {GREY}Effect: raises market demand pressure here (prices go up) for ~15–25 days.{RESET}")
+                print(f"  {GREY}Effect: gradually raises local demand over several days, then tapers off naturally.{RESET}")
                 print(f"  {GREY}Cost: 60–200g depending on item rarity.{RESET}")
 
                 local_keys = sorted(market.item_keys)
                 for i, k in enumerate(local_keys, 1):
                     item = ALL_ITEMS[k]
                     cur_p   = market.get_buy_price(k, self.season, self.skills.trading)
-                    pres    = market.pressure.get(k, 1.0)
                     rarity_costs = {"common": 60, "uncommon": 100, "rare": 150, "legendary": 200}
                     cost    = rarity_costs.get(item.rarity, 80)
-                    est_up  = round(pres * 1.25 * cur_p - cur_p, 1)
+                    est_up  = round(cur_p * random.uniform(0.10, 0.22), 1)
                     print(f"  {CYAN}{i:>2}{RESET}. {item.name:<22} "
                           f"Now: {c(f'{cur_p:.1f}g', YELLOW):>14}  "
                           f"Cost: {c(f'{cost}g', YELLOW):>12}  "
@@ -6354,10 +6743,7 @@ class Game:
                         err(f"Need {cost}g to run campaign. Have {self.inventory.gold:.0f}g.")
                         continue
                     self.inventory.gold -= cost
-                    # Boost pressure by 25% — mean reversion will unwind it in ~15-25 days
-                    old_p = market.pressure.get(k, 1.0)
-                    new_p = min(market.MAX_PRESSURE, old_p * 1.25)
-                    market.pressure[k] = new_p
+                    market.schedule_influence(k, self._absolute_day(), kind="campaign")
                     ok(f"Campaign underway for {item.name}! Demand rising in {self.current_area.value}.")
                     self._log_event(f"Campaigned {item.name} in {self.current_area.value}  (-{cost}g)")
                     headline = random.choice([
@@ -6376,15 +6762,14 @@ class Game:
                 # ── SLANDER ───────────────────────────────────────────────
                 print(header("SLANDER AN ITEM"))
                 print(f"  Spread whispers, bribe critics, start rumours — undercut demand for a good.")
-                print(f"  {GREY}Effect: lowers market demand pressure (prices fall) for ~10–20 days.{RESET}")
+                print(f"  {GREY}Effect: gradually lowers local demand, then levels back toward normal as rumours fade.{RESET}")
                 print(f"  {c('Costs: -5 to -10 reputation. Free to execute.', RED)}")
 
                 local_keys = sorted(market.item_keys)
                 for i, k in enumerate(local_keys, 1):
                     item = ALL_ITEMS[k]
                     cur_p = market.get_sell_price(k, self.season, self.skills.trading)
-                    pres  = market.pressure.get(k, 1.0)
-                    est_dn = round(cur_p - pres * 0.80 * cur_p / max(pres, 0.01), 1)
+                    est_dn = round(cur_p * random.uniform(0.08, 0.18), 1)
                     print(f"  {CYAN}{i:>2}{RESET}. {item.name:<22} "
                           f"Now: {c(f'{cur_p:.1f}g', YELLOW):>14}  "
                           f"Rep cost: {c('-5 to -10', RED):>18}  "
@@ -6400,13 +6785,10 @@ class Game:
                     if self.reputation - rep_cost < 0:
                         err("Your reputation is too low to risk further scandal.")
                         continue
-                    # Reduce pressure by 20%
-                    old_p = market.pressure.get(k, 1.0)
-                    new_p = max(market.MIN_PRESSURE, old_p * 0.80)
-                    market.pressure[k] = new_p
+                    market.schedule_influence(k, self._absolute_day(), kind="slander")
                     self.reputation = max(0, self.reputation - rep_cost)
                     warn(f"Slander spread about {item.name} in {self.current_area.value}. "
-                         f"Rep -{rep_cost}  →  {self.reputation}/100")
+                        f"Rep -{rep_cost}  →  {self.reputation}")
                     self._log_event(
                         f"Slandered {item.name} in {self.current_area.value}  (-{rep_cost} rep)")
                     headline = random.choice([
@@ -6563,7 +6945,7 @@ class Game:
             print(f"  {GREY}No businesses — trading profit only.{RESET}")
 
         print(f"\n  {BOLD}PLAYER STATUS{RESET}")
-        print(f"  {'Reputation':.<{col_w}} {self._rep_label()}  ({self.reputation}/100)")
+        print(f"  {'Reputation':.<{col_w}} {self._rep_label()}  ({self.reputation})")
         heat_col = RED if self.heat > 50 else YELLOW if self.heat > 0 else GREY
         print(f"  {'Heat Level':.<{col_w}} {c(f'{self.heat}/100', heat_col)}")
         print(f"  {'Lifetime Trades':.<{col_w}} {self.lifetime_trades}")
@@ -6817,7 +7199,7 @@ class Game:
                      "Increases success chance and discount size with the Haggle option.\n"
                      "Lv1: 18% chance.  Lv5: 50% chance, up to 25% discount."),
                     ("Logistics",
-                     "+20 carry weight per level. Base: 100 weight. Heavy items (Coal 2.5,\n"
+                     "+30 carry weight per level. Base: 100 weight. Heavy items (Coal 2.5,\n"
                      "Timber 3.0) need Logistics Lv3+ to carry in meaningful bulk."),
                     ("Industry",
                      "Lv2+: +8% bonus production per level above 1 on every business, daily.\n"
@@ -7232,8 +7614,9 @@ class Game:
                 self.inventory.add(b.item_produced, bonus)
 
         # Market updates
+        current_abs_day = self._absolute_day()
         for market in self.markets.values():
-            market.update(self.season)
+            market.update(self.season, current_abs_day)
 
         # Monthly loan payments + savings interest (every 30 days)
         if self.day % 30 == 0:
@@ -7244,7 +7627,7 @@ class Game:
                     if loan.months_remaining <= 0:
                         self.loans.remove(loan)
                         ok("Loan fully repaid!")
-                        self.reputation = min(100, self.reputation + 5)
+                        self._gain_reputation(5)
                 else:
                     # Default
                     warn(f"Loan payment missed! Debt increases. Rep -10.")
@@ -7318,6 +7701,7 @@ class Game:
                 if _ship:
                     self.ships.remove(_ship)
                 self.ach_stats["voyages_lost"] = self.ach_stats.get("voyages_lost", 0) + 1
+                self._lose_reputation(3)
                 self.news_feed.appendleft((self._absolute_day(), "Sea", "Shipwreck",
                                            f"The {_voy.ship_name} was lost at sea!"))
                 self.event_log.appendleft(_voy.outcome_text)
@@ -7329,6 +7713,7 @@ class Game:
                     _ship.status    = "docked"
                     _ship.voyage_id = None
                 self.ach_stats["voyages_lost"] = self.ach_stats.get("voyages_lost", 0) + 1
+                self._lose_reputation(2)
                 self.news_feed.appendleft((self._absolute_day(), "Sea", "Piracy",
                                            f"The {_voy.ship_name} was seized by pirates!"))
                 self.event_log.appendleft(_voy.outcome_text)
@@ -7357,6 +7742,7 @@ class Game:
                     _ship.voyage_id = None
                 self.ach_stats["voyages_completed"] = self.ach_stats.get("voyages_completed", 0) + 1
                 self.ach_stats["voyage_gold_earned"] = self.ach_stats.get("voyage_gold_earned", 0.0) + _profit
+                self._gain_reputation(2)
                 self.news_feed.appendleft((self._absolute_day(), "Sea", "Voyage Return",
                                            _voy.outcome_text))
                 self.event_log.appendleft(_voy.outcome_text)
@@ -7383,7 +7769,7 @@ class Game:
                 if cl.weeks_remaining <= 0:
                     ok(f"Citizen loan fully repaid: {cl.borrower_name}  "
                        f"(total: +{cl.total_received:.0f}g)")
-                    self.reputation = min(100, self.reputation + 1)
+                    self._gain_reputation(1)
                     self._log_event(f"Citizen loan repaid by {cl.borrower_name}: +{cl.total_received:.0f}g")
 
         # ── Real estate — daily lease income & construction progress ──────────
@@ -7455,7 +7841,7 @@ class Game:
                 fc.withdrawn = True
                 ok(f"Fund matured — paid {fc.name} {c(f'{owed:.0f}g', YELLOW)}. "
                    f"Fees earned: {c(f'+{fc.fees_collected:.0f}g', GREEN)}")
-                self.reputation = min(100, self.reputation + 2)
+                self._gain_reputation(2)
                 self._log_event(f"Fund matured for {fc.name}: paid {owed:.0f}g")
             else:
                 warn(f"Can't pay fund client {fc.name}! Need {owed:.0f}g.  Rep -5")
@@ -7552,8 +7938,11 @@ class Game:
         }
 
         data = {
-            "version": 2,
+            "version": 3,
             "bound_user_id": self.bound_user_id,
+            "new_game_tutorial_offered": self.new_game_tutorial_offered,
+            "new_game_tutorial_completed": self.new_game_tutorial_completed,
+            "cat_state": self._normalize_cat_state(self.cat_state),
             "player_name": self.player_name,
             "day": self.day, "year": self.year, "season": self.season.name,
             "current_area": self.current_area.name,
@@ -7614,6 +8003,11 @@ class Game:
             "time_played_seconds": self.time_played_seconds,
             "gamble_mercy":       self.settings.gamble_mercy,
             "influence_cooldowns": dict(self.influence_cooldowns),
+            "daily_haggles": deepcopy(self.daily_haggles),
+            "markets": {
+                area.name: market.to_save()
+                for area, market in self.markets.items()
+            },
             # ── Real Estate ──────────────────────────────────────────────────────────
             "real_estate": [
                 {"id": p.id, "prop_type": p.prop_type, "name": p.name,
@@ -7734,6 +8128,9 @@ class Game:
                 self.bound_user_id = file_uid
 
             self.player_name  = data.get("player_name", "Merchant")
+            self.new_game_tutorial_offered = bool(data.get("new_game_tutorial_offered", False))
+            self.new_game_tutorial_completed = bool(data.get("new_game_tutorial_completed", False))
+            self.cat_state = self._normalize_cat_state(data.get("cat_state"))
             self.day          = data.get("day", 1)
             self.year         = data.get("year", 1)
             self.season       = Season[data.get("season", "SPRING")]
@@ -7741,6 +8138,12 @@ class Game:
             self.inventory    = Inventory(data.get("gold", 500.0))
             self.inventory.items      = data.get("inventory_items", {})
             self.inventory.cost_basis = data.get("cost_basis", {})
+            if self.inventory.items.get(CAT_TREAT_KEY, 0) > 1:
+                self.inventory.items[CAT_TREAT_KEY] = 1
+            if self.cat_state.get("treat_used", False):
+                self.inventory.items.pop(CAT_TREAT_KEY, None)
+            if CAT_TREAT_KEY not in self.inventory.items:
+                self.inventory.cost_basis.pop(CAT_TREAT_KEY, None)
             self.bank_balance = data.get("bank_balance", 0.0)
             self.reputation   = data.get("reputation", 50)
             self.heat         = data.get("heat", 0)
@@ -7802,6 +8205,13 @@ class Game:
                 espionage=sd.get("espionage", 1), banking=sd.get("banking", 1),
                 xp=sd.get("xp", {s.value: 0 for s in SkillType}),
             )
+
+            market_blob = data.get("markets", {})
+            if isinstance(market_blob, dict):
+                for area in Area:
+                    saved_market = market_blob.get(area.name)
+                    if isinstance(saved_market, dict):
+                        self.markets[area].from_save(saved_market)
 
             # ── New feature fields (backward compatible) ────────────────────
             raw_lic = data.get("licenses")
@@ -7874,6 +8284,8 @@ class Game:
                     else:
                         self.ach_stats[k] = sv
             self.influence_cooldowns = {k: int(v) for k, v in data.get("influence_cooldowns", {}).items()}
+            raw_haggles = data.get("daily_haggles", {})
+            self.daily_haggles = raw_haggles if isinstance(raw_haggles, dict) else {}
             self.settings.gamble_mercy = int(data.get("gamble_mercy", 0))
             # ── Title data (backward-compatible) ────────────────────────
             self.earned_titles       = list(data.get("earned_titles", []))
@@ -8523,8 +8935,9 @@ class Game:
             err("Requires a Fund Manager License.")
             pause()
             return
-        if self.reputation < 55:
-            err(f"Reputation {self.reputation}/100 — need 55+ for fund management clients.")
+        need_rep = LICENSE_INFO[LicenseType.FUND_MGR]["rep"]
+        if self.reputation < need_rep:
+            err(f"Reputation {self.reputation} — need {need_rep}+ for fund management clients.")
             pause()
             return
         while True:
@@ -8631,52 +9044,23 @@ class Game:
     # ── Settings ──────────────────────────────────────────────────────────────
 
     def settings_menu(self):
-        """Game settings: difficulty and autosave."""
-        DIFF_LABELS = {
-            "easy":   ("Easy",   GREEN,  "Costs ×0.70  ·  Sell ×1.10  ·  Events ×0.60  ·  Attacks ×0.50"),
-            "normal": ("Normal", CYAN,   "Costs ×1.00  ·  Sell ×1.00  ·  Events ×1.00  ·  Attacks ×1.00"),
-            "hard":   ("Hard",   YELLOW, "Costs ×1.35  ·  Sell ×0.90  ·  Events ×1.40  ·  Attacks ×1.50"),
-            "brutal": ("Brutal", RED,    "Costs ×1.80  ·  Sell ×0.80  ·  Events ×2.00  ·  Attacks ×2.50"),
-        }
+        """Game settings: autosave and standardized economy info."""
         while True:
             s = self.settings
-            dlabel, dcol, ddesc = DIFF_LABELS[s.difficulty]
             print(header("SETTINGS"))
-            print(f"  Current difficulty : {c(dlabel, dcol)}")
-            print(f"  {GREY}{ddesc}{RESET}")
+            print(f"  Economy            : {c('Standardized balance', CYAN)}")
+            print(f"  {GREY}Every save now uses the same cost, sell, event, and attack scaling.{RESET}")
             print(f"  Autosave           : {c('ON  (every 3 days)', GREEN) if s.autosave else c('OFF', GREY)}")
             print()
-            print(f"  {CYAN}1{RESET}. Change difficulty")
-            print(f"  {CYAN}2{RESET}. Toggle autosave")
+            print(f"  {CYAN}1{RESET}. Toggle autosave")
             print(f"  {BOLD}[B]{RESET} Back")
             ch = prompt("Choice: ")
             if ch == "1":
-                print(f"\n  Difficulties:")
-                options = list(DIFF_LABELS.keys())
-                for i, key in enumerate(options, 1):
-                    lbl, col, desc = DIFF_LABELS[key]
-                    marker = c(" ◄", CYAN) if key == s.difficulty else ""
-                    print(f"    {CYAN}{i}{RESET}. {c(lbl, col)}{marker}  {GREY}{desc}{RESET}")
-                dc = prompt("Choose difficulty (1-4) or cancel: ")
-                if dc.strip().lower() == "cancel":
-                    continue
-                try:
-                    di = int(dc.strip()) - 1
-                    if 0 <= di < len(options):
-                        s.difficulty = options[di]
-                        lbl, col, _ = DIFF_LABELS[s.difficulty]
-                        s.save()
-                        ok(f"Difficulty set to {c(lbl, col)}.")
-                    else:
-                        err("Invalid choice.")
-                except ValueError:
-                    err("Invalid input.")
-            elif ch == "2":
                 s.autosave = not s.autosave
                 state = c("ON", GREEN) if s.autosave else c("OFF", GREY)
                 s.save()
                 ok(f"Autosave turned {state}.")
-            elif ch.upper() in ("3", "B"):
+            elif ch.upper() in ("2", "B"):
                 return
             else:
                 err("Invalid choice.")

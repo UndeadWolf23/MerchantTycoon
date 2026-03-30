@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 from copy import deepcopy
 from collections import deque
-from datetime import date
+from datetime import date, datetime
 
 # ─────────────────────────────────────────────────────────────────────────────
 # USER DATA DIRECTORY  —  AppData/Roaming on Windows, ~/.config elsewhere
@@ -44,6 +44,86 @@ def _get_user_data_dir() -> str:
     return folder
 
 _USER_DATA_DIR: str = _get_user_data_dir()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MASTER LOG  —  append-only JSONL session log; purged on every open / close
+# Never uploaded to cloud.  Stored in AppData/MerchantTycoon/master_log.jsonl
+# ─────────────────────────────────────────────────────────────────────────────
+
+MASTER_LOG_FILE: str = os.path.join(_USER_DATA_DIR, "master_log.jsonl")
+
+
+class MasterLog:
+    """
+    Append-only JSONL temp file.  Written throughout the session;
+    purged (overwritten to empty) whenever the game opens or closes.
+    Do NOT persist this file to cloud — it is session-only.
+
+    Each line is a self-contained JSON object:
+        {"ts":"2026-03-28 14:30:22","gt":"Y2 D47","cat":"TRADE",
+         "sub":"BUY","msg":"Bought 10x Fish...","gold":-120.0,"area":"City"}
+    """
+    _fh: Any = None
+    _count: int = 0
+
+    @classmethod
+    def open(cls) -> None:
+        """Purge any previous log and open a fresh one."""
+        cls.close()
+        try:
+            cls._fh = open(MASTER_LOG_FILE, "w", encoding="utf-8", buffering=8192)
+            cls._count = 0
+        except Exception:
+            cls._fh = None
+
+    @classmethod
+    def close(cls) -> None:
+        """Flush and close the log file."""
+        if cls._fh is not None:
+            try:
+                cls._fh.flush()
+                cls._fh.close()
+            except Exception:
+                pass
+            cls._fh = None
+
+    @classmethod
+    def write(
+        cls,
+        cat: str,
+        msg: str,
+        sub: str = "",
+        gold: float = 0.0,
+        area: str = "",
+        game: Optional[Any] = None,
+    ) -> None:
+        """Append one log entry.  Silent no-op if the file is not open."""
+        if cls._fh is None:
+            return
+        entry: Dict[str, Any] = {
+            "ts":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "gt":  f"Y{game.year} D{game.day}" if game is not None else "─",
+            "cat": cat,
+        }
+        if sub:
+            entry["sub"] = sub
+        entry["msg"] = msg
+        if gold != 0.0:
+            entry["gold"] = round(gold, 2)
+        if area:
+            entry["area"] = area
+        try:
+            cls._fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            cls._fh.flush()
+            cls._count += 1
+        except Exception:
+            pass
+
+    @classmethod
+    def count(cls) -> int:
+        """Return the number of entries written this session."""
+        return cls._count
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COLOUR HELPERS (works on Windows 10+ with ANSI enabled, graceful fallback)
@@ -127,6 +207,10 @@ class EventType(Enum):
     WAR            = "Border War"
     GOLD_RUSH      = "Gold Rush"
     FESTIVAL       = "Grand Festival"
+    MARKET_CRASH   = "Market Crash"
+    STORM          = "Fierce Storm"
+    ROYAL_DECREE   = "Royal Trade Decree"
+    BANDIT_SURGE   = "Bandit Surge"
 
 class SkillType(Enum):
     TRADING     = "Trading"
@@ -232,6 +316,7 @@ class GameSettings:
     right_click_haggle:    bool  = True      # right-click buy table item to haggle
     enable_signatures:     bool  = True      # show parchment signing dialog for licenses/loans/etc.
     gamble_mercy:          int   = 0           # mercy counter: at 15 the next coffer roll excludes commons
+    gamble_free_spins:     int   = 0           # persistent free spins granted by coffer rewards or codes
     hotkeys:               Dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_HOTKEYS)
     )
@@ -274,6 +359,7 @@ class GameSettings:
                 "right_click_haggle":    self.right_click_haggle,
                 "enable_signatures":     self.enable_signatures,
                 "gamble_mercy":          self.gamble_mercy,
+                "gamble_free_spins":     self.gamble_free_spins,
                 "hotkeys":               self.hotkeys,
             }, f)
 
@@ -294,6 +380,7 @@ class GameSettings:
                 self.right_click_haggle   = bool(d.get("right_click_haggle",    True))
                 self.enable_signatures    = bool(d.get("enable_signatures",     True))
                 self.gamble_mercy         = int(d.get("gamble_mercy", 0))
+                self.gamble_free_spins    = int(d.get("gamble_free_spins", 0))
                 # Merge saved hotkeys with defaults (new actions get default binding)
                 raw_hk = d.get("hotkeys", {})
                 if isinstance(raw_hk, dict):
@@ -543,6 +630,8 @@ class Property:
     purchase_price_paid: float = 0.0  # what the player actually paid
     tenant_name: str = ""             # name of current tenant, or '' if unleased
     lease_rate_mult: float = 1.0      # tenant's negotiated rate vs standard
+    lease_posted: bool = False        # True when listing is posted awaiting applicants
+    lease_applications: List[dict] = field(default_factory=list)  # pending applicants
 
     @property
     def current_value(self) -> float:
@@ -2651,6 +2740,30 @@ class AreaMarket:
                       "exotic_fruit", "honey", "perfume", "bread"]:
                 if k in self.pressure:
                     self.pressure[k] = min(self.MAX_PRESSURE, self.pressure[k] * 1.45)
+        elif event == EventType.MARKET_CRASH:
+            # City-wide price collapse; luxury goods hit hardest
+            _lux = {"gem", "jewelry", "silk", "perfume", "tapestry", "artifact", "glassware", "spice"}
+            for k in list(self.pressure):
+                mult = 0.45 if k in _lux else 0.70
+                self.pressure[k] = max(self.MIN_PRESSURE, self.pressure[k] * mult)
+        elif event == EventType.STORM:
+            for k in ["fish", "salt", "rope", "blubber", "spice", "silk"]:
+                if k in self.pressure:
+                    self.pressure[k] = min(self.MAX_PRESSURE, self.pressure[k] * 1.55)
+                    self.stock[k] = max(0, int(self.stock.get(k, 0) * 0.5))
+            self.travel_risk_override = min(0.65, self.travel_risk_override + 0.12)
+        elif event == EventType.ROYAL_DECREE:
+            # Decree forces premium pricing on processed goods
+            _proc = {"cloth", "steel", "glassware", "medicine", "leather", "paper",
+                     "bread", "wine", "ale", "pottery", "candles", "soap", "rope"}
+            for k in _proc:
+                if k in self.pressure:
+                    self.pressure[k] = min(self.MAX_PRESSURE, self.pressure[k] * 1.35)
+        elif event == EventType.BANDIT_SURGE:
+            for k in ["smoked_meat", "rope", "medicine", "leather"]:
+                if k in self.pressure:
+                    self.pressure[k] = min(self.MAX_PRESSURE, self.pressure[k] * 1.25)
+            self.travel_risk_override = min(0.65, self.travel_risk_override + 0.20)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2689,16 +2802,20 @@ def make_business(key: str, area: Area) -> Business:
 # ─────────────────────────────────────────────────────────────────────────────
 
 RANDOM_EVENTS = [
-    (EventType.DROUGHT,        ["FARMLAND"],                   0.06),
-    (EventType.FLOOD,          ["FARMLAND","SWAMP","COAST"],   0.05),
-    (EventType.BUMPER_HARVEST, ["FARMLAND"],                   0.07),
-    (EventType.MINE_COLLAPSE,  ["MOUNTAIN"],                   0.04),
-    (EventType.PIRACY,         ["COAST"],                      0.06),
-    (EventType.TRADE_BOOM,     ["CITY"],                       0.05),
-    (EventType.PLAGUE,         ["CITY","FARMLAND"],            0.04),
-    (EventType.WAR,            ["MOUNTAIN","DESERT"],          0.04),
-    (EventType.GOLD_RUSH,      ["MOUNTAIN","DESERT"],          0.03),
-    (EventType.FESTIVAL,       ["CITY","FARMLAND","COAST"],    0.06),
+    (EventType.DROUGHT,        ["FARMLAND"],                         0.06),
+    (EventType.FLOOD,          ["FARMLAND","SWAMP","COAST"],         0.05),
+    (EventType.BUMPER_HARVEST, ["FARMLAND"],                         0.07),
+    (EventType.MINE_COLLAPSE,  ["MOUNTAIN"],                         0.04),
+    (EventType.PIRACY,         ["COAST"],                            0.06),
+    (EventType.TRADE_BOOM,     ["CITY"],                             0.05),
+    (EventType.PLAGUE,         ["CITY","FARMLAND"],                  0.04),
+    (EventType.WAR,            ["MOUNTAIN","DESERT"],                0.04),
+    (EventType.GOLD_RUSH,      ["MOUNTAIN","DESERT"],                0.03),
+    (EventType.FESTIVAL,       ["CITY","FARMLAND","COAST"],          0.06),
+    (EventType.MARKET_CRASH,   ["CITY"],                             0.04),
+    (EventType.STORM,          ["COAST","SWAMP"],                    0.05),
+    (EventType.ROYAL_DECREE,   ["CITY","FARMLAND"],                  0.04),
+    (EventType.BANDIT_SURGE,   ["FOREST","MOUNTAIN","DESERT"],       0.05),
 ]
 
 # News headlines keyed to event type name (+ "NEUTRAL" filler pool)
@@ -2762,6 +2879,30 @@ NEWS_POOL: Dict[str, List[str]] = {
         "Silk and wine disappear from shelves before noon. Come early.",
         "Taverns emptied of ale, spice merchants grinning ear to ear.",
         "Luxury vendors can't keep shelves stocked — demand is relentless.",
+    ],
+    "MARKET_CRASH": [
+        "Panic selling sweeps the city exchange — luxury prices in freefall.",
+        "Merchants dumping inventory as confidence collapses overnight.",
+        "Investors pulling out; gem and silk prices at a season low.",
+        "Creditors calling in debts — luxury goods flooding the market.",
+    ],
+    "STORM": [
+        "A fierce storm has battered the coast — fishing boats still ashore.",
+        "Half the usual salt and rope shipments are delayed indefinitely.",
+        "Coastal roads washed out; maritime trade down to a trickle.",
+        "Storm damage reported at three harbours. Spice shipment missing.",
+    ],
+    "ROYAL_DECREE": [
+        "Royal decree mandates premium duties on all processed goods from today.",
+        "Crown inspectors posted at city gates — processed goods taxed heavily.",
+        "Guild masters grumbling as the decree pushes cloth and steel prices up.",
+        "The decree is in effect: steel, medicine, and leather prices climbing.",
+    ],
+    "BANDIT_SURGE": [
+        "Bandits attacking caravans on the forest road — travel risk is high.",
+        "Three merchant parties robbed this week. Roads to the mountains are perilous.",
+        "Militia called out as bandit activity surges through the hill passes.",
+        "Desert routes compromised — experienced guards commanding double wages.",
     ],
     "NEUTRAL": [
         "Council debate over road taxes drags into its third week.",
@@ -3005,6 +3146,7 @@ class Voyage:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Game:
+    VERSION              = "0.6.34 - Alpha"
     SAVE_FILE            = os.path.join(_USER_DATA_DIR, "savegame.dat")
 
     @staticmethod
@@ -3021,6 +3163,7 @@ class Game:
     def __init__(self):
         self.settings       = GameSettings()
         self.settings.load()
+        self.version        = self.VERSION
         self.player_name    = "Merchant"
         self.current_area   = Area.CITY
         self.inventory      = Inventory(gold=750.0)
@@ -3127,6 +3270,8 @@ class Game:
             "lifetime_loss_count": 0,   # how many times sold at a loss
         }
         self.influence_cooldowns: Dict[str, int] = {}  # "{area}:{item}:{action}" → expiry abs_day
+        self.campaign_targets: List[str] = []  # "{area}:{item_key}" marked for auto-campaign
+        self.slander_targets: List[str] = []   # "{area}:{item_key}" marked for auto-slander
         self.daily_haggles: Dict[str, Dict[str, object]] = {}
         # ── Titles ────────────────────────────────────────────────────────
         self.earned_titles: List[str] = []   # list of earned title IDs
@@ -3147,7 +3292,32 @@ class Game:
         self.new_game_tutorial_offered: bool = False
         self.new_game_tutorial_completed: bool = False
         self.cat_state: Dict[str, Any] = self._default_cat_state()
+        # ── Courtship & Marriage ──────────────────────────────────────────────
+        self.marriage_state: dict = self._default_marriage_state()
+        self.suitor_courtship: dict = {}  # {sid: {"started_real":float, "actions":int, "gifts":int}}
         self._generate_captains()
+
+    @staticmethod
+    def _default_marriage_state() -> dict:
+        return {
+            "spouse_id":          None,   # str sid of spouse
+            "married_at_real":    0.0,    # time_played_seconds when married
+            "rel_xp":             0,      # relationship experience points
+            "rel_level":          0,      # 0/1/2
+            "perk_expires_real":  0.0,    # time_played_seconds when daily perk ends
+            "last_visit_abs_day": 0,      # abs game-day of last daily visit
+            "divorce_count":      0,      # persists across remarriages
+            # permanent perk fields (set at marriage time)
+            "perm_trade_pct":     0.0,    # +% on trade profit
+            "perm_rep_daily":     0,      # +rep each advance_day while married
+            "perm_heat_mult":     1.0,    # heat gain multiplier (< 1 = less heat)
+            "perm_travel_bonus":  0,      # travel day reduction
+            # daily perk fields
+            "daily_perk_type":    "",     # "rep_mult" / "no_heat" / "trade_boost" etc.
+            "daily_perk_level0":  {},     # {type: val} for level 0
+            "daily_perk_level1":  {},
+            "daily_perk_level2":  {},
+        }
 
     @staticmethod
     def _default_cat_state() -> Dict[str, Any]:
@@ -3358,6 +3528,7 @@ class Game:
                 current.append(amount)
         else:
             self.ach_stats[key] = current + amount
+        self._mlog("SYSTEM", f"Stat tracked: {key} += {amount}", sub="Stat")
 
     def _check_achievements(self) -> None:
         """Unlock any newly met achievements and push them to the queue,
@@ -3614,6 +3785,7 @@ class Game:
         if gain <= 0:
             return 0
         self.reputation = max(0, self.reputation + gain)
+        self._mlog("PLAYER", f"Reputation +{gain} -> {self.reputation}", sub="Reputation")
         return gain
 
     def _lose_reputation(self, amount: int) -> int:
@@ -3622,6 +3794,7 @@ class Game:
             return 0
         applied = min(self.reputation, loss)
         self.reputation = max(0, self.reputation - loss)
+        self._mlog("PLAYER", f"Reputation -{applied} -> {self.reputation}", sub="Reputation")
         return applied
 
     def _current_weight(self) -> float:
@@ -3676,11 +3849,14 @@ class Game:
         if mgr.auto_repair:
             for b in self.businesses:
                 if b.broken_down and self.inventory.gold >= b.repair_cost:
-                    self.inventory.gold -= b.repair_cost
+                    repair_cost = b.repair_cost
+                    self.inventory.gold -= repair_cost
                     b.broken_down = False
                     b.repair_cost = 0.0
                     mgr.total_repairs += 1
                     self._log_event(f"[Mgr] Auto-repaired {b.name}")
+                    self._mlog("BUSINESS", f"Manager auto-repaired {b.name} for {repair_cost:.0f}g",
+                               sub="ManagerRepair", gold=-repair_cost, area=b.area.value)
         # Auto-hire workers to fill empty slots
         if mgr.auto_hire:
             for b in self.businesses:
@@ -3692,6 +3868,9 @@ class Game:
                         b.hired_workers.append(best)
                         b.workers = len(b.hired_workers)
                         mgr.total_hires += 1
+                        self._mlog("BUSINESS",
+                                   f"Manager auto-hired {best['name']} for {b.name} at {best['wage']:.1f}g/day",
+                                   sub="ManagerHire", area=b.area.value)
         # Auto-sell accumulated production
         if mgr.auto_sell:
             for b in self.businesses:
@@ -4620,6 +4799,30 @@ class Game:
         self._mgr_award_xp(mgr, 3)
         self._check_achievements()
 
+    def _gen_single_lease_applicant(self, daily_rate: float) -> dict:
+        """Generate one lease applicant for a posted property (trickle system)."""
+        _first = ["Aldric","Bram","Cora","Dag","Elra","Finn","Greta","Holt","Isa","Jorin",
+                  "Kev","Lena","Mira","Ned","Ora","Pip","Quinn","Rolf","Sable","Tilda",
+                  "Ulf","Vera","Wren","Xan","Yara","Zane"]
+        _last  = ["Miller","Cooper","Smith","Tanner","Fisher","Brewer","Mason","Wright",
+                  "Fletcher","Barrow","Cotter","Dyer","Galloway","Hayward","Saltmarsh","Underhill"]
+        _tiers = [
+            ("Excellent",    "Reliable payer, keeps the property well.",              (1.08, 1.22)),
+            ("Good",         "Generally dependable, occasional minor delay.",         (1.00, 1.10)),
+            ("Average",      "Pays on time most months.",                             (0.92, 1.02)),
+            ("Risky",        "May be late with payments some months.",                (0.80, 0.94)),
+            ("Troublesome",  "History of payment issues; expect friction.",           (0.70, 0.86)),
+        ]
+        reliability, desc, rate_range = random.choice(_tiers)
+        rate_mult = round(random.uniform(*rate_range), 2)
+        return {
+            "name":         f"{random.choice(_first)} {random.choice(_last)}",
+            "reliability":  reliability,
+            "desc":         desc,
+            "rate_mult":    rate_mult,
+            "daily_rate":   round(daily_rate * rate_mult, 2),
+        }
+
     def _gen_loan_applicants(self, count: int = 5) -> List[Dict]:
         """Generate citizens seeking personal loans."""
         _first = ["Bryn","Cal","Doren","Elva","Fenn","Gwyn","Holt","Isla",
@@ -4636,10 +4839,10 @@ class Game:
         result = []
         for _ in range(count):
             name       = f"{random.choice(_first)} {random.choice(_last)}"
-            amount     = round(random.choice([50,80,100,150,200,300,500]) * random.uniform(0.8,1.2))
+            amount     = round(random.choice([500,1000,2500,5000,10000,25000,50000]) * random.uniform(0.8,1.2))
             cw         = round(random.uniform(0.6, 1.5), 2)
-            max_rate   = round(random.uniform(0.04, 0.14), 3)
-            weeks      = random.choice([4, 6, 8, 12, 16])
+            max_rate   = round(random.uniform(0.03, 0.12), 3)
+            weeks      = random.choice([4, 6, 8, 12, 16, 24])
             def_risk   = round(min(0.30, (1.5 - cw) * 0.07 * stress), 4)
             cw_lbl     = (c("High risk", RED) if cw < 0.85
                           else c("Average", YELLOW) if cw < 1.15
@@ -4659,10 +4862,10 @@ class Game:
         for _ in range(count):
             result.append({
                 "name":         random.choice(_names),
-                "capital":      round(random.choice([200,500,800,1000,1500,2000])
+                "capital":      round(random.choice([5000,10000,25000,50000,100000,250000])
                                       * random.uniform(0.9, 1.1)),
-                "duration":     random.choice([30, 60, 90]),
-                "promised_rate": round(random.uniform(0.05, 0.18), 3),
+                "duration":     random.choice([60, 90, 120, 180]),
+                "promised_rate": round(random.uniform(0.10, 0.35), 3),
                 "fee_rate":      round(random.uniform(0.015, 0.035), 3),
             })
         return result
@@ -4742,13 +4945,45 @@ class Game:
 
     def _log_event(self, msg: str):
         self.event_log.appendleft(f"[Y{self.year} D{self.day}] {msg}")
+        MasterLog.write(
+            "EVENT", msg,
+            area=getattr(getattr(self, "current_area", None), "value", ""),
+            game=self,
+        )
 
     def _log_trade(self, msg: str):
         self.trade_log.appendleft(f"[Y{self.year} D{self.day}] {msg}")
+        _sub = msg.split()[0] if msg else ""
+        MasterLog.write(
+            "TRADE", msg, sub=_sub,
+            area=getattr(getattr(self, "current_area", None), "value", ""),
+            game=self,
+        )
+
+    def _mlog(
+        self,
+        cat: str,
+        msg: str,
+        sub: str = "",
+        gold: float = 0.0,
+        area: str = "",
+    ) -> None:
+        """Convenience MasterLog write with automatic game context."""
+        MasterLog.write(
+            cat, msg, sub=sub, gold=gold,
+            area=area or getattr(getattr(self, "current_area", None), "value", ""),
+            game=self,
+        )
 
     def _use_time(self, slots: int = 1):
         """Spend activity slots for the day; auto-advance when daily limit reached."""
+        before = self.daily_time_units
         self.daily_time_units += slots
+        self._mlog(
+            "WORLD",
+            f"Time spent: +{slots} slot(s)  ({before}->{self.daily_time_units}/{self.DAILY_TIME_UNITS})",
+            sub="TimeUse",
+        )
         if self.daily_time_units >= self.DAILY_TIME_UNITS:
             print(f"\n  {c('◑  Night falls — your day is done.', GREY)}")
             self._advance_day()
@@ -5648,6 +5883,8 @@ class Game:
             self.businesses.append(b)
             ok(f"Purchased {b.name} for {cost}g! Located in {b.area.value}.")
             self._log_event(f"Purchased {b.name}")
+            self._mlog("BUSINESS", f"Purchased business: {b.name} in {b.area.value} for {cost:.0f}g",
+                       sub="Purchase", gold=-cost, area=b.area.value)
             self._gain_skill_xp(SkillType.INDUSTRY, 20)
         except (ValueError, IndexError):
             err("Invalid choice.")
@@ -5677,6 +5914,8 @@ class Game:
             self.inventory.gold -= cost
             b.level += 1
             ok(f"Upgraded {b.name} to Level {b.level}!")
+            self._mlog("BUSINESS", f"Upgraded business: {b.name} to Lv{b.level} for {cost:.0f}g",
+                       sub="Upgrade", gold=-cost, area=b.area.value)
             self._gain_skill_xp(SkillType.INDUSTRY, 15)
         except (ValueError, IndexError):
             err("Invalid choice.")
@@ -5822,6 +6061,10 @@ class Game:
                         chosen = applicants[aidx]
                         b.hired_workers.append(chosen)
                         b.workers = len(b.hired_workers)
+                        self._mlog("BUSINESS",
+                                   f"Hired employee: {chosen['name']} for {b.name} at {chosen['wage']:.1f}g/day "
+                                   f"(prod {chosen['productivity']:.2f}x)",
+                                   sub="HireWorker", area=b.area.value)
                         ok(f"Hired {chosen['name']} at {chosen['wage']:.1f}g/day "
                            f"(productivity {chosen['productivity']:.2f}x).")
                     except ValueError:
@@ -5846,6 +6089,8 @@ class Game:
                             continue
                         fired = b.hired_workers.pop(fidx)
                         b.workers = len(b.hired_workers)
+                        self._mlog("BUSINESS", f"Fired employee: {fired['name']} from {b.name}",
+                                   sub="FireWorker", area=b.area.value)
                         ok(f"Fired {fired['name']}.")
                     except ValueError:
                         err("Invalid input.")
@@ -5865,10 +6110,13 @@ class Game:
             if b.repair_cost > self.inventory.gold:
                 err(f"Need {b.repair_cost:.0f}g to repair.")
                 return
-            self.inventory.gold -= b.repair_cost
+            repair_cost = b.repair_cost
+            self.inventory.gold -= repair_cost
             b.broken_down = False
             b.repair_cost = 0.0
             ok(f"{b.name} repaired and back in operation!")
+            self._mlog("BUSINESS", f"Repaired business: {b.name} for {repair_cost:.0f}g",
+                       sub="Repair", gold=-repair_cost, area=b.area.value)
             self._track_stat("repairs")
             self._check_achievements()
         except (ValueError, IndexError):
@@ -5894,6 +6142,8 @@ class Game:
                 self.businesses.pop(idx)
                 ok(f"Sold {b.name} for {sale_price:.0f}g.")
                 self._log_event(f"Sold {b.name} for {sale_price:.0f}g")
+                self._mlog("BUSINESS", f"Sold business: {b.name} for {sale_price:.0f}g",
+                           sub="Sell", gold=sale_price, area=b.area.value)
         except (ValueError, IndexError):
             err("Invalid choice.")
 
@@ -7583,6 +7833,9 @@ class Game:
             total_daily = b.daily_cost + daily_wages
             if self.inventory.gold >= total_daily:
                 self.inventory.gold -= total_daily
+                self._mlog("BUSINESS",
+                           f"{b.name}: +{prod}x {b.item_produced}  —  cost -{total_daily:.1f}g",
+                           sub="Production", gold=-total_daily)
             else:
                 warn(f"Can't pay {b.name} costs! A worker quits.")
                 if b.hired_workers:
@@ -7623,6 +7876,8 @@ class Game:
             for loan in self.loans[:]:
                 if self.inventory.gold >= loan.monthly_payment:
                     self.inventory.gold -= loan.monthly_payment
+                    self._mlog("FINANCE", f"Loan payment: -{loan.monthly_payment:.1f}g  ({loan.months_remaining - 1} months remaining)",
+                               sub="LoanPayment", gold=-loan.monthly_payment)
                     loan.months_remaining -= 1
                     if loan.months_remaining <= 0:
                         self.loans.remove(loan)
@@ -7641,7 +7896,9 @@ class Game:
                 monthly_rate = 0.015 + self.skills.banking * 0.002
                 interest     = round(self.bank_balance * monthly_rate, 2)
                 self.bank_balance += interest
-                ok(f"Bank interest: +{interest:.2f}g  ({monthly_rate*100:.1f}%/mo  ·  balance: {self.bank_balance:.0f}g)")
+                ok(f"Bank interest: +{interest:.2f}g  ({monthly_rate*100:.1f}%/mo  \u00b7  balance: {self.bank_balance:.0f}g)")
+                self._mlog("FINANCE", f"Bank interest: +{interest:.2f}g @ {monthly_rate*100:.1f}%/mo  (balance: {self.bank_balance:.0f}g)",
+                           sub="BankInterest", gold=interest)
 
         # Daily CD maturity check
         for cd in self.cds[:]:
@@ -7655,7 +7912,7 @@ class Game:
                 self._log_event(f"CD matured: +{profit:.0f}g on {cd.principal:.0f}g ({cd.term_days}d term)")
 
         # Random world event (frequency scales with difficulty)
-        if random.random() < 0.04 * self.settings.event_freq_mult:
+        if random.random() < 0.08 * self.settings.event_freq_mult:
             self._trigger_random_event()
 
         # Contract expiry check
@@ -7672,7 +7929,7 @@ class Game:
 
         # Heat naturally cools
         if self.heat > 0:
-            self.heat = max(0, self.heat - 2)
+            self.heat = max(0, self.heat - 3)
 
         # ── Stock market daily advance ─────────────────────────────────────
         self.stock_market.update(self.markets, self.season)
@@ -7762,10 +8019,15 @@ class Game:
                     warn(f"Citizen loan DEFAULTED: {cl.borrower_name} can't pay!  Rep -2")
                     self.reputation = max(0, self.reputation - 2)
                     self._log_event(f"Citizen loan default: {cl.borrower_name}")
+                    self._mlog("FINANCE", f"Citizen loan defaulted: {cl.borrower_name}",
+                               sub="CitizenLoanDefault")
                     continue
                 self.inventory.gold += cl.weekly_payment
                 cl.total_received   += cl.weekly_payment
                 cl.weeks_remaining  -= 1
+                self._mlog("FINANCE",
+                           f"Citizen loan payment from {cl.borrower_name}: +{cl.weekly_payment:.1f}g  ({cl.weeks_remaining} week(s) left)",
+                           sub="CitizenLoanPayment", gold=cl.weekly_payment)
                 if cl.weeks_remaining <= 0:
                     ok(f"Citizen loan fully repaid: {cl.borrower_name}  "
                        f"(total: +{cl.total_received:.0f}g)")
@@ -7784,6 +8046,8 @@ class Game:
                     self._track_stat("re_builds_completed")
                     ok(f"🏗 Construction complete: {c(prop.name, CYAN)} in {prop.area.value}!")
                     self._log_event(f"Construction complete: {prop.name} ({prop.area.value})")
+                    self._mlog("REALESTATE", f"Construction complete: {prop.name} ({prop.area.value})",
+                               sub="ConstructionComplete", area=prop.area.value)
                     self._check_achievements()
             elif prop.is_leased and prop.condition >= 0.20:
                 income = prop.daily_lease
@@ -7791,6 +8055,15 @@ class Game:
                     self.inventory.gold += income
                     prop.total_lease_income += income
                     daily_lease_total += income
+                    self._mlog("REALESTATE",
+                               f"Lease income: {prop.name} +{income:.1f}g/day from {prop.tenant_name or 'tenant'}",
+                               sub="LeaseIncome", gold=income, area=prop.area.value)
+            # Lease application trickle (~50% daily chance per posted property)
+            if prop.lease_posted and not prop.is_leased and not prop.under_construction:
+                if random.random() < 0.50 and len(prop.lease_applications) < 8:
+                    applicant = self._gen_single_lease_applicant(prop.daily_lease or 1.0)
+                    prop.lease_applications.append(applicant)
+                    self._log_event(f"Lease applicant for {prop.name}: {applicant['name']}")
         # Construction progress for land plots
         completed_plots = []
         for plot in self.land_plots:
@@ -7817,10 +8090,14 @@ class Game:
                     completed_plots.append(plot)
                     ok(f"🏗 Construction complete: {c(prop_name, CYAN)} in {plot.area.value}!")
                     self._log_event(f"Built: {prop_name} ({plot.area.value})")
+                    self._mlog("REALESTATE", f"Built new property: {prop_name} ({plot.area.value})",
+                               sub="BuildComplete", area=plot.area.value)
                     self._check_achievements()
         for p in completed_plots:
             self.land_plots.remove(p)
         if daily_lease_total > 0:
+            self._mlog("REALESTATE", f"Daily lease income total: +{daily_lease_total:.1f}g",
+                       sub="LeaseIncomeTotal", gold=daily_lease_total)
             self.ach_stats["re_lease_income"] = self.ach_stats.get("re_lease_income", 0.0) + daily_lease_total
             self.ach_stats["re_leases_active"] = sum(1 for p in self.real_estate if p.is_leased and not p.under_construction)
         # ── Fund client fees (every 30 days) + maturity checks (daily) ────
@@ -7870,6 +8147,13 @@ class Game:
                 and self.reputation >= 60
                 and not self.ach_stats.get("rep_recovered", False)):
             self._track_stat("rep_recovered", True)
+
+        # ── Marriage daily passive perk ───────────────────────────────────
+        ms = self.marriage_state
+        if ms.get("spouse_id"):
+            rep_bonus = int(ms.get("perm_rep_daily", 0))
+            if rep_bonus > 0:
+                self.reputation = min(1000, self.reputation + rep_bonus)
 
         # Check achievements every day so time-based ones fire promptly
         self._check_achievements()
@@ -7938,7 +8222,7 @@ class Game:
         }
 
         data = {
-            "version": 3,
+            "version": self.version,
             "bound_user_id": self.bound_user_id,
             "new_game_tutorial_offered": self.new_game_tutorial_offered,
             "new_game_tutorial_completed": self.new_game_tutorial_completed,
@@ -8002,7 +8286,10 @@ class Game:
             "active_title":        self.active_title,
             "time_played_seconds": self.time_played_seconds,
             "gamble_mercy":       self.settings.gamble_mercy,
+            "gamble_free_spins":  self.settings.gamble_free_spins,
             "influence_cooldowns": dict(self.influence_cooldowns),
+            "campaign_targets":    list(self.campaign_targets),
+            "slander_targets":     list(self.slander_targets),
             "daily_haggles": deepcopy(self.daily_haggles),
             "markets": {
                 area.name: market.to_save()
@@ -8020,7 +8307,9 @@ class Game:
                  "total_lease_income": p.total_lease_income,
                  "purchase_price_paid": p.purchase_price_paid,
                  "tenant_name": p.tenant_name,
-                 "lease_rate_mult": p.lease_rate_mult}
+                 "lease_rate_mult": p.lease_rate_mult,
+                 "lease_posted": p.lease_posted,
+                 "lease_applications": p.lease_applications}
                 for p in self.real_estate
             ],
             "land_plots": [
@@ -8080,6 +8369,9 @@ class Game:
             "news_feed":  [list(entry) for entry in self.news_feed],
             "event_log":  list(self.event_log),
             "trade_log":  list(self.trade_log),
+            # ── Courtship & Marriage ────────────────────────────────────────
+            "marriage_state":   self.marriage_state,
+            "suitor_courtship": self.suitor_courtship,
         }
 
         try:
@@ -8093,6 +8385,7 @@ class Game:
             return
         if not silent:
             ok(f"Game saved.")
+        MasterLog.write("SYSTEM", f"Game saved — Y{self.year} D{self.day}  gold:{self.inventory.gold:.0f}g", sub="Save", game=self)
 
     def load_game(self) -> bool:
         if not os.path.exists(self.SAVE_FILE):
@@ -8284,9 +8577,12 @@ class Game:
                     else:
                         self.ach_stats[k] = sv
             self.influence_cooldowns = {k: int(v) for k, v in data.get("influence_cooldowns", {}).items()}
+            self.campaign_targets = list(data.get("campaign_targets", []))
+            self.slander_targets  = list(data.get("slander_targets", []))
             raw_haggles = data.get("daily_haggles", {})
             self.daily_haggles = raw_haggles if isinstance(raw_haggles, dict) else {}
             self.settings.gamble_mercy = int(data.get("gamble_mercy", 0))
+            self.settings.gamble_free_spins = int(data.get("gamble_free_spins", 0))
             # ── Title data (backward-compatible) ────────────────────────
             self.earned_titles       = list(data.get("earned_titles", []))
             self.active_title        = data.get("active_title", "")
@@ -8309,6 +8605,8 @@ class Game:
                         purchase_price_paid=pd.get("purchase_price_paid", 0.0),
                         tenant_name=pd.get("tenant_name", ""),
                         lease_rate_mult=float(pd.get("lease_rate_mult", 1.0)),
+                        lease_posted=pd.get("lease_posted", False),
+                        lease_applications=pd.get("lease_applications", []),
                     ))
                 except Exception:
                     pass
@@ -8418,6 +8716,25 @@ class Game:
                 self.event_log.appendleft(str(entry))
             for entry in reversed(data.get("trade_log", [])):
                 self.trade_log.appendleft(str(entry))
+
+            # ── Courtship & Marriage (backward-compatible) ────────────────
+            saved_ms = data.get("marriage_state", {})
+            if isinstance(saved_ms, dict):
+                defaults = self._default_marriage_state()
+                for k, v in defaults.items():
+                    defaults[k] = saved_ms.get(k, v)
+                self.marriage_state = defaults
+            self.suitor_courtship = {}
+            saved_sc = data.get("suitor_courtship", {})
+            if isinstance(saved_sc, dict):
+                self.suitor_courtship = saved_sc
+
+            MasterLog.write(
+                "SYSTEM",
+                f"Game loaded — Y{self.year} D{self.day}  gold:{self.inventory.gold:.0f}g  area:{self.current_area.value}",
+                sub="Load",
+                game=self,
+            )
 
             return True
         except Exception as e:

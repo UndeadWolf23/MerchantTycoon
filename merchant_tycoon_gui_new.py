@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import sys
 import os
+import re
 import time
 import random
 import shutil
@@ -51,6 +52,7 @@ import math
 import struct
 import tempfile
 import wave
+from urllib.parse import quote
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
@@ -66,14 +68,14 @@ from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize, QRect, QRectF,
     QRunnable, QThreadPool, QObject, Signal, Slot, QAbstractAnimation,
     QParallelAnimationGroup, QSequentialAnimationGroup, Property as QtProperty,
-    QByteArray, QEvent, QMimeData, QThread, QMetaObject, Q_ARG,
+    QByteArray, QEvent, QMimeData, QThread, QMetaObject, Q_ARG, QUrl,
 )
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap,
     QPalette, QIcon, QCursor, QLinearGradient, QRadialGradient,
     QKeySequence, QShortcut, QGuiApplication, QScreen, QAction,
     QCloseEvent, QMouseEvent, QResizeEvent, QPen, QBrush,
-    QFontDatabase, QTransform,
+    QFontDatabase, QTransform, QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
@@ -108,10 +110,48 @@ from merchant_tycoon import (
     MANAGER_EFFICIENCY, _MANAGER_DEFAULT_CONFIGS,
     Ship, Captain, Voyage, SHIP_TYPES, SHIP_UPGRADES, VOYAGE_PORTS,
     _SHIP_NAME_PREFIXES, _SHIP_NAME_SUFFIXES,
+    SEASONAL_DEMAND, AREA_PRODUCTION,
+    MasterLog, MASTER_LOG_FILE,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COLOUR PALETTE  —  Warm fantasy / medieval merchant
+
+def _ml_read_tail(path: str, n_want: int, skip: int = 0) -> Tuple[List[Dict], int]:
+    """
+    Read up to *n_want* JSONL log entries from near the end of *path*,
+    skipping *skip* entries from the tail (for Load-More pagination).
+    Returns (entries_newest_first, approx_total_line_count).
+
+    Uses chunked reverse-reading — never loads the whole file into memory.
+    Estimates ~400 bytes/entry and reads that many bytes from the end.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size == 0:
+                return [], 0
+            target_bytes = min((skip + n_want + 4) * 400, size, 20 * 1024 * 1024)
+            fh.seek(max(0, size - target_bytes))
+            raw = fh.read()
+        lines = [ln for ln in raw.split(b"\n") if ln.strip()]
+        total = len(lines)
+        end   = max(0, total - skip)
+        start = max(0, end - n_want)
+        selected = lines[start:end]
+        selected.reverse()          # newest-first
+        entries: List[Dict] = []
+        for ln in selected:
+            try:
+                entries.append(json.loads(ln.decode("utf-8", errors="replace")))
+            except Exception:
+                pass
+        return entries, total
+    except FileNotFoundError:
+        return [], 0
+    except Exception:
+        return [], 0
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Palette:
@@ -1413,6 +1453,25 @@ class Screen(QWidget):
         """Called by GameApp to hide this screen."""
         self.on_hide()
 
+    def rebuild(self) -> None:
+        """
+        Destroy all built child widgets and re-run build() + refresh() at the
+        current UI scale.  Safe to call while the screen is active.
+        """
+        for child in list(self.children()):
+            if isinstance(child, QTimer):
+                child.stop()
+                child.setParent(None)
+                child.deleteLater()
+            elif isinstance(child, QWidget):
+                child.setParent(None)
+                child.deleteLater()
+        self._built = False
+        self.build()
+        self._built = True
+        self.refresh()
+        self.update()
+
     # ── Subclass API ──────────────────────────────────────────────────────────
 
     def build(self) -> None:
@@ -1757,8 +1816,8 @@ class MessageBar(QWidget):
     Severity: ok (green) / warn (amber) / err (red) / info (gold).
     """
 
-    _CLEAR_MS   = 6_000
-    _TARGET_H   = UIScale.px(32)
+    _CLEAR_MS   = 9_000
+    _TARGET_H   = UIScale.px(44)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1774,7 +1833,7 @@ class MessageBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(UIScale.px(12), 0, UIScale.px(12), 0)
         self._label = QLabel("", self)
-        self._label.setFont(Fonts.mixed)
+        self._label.setFont(Fonts.mixed_bold)
         self._label.setStyleSheet("background: transparent;")
         layout.addWidget(self._label)
 
@@ -1797,6 +1856,15 @@ class MessageBar(QWidget):
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _show(self, text: str, colour: str) -> None:
+        # When a floating toast handler is available, relay to it and keep the
+        # message bar invisible (single notification, not two stacked displays).
+        if self._toast_fn:
+            try:
+                self._toast_fn(text.strip().lstrip("\u2714\u26a0\u2718\u203a  "), colour)
+            except Exception:
+                pass
+            return
+
         self._label.setText(text)
         self._label.setStyleSheet(f"color: {colour}; background: transparent;")
 
@@ -1812,12 +1880,6 @@ class MessageBar(QWidget):
 
         self._clear_timer.start(self._CLEAR_MS)
 
-        if self._toast_fn:
-            try:
-                self._toast_fn(text.strip().lstrip("✔⚠✘› "), colour)
-            except Exception:
-                pass
-
     def _clear(self) -> None:
         if self._anim.state() == QAbstractAnimation.State.Running:
             self._anim.stop()
@@ -1830,6 +1892,11 @@ class MessageBar(QWidget):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GAME TOAST  —  floating transient notification overlay
+# Shared registry for ALL floating notifications (GameToast + FloatingStatNotice).
+# Using a single list ensures they don't overlap each other regardless of type.
+_NOTIFICATION_ACTIVE: List = []   # module-level; items are either GameToast or FloatingStatNotice
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GameToast(QWidget):
@@ -1838,13 +1905,13 @@ class GameToast(QWidget):
     lingers, then fades out.  Does not steal focus.
     """
 
-    _DURATION_MS  = 3_000
+    _DURATION_MS  = 5_000
     _SLIDE_IN_MS  = 280
-    _FADE_OUT_MS  = 400
-    _MAX_VISIBLE  = 4   # stack limit before oldest is dismissed
+    _FADE_OUT_MS  = 500
+    _MAX_VISIBLE  = 6   # shared stack limit
     _STACK_MARGIN = 16
 
-    _active: List["GameToast"] = []   # class-level live list
+    _active: List["GameToast"] = []   # kept for back-compat; real list is _NOTIFICATION_ACTIVE
 
     def __init__(self, parent: QWidget, text: str,
                  colour: str = P.amber,
@@ -1858,14 +1925,15 @@ class GameToast(QWidget):
                             Qt.WindowType.ToolTip |
                             Qt.WindowType.WindowStaysOnTopHint)
 
-        # Limit active toasts
-        while len(self._stack_for(parent)) >= self._MAX_VISIBLE:
-            oldest = self._stack_for(parent)[0]
+        # Limit shared stack size
+        while len(self._shared_stack_for(parent)) >= self._MAX_VISIBLE:
+            oldest = self._shared_stack_for(parent)[0]
             try:
                 oldest._dismiss_now()
             except Exception:
                 pass
 
+        _NOTIFICATION_ACTIVE.append(self)
         GameToast._active.append(self)
 
         self.setStyleSheet(f"""
@@ -1884,7 +1952,7 @@ class GameToast(QWidget):
         lbl.setFont(Fonts.body_small)
         lbl.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
         lbl.setWordWrap(True)
-        lbl.setMaximumWidth(UIScale.px(300))
+        lbl.setMaximumWidth(UIScale.px(380))
         layout.addWidget(lbl)
 
         self.adjustSize()
@@ -1908,21 +1976,26 @@ class GameToast(QWidget):
         QTimer.singleShot(self._duration_ms, self._start_fade_out)
 
     @classmethod
-    def _stack_for(cls, parent: QWidget) -> List["GameToast"]:
-        return [toast for toast in cls._active
-                if getattr(toast, "_host", None) is parent and not toast.isHidden()]
+    def _shared_stack_for(cls, parent: QWidget) -> list:
+        return [n for n in _NOTIFICATION_ACTIVE
+                if getattr(n, "_host", None) is parent and not n.isHidden()]
 
     @classmethod
-    def _target_pos(cls, parent: QWidget, toast: "GameToast", index: int) -> QPoint:
+    def _stack_for(cls, parent: QWidget) -> List["GameToast"]:
+        return [n for n in _NOTIFICATION_ACTIVE
+                if getattr(n, "_host", None) is parent and not n.isHidden()]
+
+    @classmethod
+    def _target_pos(cls, parent: QWidget, item: QWidget, index: int) -> QPoint:
         margin = UIScale.px(cls._STACK_MARGIN)
         pgeom = parent.rect()
         origin = parent.mapToGlobal(QPoint(0, 0))
-        x = origin.x() + pgeom.width() - toast.width() - margin
-        y = origin.y() + pgeom.height() - margin - (toast.height() + margin) * (index + 1)
+        x = origin.x() + pgeom.width() - item.width() - margin
+        y = origin.y() + pgeom.height() - margin - (item.height() + margin) * (index + 1)
         return QPoint(x, y)
 
     def _positions_for(self, parent: QWidget) -> Tuple[QPoint, QPoint]:
-        stack = self._stack_for(parent)
+        stack = self._shared_stack_for(parent)
         idx = max(0, len(stack) - 1)
         end_pos = self._target_pos(parent, self, idx)
         origin = parent.mapToGlobal(QPoint(0, 0))
@@ -1930,11 +2003,11 @@ class GameToast(QWidget):
         return start_pos, end_pos
 
     @classmethod
-    def _reflow(cls, parent: QWidget, exclude: Optional["GameToast"] = None) -> None:
-        for idx, toast in enumerate(cls._stack_for(parent)):
-            if toast is exclude:
+    def _reflow(cls, parent: QWidget, exclude: Optional[QWidget] = None) -> None:
+        for idx, item in enumerate(cls._shared_stack_for(parent)):
+            if item is exclude:
                 continue
-            toast.move(cls._target_pos(parent, toast, idx))
+            item.move(cls._target_pos(parent, item, idx))
 
     @classmethod
     def reflow_for(cls, parent: QWidget) -> None:
@@ -1955,6 +2028,10 @@ class GameToast(QWidget):
 
     def _dismiss_now(self) -> None:
         try:
+            _NOTIFICATION_ACTIVE.remove(self)
+        except ValueError:
+            pass
+        try:
             GameToast._active.remove(self)
         except ValueError:
             pass
@@ -1966,16 +2043,16 @@ class GameToast(QWidget):
 
 
 class FloatingStatNotice(QWidget):
-    """Fleeting upper-right notifier for gold, XP, and reputation deltas."""
+    """Fleeting stat-delta notifier.  Shares the unified bottom-right toast stack."""
 
-    _DURATION_MS = 1_400
+    _DURATION_MS = 1_800
     _FADE_IN_MS = 140
-    _FLOAT_MS = 650
+    _FLOAT_MS = 500
     _FADE_OUT_MS = 320
-    _STACK_MARGIN = 14
-    _MAX_VISIBLE = 5
+    _STACK_MARGIN = 16
+    _MAX_VISIBLE = 6   # shared with GameToast
 
-    _active: List["FloatingStatNotice"] = []
+    _active: List["FloatingStatNotice"] = []   # kept for back-compat
 
     def __init__(self, parent: QWidget, text: str, colour: str) -> None:
         super().__init__(parent, Qt.WindowType.ToolTip)
@@ -1995,6 +2072,15 @@ class FloatingStatNotice(QWidget):
             except Exception:
                 pass
 
+        # Limit shared stack size
+        while len(self._shared_stack_for(parent)) >= self._MAX_VISIBLE:
+            oldest = self._shared_stack_for(parent)[0]
+            try:
+                oldest._dismiss_now()
+            except Exception:
+                pass
+
+        _NOTIFICATION_ACTIVE.append(self)
         FloatingStatNotice._active.append(self)
         self.setStyleSheet(
             f"QWidget{{background-color:{P.bg_dialog}; border:1px solid {colour}; border-radius:8px;}}"
@@ -2016,7 +2102,7 @@ class FloatingStatNotice(QWidget):
         start_pos, end_pos = self._positions_for(parent)
         self.move(start_pos)
         self.show()
-        self._reflow(parent, exclude=self)
+        GameToast._reflow(parent, exclude=self)   # reflow the shared stack
 
         self._fade_in = QPropertyAnimation(self._opacity, b"opacity", self)
         self._fade_in.setDuration(self._FADE_IN_MS)
@@ -2035,38 +2121,41 @@ class FloatingStatNotice(QWidget):
         QTimer.singleShot(self._DURATION_MS, self._start_exit)
 
     @classmethod
-    def _stack_for(cls, parent: QWidget) -> List["FloatingStatNotice"]:
-        return [notice for notice in cls._active if getattr(notice, "_host", None) is parent and not notice.isHidden()]
+    def _shared_stack_for(cls, parent: QWidget) -> list:
+        return [n for n in _NOTIFICATION_ACTIVE
+                if getattr(n, "_host", None) is parent and not n.isHidden()]
 
     @classmethod
-    def _target_pos(cls, parent: QWidget, notice: "FloatingStatNotice", index: int) -> QPoint:
+    def _stack_for(cls, parent: QWidget) -> List["FloatingStatNotice"]:
+        return [n for n in _NOTIFICATION_ACTIVE
+                if getattr(n, "_host", None) is parent and not n.isHidden()]
+
+    @classmethod
+    def _target_pos(cls, parent: QWidget, item: QWidget, index: int) -> QPoint:
         margin = UIScale.px(cls._STACK_MARGIN)
         pgeom = parent.rect()
         origin = parent.mapToGlobal(QPoint(0, 0))
-        x = origin.x() + pgeom.width() - notice.width() - margin
-        y = origin.y() + margin + (notice.height() + margin) * index
+        x = origin.x() + pgeom.width() - item.width() - margin
+        y = origin.y() + pgeom.height() - margin - (item.height() + margin) * (index + 1)
         return QPoint(x, y)
 
     def _positions_for(self, parent: QWidget) -> Tuple[QPoint, QPoint]:
-        stack = self._stack_for(parent)
+        stack = self._shared_stack_for(parent)
         idx = max(0, len(stack) - 1)
         end_pos = self._target_pos(parent, self, idx)
-        start_pos = QPoint(end_pos.x(), end_pos.y() + UIScale.px(18))
+        origin = parent.mapToGlobal(QPoint(0, 0))
+        start_pos = QPoint(end_pos.x(), origin.y() + parent.height())
         return start_pos, end_pos
 
     @classmethod
-    def _reflow(cls, parent: QWidget, exclude: Optional["FloatingStatNotice"] = None) -> None:
-        for idx, notice in enumerate(cls._stack_for(parent)):
-            if notice is exclude:
-                continue
-            notice.move(cls._target_pos(parent, notice, idx))
+    def _reflow(cls, parent: QWidget, exclude: Optional[QWidget] = None) -> None:
+        GameToast._reflow(parent, exclude=exclude)
 
     @classmethod
     def reflow_for(cls, parent: QWidget) -> None:
-        cls._reflow(parent)
+        GameToast._reflow(parent)
 
     def _start_exit(self) -> None:
-        target = self.pos() - QPoint(0, UIScale.px(22))
         self._exit_group = QParallelAnimationGroup(self)
 
         fade = QPropertyAnimation(self._opacity, b"opacity", self)
@@ -2075,18 +2164,15 @@ class FloatingStatNotice(QWidget):
         fade.setEndValue(0.0)
         fade.setEasingCurve(Easing.VALUE_FADE)
 
-        rise = QPropertyAnimation(self, b"pos", self)
-        rise.setDuration(self._FADE_OUT_MS)
-        rise.setStartValue(self.pos())
-        rise.setEndValue(target)
-        rise.setEasingCurve(Easing.TOAST_OUT)
-
         self._exit_group.addAnimation(fade)
-        self._exit_group.addAnimation(rise)
         self._exit_group.finished.connect(self._dismiss_now)
         self._exit_group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _dismiss_now(self) -> None:
+        try:
+            _NOTIFICATION_ACTIVE.remove(self)
+        except ValueError:
+            pass
         try:
             FloatingStatNotice._active.remove(self)
         except ValueError:
@@ -2095,7 +2181,7 @@ class FloatingStatNotice(QWidget):
         self.hide()
         self.deleteLater()
         if host is not None:
-            self._reflow(host)
+            GameToast._reflow(host)
 
 
 class AnimatedValueLabel(QLabel):
@@ -2424,7 +2510,8 @@ class SecretPawButton(QWidget):
         seq.start()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.pos()):
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(pos):
             self.clicked.emit()
         super().mouseReleaseEvent(event)
 
@@ -2446,12 +2533,13 @@ class SecretPawButton(QWidget):
             painter.drawPixmap(target, paw)
 
 
-_PAWPRINT_CACHE: Dict[Tuple[int, bool], QPixmap] = {}
+_PAWPRINT_CACHE: Dict[Tuple[int, float], QPixmap] = {}
 
 
-def _pawprint_pixmap(size: int, *, rotated: bool = False) -> QPixmap:
+def _pawprint_pixmap(size: int, *, rotated: bool = False, angle: float = 0) -> QPixmap:
     size = max(8, int(size))
-    cache_key = (size, bool(rotated))
+    effective_angle = float(angle) if angle else (90.0 if rotated else 0.0)
+    cache_key = (size, effective_angle)
     cached = _PAWPRINT_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -2459,9 +2547,11 @@ def _pawprint_pixmap(size: int, *, rotated: bool = False) -> QPixmap:
     if pix.isNull():
         _PAWPRINT_CACHE[cache_key] = QPixmap()
         return _PAWPRINT_CACHE[cache_key]
-    scaled = pix.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    if rotated:
-        scaled = scaled.transformed(QTransform().rotate(90), Qt.TransformationMode.SmoothTransformation)
+    scaled = pix.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+    if effective_angle:
+        scaled = scaled.transformed(QTransform().rotate(effective_angle),
+                                    Qt.TransformationMode.SmoothTransformation)
     _PAWPRINT_CACHE[cache_key] = scaled
     return scaled
 
@@ -2500,6 +2590,163 @@ class PawTrailWidget(QWidget):
             x = int(self.width() * x_frac - scaled.width() / 2)
             y = int(self.height() * y_frac - scaled.height() / 2)
             painter.drawPixmap(x, y, scaled)
+
+
+class FooterPawTrail(QWidget):
+    """
+    Subtle animated paw-print overlay that trails toward the Help button in the
+    footer.  Active only while the player has the cat treat but hasn't yet
+    discovered the cat easter-egg secret in the Help screen.
+
+    Four prints (left, right, left, right) fade in one-by-one then fade out
+    together.  The sequence repeats every 60-80 seconds.
+    """
+
+    _N            = 4      # prints per sequence
+    _PAW_PX       = 26     # logical size
+    _STEP_MS      = 340    # delay between successive prints appearing
+    _FADE_IN_MS   = 280    # fade-in time per print
+    _HOLD_MS      = 1_700  # how long all prints stay visible
+    _FADE_OUT_MS  = 950    # all-out fade
+    _MAX_ALPHA    = 0.72   # clearly visible for debugging
+
+    def __init__(self, footer: "AppFooter") -> None:
+        root_widget = footer._app.centralWidget() or footer
+        super().__init__(root_widget)
+        self._footer      = footer
+        self._root        = root_widget
+        self._running     = False
+        self._hint_active = False
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setGeometry(root_widget.rect())
+        self.raise_()
+
+        paw_px  = UIScale.px(self._PAW_PX)
+        paw_img = _pawprint_pixmap(paw_px, angle=180)   # facing downward
+        fallback_sz = QSize(paw_px, paw_px)
+
+        self._effects: List[QGraphicsOpacityEffect] = []
+        self._paw_labels: List[QLabel] = []
+        for _ in range(self._N):
+            lbl = QLabel(self)
+            lbl.setPixmap(paw_img)
+            lbl.resize(paw_img.size() if not paw_img.isNull() else fallback_sz)
+            lbl.setStyleSheet("background:transparent;")
+            eff = QGraphicsOpacityEffect(lbl)
+            eff.setOpacity(0.0)
+            lbl.setGraphicsEffect(eff)
+            lbl.hide()
+            self._effects.append(eff)
+            self._paw_labels.append(lbl)
+
+        self._trigger = QTimer(self)
+        self._trigger.setSingleShot(True)
+        self._trigger.timeout.connect(self._play)
+        self._first_run = True
+        self.hide()
+
+    # ── Public control ────────────────────────────────────────────────────────
+
+    def set_active(self, active: bool) -> None:
+        """Enable or disable the hint trail."""
+        if active == self._hint_active:
+            return
+        self._hint_active = active
+        if active:
+            self._first_run = True
+            self.show()
+            self._schedule(first=True)
+        else:
+            self._trigger.stop()
+            self._cancel_animations()
+            self.hide()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _schedule(self, first: bool = False) -> None:
+        delay = 5_000  # DEBUG: 5 s interval; restore to 8-80 s for release
+        self._trigger.start(delay)
+
+    def _play(self) -> None:
+        if self._running or not self._hint_active:
+            return
+        try:
+            help_btn = self._footer._help_btn
+            # Map the help button's centre to our (central-widget) coordinate space.
+            btn_global = help_btn.mapToGlobal(
+                QPoint(help_btn.width() // 2, help_btn.height() // 2))
+            btn_pos = self._root.mapFromGlobal(btn_global)
+        except AttributeError:
+            self._schedule()
+            return
+
+        self._running = True
+        paw_w = self._paw_labels[0].width()
+        paw_h = self._paw_labels[0].height()
+        # Trail steps diagonally down-right toward the Help button.
+        # Each successive print is dx pixels to the right and dy pixels lower.
+        dx = UIScale.px(30)   # horizontal gap between prints
+        dy = UIScale.px(44)   # vertical drop per step (emphasises "stepping down")
+
+        for i, (lbl, eff) in enumerate(zip(self._paw_labels, self._effects)):
+            steps_back = self._N - 1 - i          # 3 → 2 → 1 → 0
+            x_alt = UIScale.px(5) if i % 2 == 0 else -UIScale.px(5)  # L/R swing
+            x = btn_pos.x() - dx * steps_back - paw_w // 2 + x_alt
+            y = btn_pos.y() - dy * steps_back - paw_h // 2
+            lbl.move(x, y)
+            eff.setOpacity(0.0)
+            lbl.show()
+
+        self._reveal_step(0)
+
+    def _reveal_step(self, idx: int) -> None:
+        if not self._hint_active:
+            self._cancel_animations()
+            return
+        if idx >= self._N:
+            QTimer.singleShot(self._HOLD_MS, self._fade_out_all)
+            return
+        eff  = self._effects[idx]
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(self._FADE_IN_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(self._MAX_ALPHA)
+        anim.setEasingCurve(Easing.SMOOTH)
+        anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        QTimer.singleShot(self._STEP_MS, lambda: self._reveal_step(idx + 1))
+
+    def _fade_out_all(self) -> None:
+        if not self._hint_active:
+            self._cancel_animations()
+            return
+        for eff in self._effects:
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(self._FADE_OUT_MS)
+            anim.setStartValue(float(eff.opacity()))
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(Easing.SMOOTH)
+            anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        QTimer.singleShot(self._FADE_OUT_MS + 120, self._after_fadeout)
+
+    def _after_fadeout(self) -> None:
+        for lbl in self._paw_labels:
+            lbl.hide()
+        self._running = False
+        if self._hint_active:
+            self._schedule(first=False)
+
+    def _cancel_animations(self) -> None:
+        for eff in self._effects:
+            eff.setOpacity(0.0)
+        for lbl in self._paw_labels:
+            lbl.hide()
+        self._running = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.setGeometry(self._root.rect())
 
 
 class PawTabLabel(QWidget):
@@ -4125,6 +4372,15 @@ class GameHeader(QWidget):
         center.addWidget(_stat("_net_lbl",     P.cream))
         center.addWidget(_vdiv())
         center.addWidget(_stat("_loc_lbl",     P.fg_dim))
+        center.addWidget(_vdiv())
+        self._heat_lbl = QLabel("", self)
+        self._heat_lbl.setFont(Fonts.mixed_bold)
+        self._heat_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        self._heat_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        )
+        self._heat_lbl.setToolTip("Current heat level. High heat increases chance of guard encounters and seizures.")
+        center.addWidget(self._heat_lbl)
         lay.addLayout(center)
         lay.addStretch()
 
@@ -4181,7 +4437,8 @@ class GameHeader(QWidget):
         self._dbg_mail_btn = _debug_btn("Mail", "Debug: stage fake inbox mail", "secondary", self.window()._debug_send_mail)
         self._dbg_gold_btn = _debug_btn("+5000g", "Debug: add 5000 gold", "secondary", self.window()._debug_add_gold)
         self._dbg_cloud_btn = _debug_btn("Restore", "Debug: restore from cloud save", "secondary", self.window()._debug_cloud_restore)
-        self._dbg_purge_btn = _debug_btn("Purge", "Debug: purge local save files", "danger", self.window()._debug_purge_saves)
+        self._dbg_simtime_btn = _debug_btn("⏱ +Time", "Debug: advance time_played_seconds (for courtship & timed tests)", "secondary", self.window()._debug_sim_time)
+        self._dbg_purge_btn = _debug_btn("Purge", "Debug: purge ALL local saves and quit", "danger", self.window()._debug_purge_saves)
 
         self._sync_lbl = QLabel("", self)
         self._sync_lbl.setFont(Fonts.tiny)
@@ -4198,6 +4455,7 @@ class GameHeader(QWidget):
         right.addWidget(self._dbg_mail_btn)
         right.addWidget(self._dbg_gold_btn)
         right.addWidget(self._dbg_cloud_btn)
+        right.addWidget(self._dbg_simtime_btn)
         right.addWidget(self._dbg_purge_btn)
         right.addSpacing(UIScale.px(10))
         right.addWidget(self._rest_btn)
@@ -4237,6 +4495,16 @@ class GameHeader(QWidget):
         loc   = getattr(g, "current_area", None)
         loc_s = loc.value if loc and hasattr(loc, "value") else str(loc or "?")
         self._loc_lbl.setText(f"{Sym.LOCATION} {loc_s}")
+
+        # Heat
+        heat = int(getattr(g, "heat", 0) or 0)
+        if heat > 0:
+            heat_col = P.red if heat >= 60 else (P.amber if heat >= 30 else P.fg_dim)
+            self._heat_lbl.setText(f"\U0001f525 {heat}/100")
+            self._heat_lbl.setStyleSheet(f"color:{heat_col}; background:transparent;")
+            self._heat_lbl.setVisible(True)
+        else:
+            self._heat_lbl.setVisible(False)
 
         # Day / Season / Year
         day    = getattr(g, "day",    1)
@@ -4306,7 +4574,7 @@ _NAV_SECTION_MAP: Dict[str, str] = {
     "intelligence_hub": "info",
     "market":          "info", "news":      "info", "help": "info",
     "social_hub":      "social",
-    "social":          "social",   "influence":  "social",
+    "social":          "social",   "influence":  "social",   "suitors": "social",
     "profile_hub":     "player",
     "licenses":        "player",  "progress":   "player",
     "reputation":      "player",  "skills":     "player",
@@ -4366,11 +4634,12 @@ class NavRail(QWidget):
         ],
         "info": [
             ("market", Sym.INTELLIGENCE, "Market Info"),
-            ("news", Sym.NEWS, "News & Events"),
+            ("news", Sym.NEWS, "News, Events & Logs"),
             ("help", Sym.INFO, "Help"),
         ],
         "social": [
             ("social", Sym.SOCIAL, "Social Hub"),
+            ("suitors", Sym.SOCIAL, "Courtship"),
             ("influence", Sym.INFLUENCE, "Influence"),
         ],
         "player": [
@@ -4405,6 +4674,7 @@ class NavRail(QWidget):
         hdr.setStyleSheet(
             f"background:{P.bg_panel}; border-bottom:1px solid {P.border};"
         )
+        self._hdr_frame = hdr  # stored for refresh_scale()
         hdr_lay = QHBoxLayout(hdr)
         hdr_lay.setContentsMargins(0, 0, 0, 0)
         hdr_lay.setSpacing(0)
@@ -4465,6 +4735,32 @@ class NavRail(QWidget):
         lay.addSpacing(UIScale.px(6))
 
         self.set_active("dashboard")
+        UIScale.connect(self.refresh_scale)
+
+    def refresh_scale(self, _scale: float = 0.0) -> None:
+        """Update all fixed sizes when UI scale changes."""
+        collapsed_w = UIScale.px(self.COLLAPSED_W)
+        expanded_w  = UIScale.px(self.EXPANDED_W)
+        target_w = expanded_w if self._expanded else collapsed_w
+        self.setFixedWidth(target_w)
+        hdr_h = UIScale.px(46)
+        self._hdr_frame.setFixedHeight(hdr_h)
+        self._toggle_btn.setFixedSize(collapsed_w, hdr_h)
+        self._toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {P.fg_dim};
+                border: none;
+                font-family: 'Segoe UI Symbol';
+                font-size: {UIScale.px(18)}px;
+                padding: 0px;
+            }}
+            QPushButton:hover {{
+                color: {P.gold}; background: {P.bg_hover};
+            }}
+        """)
+        btn_h = UIScale.px(48)
+        for btn in self._btns.values():
+            btn.setFixedHeight(btn_h)
 
     def _make_btn(self, section: str, icon: str, label: str) -> QPushButton:
         # Respect initial expanded/collapsed state when building buttons
@@ -4615,6 +4911,14 @@ class AppFooter(QWidget):
         self._back_btn = _btn(f"{Sym.BACK}  Back", "Go back", "nav", self._app.go_back)
         self._back_btn.setVisible(False)  # hidden on dashboard
 
+        self._version_lbl = QLabel(f"v{self._app.GAME_VERSION}", self)
+        self._version_lbl.setFont(Fonts.mono_small)
+        self._version_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+
+        self._feedback_btn = _btn("Feedback", "Send feedback by email", "secondary", self._app._open_feedback)
+        self._feedback_btn.setFixedHeight(UIScale.px(self.H - 10))
+        self._feedback_btn.setFont(Fonts.tiny)
+
         self._notice_lbl = QLabel("", self)
         self._notice_lbl.setFont(Fonts.mixed_small)
         self._notice_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
@@ -4631,6 +4935,8 @@ class AppFooter(QWidget):
         self._quit_btn = _btn(f"{Sym.NO}  Quit",          "Quit game",  "danger",
                       self._app.quit_game)
 
+        lay.addWidget(self._version_lbl)
+        lay.addWidget(self._feedback_btn)
         lay.addWidget(self._back_btn)
         lay.addWidget(self._notice_lbl, 1)
         lay.addStretch()
@@ -4638,9 +4944,17 @@ class AppFooter(QWidget):
         lay.addWidget(self._help_btn)
         lay.addWidget(self._quit_btn)
 
+        # Paw-trail overlay (created last so it sits on top of all footer widgets)
+        self._paw_trail = FooterPawTrail(self)
+
     def update_back(self, stack_depth: int) -> None:
         """Show Back button only when there is somewhere to go back to."""
         self._back_btn.setVisible(stack_depth > 1)
+
+    def update_cat_hint(self, active: bool) -> None:
+        """Enable/disable the subtle paw-trail hint toward the Help button."""
+        if hasattr(self, "_paw_trail"):
+            self._paw_trail.set_active(active)
 
     def show_notice(self, text: str, colour: str = "", duration_ms: int = 4800) -> None:
         self._notice_lbl.setText(text)
@@ -5898,6 +6212,7 @@ class GameApp(QMainWindow):
     """
 
     TITLE  = "Merchant Tycoon — Expanded Edition"
+    GAME_VERSION = "0.6.34 - Alpha"
     WIN_W  = 1280
     WIN_H  = 820
     MIN_W  = 960
@@ -6085,6 +6400,9 @@ class GameApp(QMainWindow):
         # ── 5. Message bar ────────────────────────────────────────────────
         self.message_bar = MessageBar(central)
         root.addWidget(self.message_bar)
+        # Relay all msg.ok/warn/err/info to GameToast so there is a single
+        # unified floating notification.  The MessageBar strip stays invisible
+        # when this handler is set (see MessageBar._show).
         self.message_bar._toast_fn = lambda text, col: GameToast(self, text, col)
 
         # ── Register screens ──────────────────────────────────────────────
@@ -6129,6 +6447,7 @@ class GameApp(QMainWindow):
         if name not in self.screens:
             self.message_bar.err(f"Unknown screen: '{name}'")
             return
+        self._master_log_action(f"Navigate to screen: {name}", sub="Navigation")
 
         self._set_game_shell_visible(name != "launch")
 
@@ -6180,6 +6499,7 @@ class GameApp(QMainWindow):
         if name not in self.screens:
             self.message_bar.err(f"Unknown screen: '{name}'")
             return
+        self._master_log_action(f"Goto screen: {name}", sub="Navigation")
         if self._stack:
             try:
                 self.screens[self._stack[-1]].deactivate()
@@ -6196,6 +6516,7 @@ class GameApp(QMainWindow):
         if len(self._stack) <= 1:
             return
         leaving = self._stack.pop()
+        self._master_log_action(f"Back navigation from {leaving}", sub="Navigation")
         try:
             self.screens[leaving].deactivate()
         except Exception:
@@ -6222,8 +6543,44 @@ class GameApp(QMainWindow):
             self._emit_stat_notices(previous_snapshot, current_snapshot)
         self._stat_snapshot = current_snapshot
         self._flush_unlock_toasts()
+        self._check_news_feed_toasts()
         if self._tutorial_controller and self._tutorial_controller.is_active():
             self._tutorial_controller.reposition()
+        self._update_cat_hint()
+
+    def _update_cat_hint(self) -> None:
+        """Drive the footer paw-trail hint based on current cat easter-egg state."""
+        if not hasattr(self, "app_footer"):
+            return
+        # DEBUG: always active so visuals can be verified.
+        # Restore the real condition for release:
+        #   game = getattr(self, "game", None)
+        #   has_treat = getattr(game, "has_cat_treat", lambda: False)()
+        #   help_unlocked = bool(game.cat_state.get("cat_help_unlocked", False))
+        #   resolved = bool(game.cat_state.get("adoption_resolved", False))
+        #   self.app_footer.update_cat_hint(bool(has_treat) and not help_unlocked and not resolved)
+        self.app_footer.update_cat_hint(True)
+
+    def _check_news_feed_toasts(self) -> None:
+        """Show a GameToast whenever a new world event is added to the news feed."""
+        feed = list(getattr(self.game, "news_feed", []) or [])
+        last_seen = getattr(self, "_last_news_feed_len", 0)
+        if len(feed) > last_seen:
+            # Newest entries are at index 0 (deque front)
+            new_count = len(feed) - last_seen
+            for entry in feed[:new_count]:
+                try:
+                    _abs_day, area_name, event_name, headline = entry
+                    if str(event_name).lower() not in {"local rumour"}:
+                        GameToast(
+                            self,
+                            f"\u26a1  {event_name} \u2014 {area_name}: {headline}",
+                            P.amber,
+                            duration_ms=5_000,
+                        )
+                except (TypeError, ValueError):
+                    pass
+        self._last_news_feed_len = len(feed)
 
     def _total_skill_xp(self) -> int:
         skills = getattr(self.game, "skills", None)
@@ -6241,6 +6598,44 @@ class GameApp(QMainWindow):
 
     def _reset_stat_snapshot(self) -> None:
         self._stat_snapshot = self._capture_stat_snapshot()
+
+    def _capture_master_log_snapshot(self) -> Dict[str, Any]:
+        return {
+            "gold": float(getattr(getattr(self.game, "inventory", None), "gold", 0.0) or 0.0),
+            "reputation": int(getattr(self.game, "reputation", 0) or 0),
+            "heat": int(getattr(self.game, "heat", 0) or 0),
+            "day": int(getattr(self.game, "day", 1) or 1),
+            "year": int(getattr(self.game, "year", 1) or 1),
+            "area": str(getattr(getattr(self.game, "current_area", None), "value", "") or ""),
+            "screen": str(self._stack[-1] if getattr(self, "_stack", None) else ""),
+        }
+
+    def _master_log_action(self, msg: str, *, sub: str = "UI", extra: str = "") -> None:
+        if sub in {"UI", "UIButton", "Footer", "Navigation", "Dialog", "Hotkey"}:
+            return
+        detail = msg if not extra else f"{msg}  [{extra}]"
+        self.game._mlog("PLAYER", detail, sub=sub)
+
+    def _master_log_action_result(self, label: str, before: Dict[str, Any]) -> None:
+        after = self._capture_master_log_snapshot()
+        deltas: List[str] = []
+        gold_delta = round(after["gold"] - before["gold"], 2)
+        rep_delta = int(after["reputation"] - before["reputation"])
+        heat_delta = int(after["heat"] - before["heat"])
+        if gold_delta:
+            deltas.append(f"gold {gold_delta:+.2f}g")
+        if rep_delta:
+            deltas.append(f"rep {rep_delta:+d}")
+        if heat_delta:
+            deltas.append(f"heat {heat_delta:+d}")
+        if after["day"] != before["day"] or after["year"] != before["year"]:
+            deltas.append(f"date Y{before['year']}D{before['day']}→Y{after['year']}D{after['day']}")
+        if after["area"] != before["area"]:
+            deltas.append(f"area {before['area']}→{after['area']}")
+        if after["screen"] != before["screen"]:
+            deltas.append(f"screen {before['screen']}→{after['screen']}")
+        if deltas:
+            self.game._mlog("PLAYER", f"{label} result: " + "; ".join(deltas), sub="ActionResult", gold=gold_delta)
 
     def _emit_stat_notices(self, previous: Dict[str, float], current: Dict[str, float]) -> None:
         gold_delta = current.get("gold", 0.0) - previous.get("gold", 0.0)
@@ -6298,6 +6693,7 @@ class GameApp(QMainWindow):
 
     @Slot(str)
     def _on_hotkey(self, action: str) -> None:
+        self._master_log_action(f"Hotkey triggered: {action}", sub="Hotkey")
         routes = {
             "trade":      "trade",
             "travel":     "travel",
@@ -6329,19 +6725,49 @@ class GameApp(QMainWindow):
 
     def _open_wait_dialog(self) -> None:
         """Open the Rest & Wait popup dialog from the header button."""
+        self._master_log_action("Opened wait dialog", sub="Dialog")
         dlg = WaitDialog(self, self)
         dlg.exec()
 
     def _open_inbox_dialog(self) -> None:
         """Open the Inbox popup dialog from the header button."""
+        self._master_log_action("Opened inbox dialog", sub="Dialog")
         dlg = InboxDialog(self, self)
         dlg.exec()
         self._refresh_inbox_badge()
 
     def _open_profile_dialog(self) -> None:
         """Open the player profile popup dialog from the header button."""
+        self._master_log_action("Opened profile dialog", sub="Dialog")
         dlg = ProfileDialog(self, self)
         dlg.exec()
+
+    def _open_feedback(self) -> None:
+        recipient = "merchanttycoon.noreply@gmail.com"
+        subject_text = "Game Feedback"
+        subject = quote(subject_text)
+        mailto_href = f"mailto:{recipient}?subject={subject}"
+
+        if sys.platform == "win32":
+            try:
+                os.startfile(mailto_href)
+                return
+            except OSError:
+                pass
+            except Exception:
+                pass
+
+        if QDesktopServices.openUrl(QUrl(mailto_href)):
+            return
+
+        gmail_href = (
+            "https://mail.google.com/mail/?view=cm&fs=1"
+            f"&to={recipient}&su={subject}"
+        )
+        if QDesktopServices.openUrl(QUrl(gmail_href)):
+            return
+
+        self.message_bar.warn("Unable to open an email client or browser for feedback.")
 
     def _set_game_shell_visible(self, visible: bool) -> None:
         if hasattr(self, "game_header"):
@@ -6473,6 +6899,8 @@ class GameApp(QMainWindow):
         self._resolve_startup_save(online_greeting or "Merchant")
 
     def _resolve_startup_save(self, online_greeting: Optional[str]) -> None:
+        MasterLog.open()
+        MasterLog.write("SYSTEM", "Session started", sub="Startup")
         is_online = bool(
             online_greeting and self.online and getattr(self.online, "is_online", False)
             and self.online.auth.user_id
@@ -6630,11 +7058,94 @@ class GameApp(QMainWindow):
     def _run_post_startup_online_tasks(self, online_greeting: str) -> None:
         self._pending_online_greeting = None
         self.message_bar.ok(f"Signed in as {online_greeting}.")
+        QTimer.singleShot(150, self._bootstrap_online_reward_mail)
         QTimer.singleShot(250, self._refresh_inbox_badge)
         QTimer.singleShot(400, self._push_online_presence)
         QTimer.singleShot(650, self._push_leaderboard)
         QTimer.singleShot(900, self._update_sync_status)
         QTimer.singleShot(1200, self._start_cloud_sync)
+
+    def _bootstrap_online_reward_mail(self) -> None:
+        online = self.online
+        rewards = getattr(online, "rewards", None) if online else None
+        if not (online and getattr(online, "is_online", False) and rewards):
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._handle_reward_mail_bootstrap(r))
+
+        try:
+            rewards.bootstrap_inbox(callback=_cb)
+        except Exception:
+            pass
+
+    def _handle_reward_mail_bootstrap(self, res: Any) -> None:
+        if not getattr(res, "success", False):
+            return
+        data = res.data if isinstance(res.data, dict) else {}
+        created = int(data.get("messages_created", 0) or 0)
+        if created > 0:
+            self._refresh_inbox_badge()
+            self.message_bar.info("New reward-code mail arrived in your inbox.")
+
+    def _apply_reward_payload(self, payload: Dict[str, Any], *, source_label: str = "Reward") -> List[str]:
+        g = self.game
+        inv = getattr(g, "inventory", None)
+        granted: List[str] = []
+        should_save_settings = False
+
+        gold = int(float(payload.get("reward_gold", 0) or 0))
+        if gold and inv is not None:
+            inv.gold = getattr(inv, "gold", 0) + gold
+            granted.append(f"{gold:,}g")
+
+        reputation = int(float(payload.get("reward_reputation", 0) or 0))
+        if reputation:
+            g._gain_reputation(reputation)
+            granted.append(f"{reputation} reputation")
+
+        free_spins = int(float(payload.get("reward_free_spins", 0) or 0))
+        if free_spins:
+            g.settings.gamble_free_spins = int(getattr(g.settings, "gamble_free_spins", 0) or 0) + free_spins
+            granted.append(f"{free_spins} free spin{'s' if free_spins != 1 else ''}")
+            should_save_settings = True
+
+        reward_items = payload.get("reward_items", {}) or {}
+        if inv is not None and isinstance(reward_items, dict):
+            for item_key, qty in reward_items.items():
+                qty_i = int(qty or 0)
+                if item_key in ALL_ITEMS and qty_i > 0:
+                    inv.add(item_key, qty_i)
+                    granted.append(f"{qty_i}x {ALL_ITEMS[item_key].name}")
+
+        title = str(payload.get("reward_title", "") or "")
+        if title:
+            earned = getattr(g, "earned_titles", None)
+            if isinstance(earned, list):
+                if title not in earned:
+                    earned.append(title)
+            elif isinstance(earned, set):
+                earned.add(title)
+            title_def = TITLES_BY_ID.get(title)
+            granted.append(title_def["name"] if isinstance(title_def, dict) and title_def.get("name") else title)
+
+        if should_save_settings:
+            try:
+                g.settings.save()
+            except Exception:
+                pass
+
+        if not self._tutorial_blocks_persistence():
+            try:
+                self._accumulate_session_time()
+                g.save_game(silent=True)
+            except Exception:
+                pass
+            if self.online and getattr(self.online, "is_online", False):
+                QTimer.singleShot(250, lambda: self._push_cloud_save(show_failures=False))
+
+        self.refresh()
+        return granted
 
     def _resume_post_startup_online_tasks(self) -> None:
         greeting = self._pending_online_greeting
@@ -6647,6 +7158,7 @@ class GameApp(QMainWindow):
 
     def _do_sync(self) -> None:
         """Trigger a cloud save and update the sync status label."""
+        self._master_log_action("Manual sync requested", sub="Sync")
         if self._tutorial_blocks_persistence():
             self.message_bar.info("Tutorial progress is temporary and will not be saved.")
             return
@@ -6662,6 +7174,7 @@ class GameApp(QMainWindow):
             self._sync_after_save(show_failures=True)
 
     def _start_cloud_sync(self) -> None:
+        self._master_log_action("Cloud sync loop start requested", sub="Sync")
         if self._tutorial_blocks_persistence():
             return
         if self.online is None or not getattr(self.online, "is_online", False):
@@ -6672,6 +7185,7 @@ class GameApp(QMainWindow):
         self._auto_save_and_sync()
 
     def _auto_save_and_sync(self) -> None:
+        self._master_log_action("Auto-save and sync tick", sub="Sync")
         if self._tutorial_blocks_persistence():
             return
         if self.online is None or not getattr(self.online, "is_online", False):
@@ -6698,6 +7212,7 @@ class GameApp(QMainWindow):
         if online is None or not getattr(online, "is_online", False):
             return
         try:
+            self._master_log_action("Presence push queued", sub="Presence")
             online.profile.update_presence(
                 self.game._net_worth(),
                 getattr(getattr(self.game, "current_area", None), "value", ""),
@@ -6720,6 +7235,7 @@ class GameApp(QMainWindow):
                 _queue_ui(self, done_callback)
             return
         try:
+            self._master_log_action("Leaderboard submit queued", sub="Leaderboard")
             def _cb(_result: Any) -> None:
                 if done_callback is not None:
                     _queue_ui(self, done_callback)
@@ -6744,6 +7260,7 @@ class GameApp(QMainWindow):
 
     def _push_cloud_save(self, *, show_failures: bool = True) -> None:
         """Push the latest local save to cloud storage if online auth is active."""
+        self._master_log_action("Cloud save push requested", sub="CloudSave")
         if self._tutorial_blocks_persistence():
             self._update_sync_status()
             return
@@ -6772,9 +7289,11 @@ class GameApp(QMainWindow):
         def _on_done(result: Any) -> None:
             def _apply() -> None:
                 if result and getattr(result, "success", False):
+                    self._master_log_action("Cloud save push completed", sub="CloudSave")
                     self._last_sync_time = time.time()
                     self._update_sync_status()
                 else:
+                    self._master_log_action("Cloud save push failed", sub="CloudSave")
                     if hasattr(self, "game_header"):
                         self.game_header.set_sync_status("(sync failed)", P.red)
                     err_txt = (
@@ -6852,6 +7371,7 @@ class GameApp(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _do_save(self) -> None:
+        self._master_log_action("Manual save requested", sub="Save")
         if self._save_local_game():
             if self.online and getattr(self.online, "is_online", False):
                 if hasattr(self, "game_header"):
@@ -6868,8 +7388,10 @@ class GameApp(QMainWindow):
         try:
             self._accumulate_session_time()
             self.game.save_game()
+            self._master_log_action("Local save completed", sub="Save")
             return True
         except Exception as exc:
+            self._master_log_action(f"Local save failed: {exc}", sub="Save")
             self.message_bar.err(f"Save failed: {exc}")
             return False
 
@@ -6904,11 +7426,13 @@ class GameApp(QMainWindow):
             os.makedirs(os.path.dirname(self.game.SAVE_FILE), exist_ok=True)
             with open(self.game.SAVE_FILE, "wb") as handle:
                 handle.write(raw_bytes)
+            self._master_log_action("Cloud payload written to local disk", sub="CloudRestore")
             return True
         except Exception:
             return False
 
     def _restore_cloud_save(self) -> None:
+        self._master_log_action("Cloud restore requested", sub="CloudRestore")
         if not (self.online and getattr(self.online, "is_online", False)):
             self.message_bar.warn("Not online — cannot restore from cloud.")
             return
@@ -6922,6 +7446,7 @@ class GameApp(QMainWindow):
 
     def _apply_cloud_restore(self, res: Any) -> None:
         if not self._write_cloud_to_disk(res):
+            self._master_log_action("Cloud restore failed before load", sub="CloudRestore")
             self.message_bar.err(
                 "Cloud restore failed — no valid data returned." if not (res and getattr(res, "success", False)) else
                 "Cloud save data is empty or in an unrecognised format."
@@ -6929,6 +7454,7 @@ class GameApp(QMainWindow):
             return
         try:
             if self.game.load_game():
+                self._master_log_action("Cloud restore applied and loaded", sub="CloudRestore")
                 if hasattr(self, "status_bar"):
                     self.status_bar._game = self.game
                 for screen in self.screens.values():
@@ -6940,8 +7466,10 @@ class GameApp(QMainWindow):
                 self.refresh()
                 self.message_bar.ok(f"Cloud save loaded! Welcome back, {self.game.player_name}.")
             else:
+                self._master_log_action("Cloud restore load rejected corrupted save", sub="CloudRestore")
                 self.message_bar.err("Cloud save corrupted — keeping current state.")
         except Exception as exc:
+            self._master_log_action(f"Cloud restore error: {exc}", sub="CloudRestore")
             self.message_bar.err(f"Cloud restore error: {exc}")
 
     def _debug_add_gold(self) -> None:
@@ -6999,6 +7527,42 @@ class GameApp(QMainWindow):
             self.game_header.set_inbox_badge(3)
         self.message_bar.ok("Debug: 3 fake inbox messages ready — click Inbox to view.")
 
+    def _debug_sim_time(self) -> None:
+        """Advance time_played_seconds by a user-specified number of hours (for testing courtship etc.)"""
+        raw = _popup_get_text(
+            self,
+            "Simulate Real Time",
+            "Advance time_played_seconds by this many hours.\n"
+            "(Courtship, timed perks, and other real-time features use this value.)\n\n"
+            f"Current time played: {self.game.time_played_seconds / 3600:.2f}h",
+            placeholder="1",
+            confirm_text="Advance Time",
+        )
+        if raw is None:
+            return
+        try:
+            hours = float(raw)
+        except ValueError:
+            self.message_bar.err("Enter a valid number of hours.")
+            return
+        if hours <= 0:
+            self.message_bar.err("Hours must be positive.")
+            return
+        secs = hours * 3600.0
+        self.game.time_played_seconds = float(getattr(self.game, "time_played_seconds", 0.0)) + secs
+        self.game.settings.time_played = int(self.game.time_played_seconds)
+        # Cat petting uses real calendar date; backdate last_pet_real_day to simulate days passing
+        if hours >= 24:
+            import datetime as _dt
+            days_sim = int(hours // 24)
+            fake_past = (_dt.date.today() - _dt.timedelta(days=days_sim)).isoformat()
+            if self.game.cat_state.get("cat_adopted") and self.game.cat_state.get("last_pet_real_day"):
+                self.game.cat_state["last_pet_real_day"] = fake_past
+        self.refresh()
+        self.message_bar.ok(
+            f"⏱ +{hours:.1f}h simulated  ({self.game.time_played_seconds / 3600:.2f}h total)"
+        )
+
     def _debug_cloud_restore(self) -> None:
         if not _popup_confirm(
             self,
@@ -7013,37 +7577,50 @@ class GameApp(QMainWindow):
     def _debug_purge_saves(self) -> None:
         if not _popup_confirm(
             self,
-            "Purge Local Saves",
-            "Delete local save files from disk for testing? The current in-memory game stays loaded.",
-            confirm_text="Purge Saves",
+            "Purge ALL Local Saves + Quit",
+            "This will delete ALL local save files (including per-account slots) "
+            "from disk, stop all autosave timers, and immediately close the game "
+            "so no new saves are generated.\n\nThis cannot be undone.",
+            confirm_text="Purge & Quit",
             confirm_role="danger",
         ):
             return
+
+        # 1. Stop the cloud-sync timer immediately so no save fires on the way out
+        try:
+            self._cloud_sync_timer.stop()
+        except Exception:
+            pass
+
+        # 2. Monkey-patch save_game so any in-flight call is silently swallowed
+        try:
+            self.game.save_game = lambda *a, **kw: None
+        except Exception:
+            pass
+
+        # 3. Collect every possible local save path
+        data_dir = os.path.dirname(self.game.SAVE_FILE)
+        legacy   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "merchant_savegame.json")
+        paths_to_delete: List[str] = [legacy]
+
+        # Static primary path
+        paths_to_delete.append(self.game.SAVE_FILE)
+
+        # All savegame_*.dat (per-account) and any .json saves in the data dir
+        for pattern in ["savegame*.dat", "savegame*.json", "savegame.dat"]:
+            paths_to_delete.extend(glob.glob(os.path.join(data_dir, pattern)))
+
         deleted: List[str] = []
-        for path in [
-            self.game.SAVE_FILE,
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "merchant_savegame.json"),
-        ]:
+        for path in dict.fromkeys(paths_to_delete):   # deduplicate, preserve order
             if os.path.exists(path):
                 try:
                     os.remove(path)
                     deleted.append(os.path.basename(path))
                 except Exception as exc:
-                    self.message_bar.warn(f"Could not delete {os.path.basename(path)}: {exc}")
-        data_dir = os.path.dirname(self.game.SAVE_FILE)
-        for pattern in ["savegame*.dat", "savegame*.json"]:
-            for path in glob.glob(os.path.join(data_dir, pattern)):
-                if path == self.game.SAVE_FILE:
-                    continue
-                try:
-                    os.remove(path)
-                    deleted.append(os.path.basename(path))
-                except Exception:
-                    pass
-        if deleted:
-            self.message_bar.ok(f"Purged: {', '.join(deleted)}")
-        else:
-            self.message_bar.info("No local save files found to purge.")
+                    pass  # already quitting, best-effort only
+
+        # 4. Hard-quit — bypass closeEvent so it cannot save again
+        QApplication.instance().quit()
 
     def _do_bankruptcy_restart(self) -> None:
         deleted: List[str] = []
@@ -7163,6 +7740,17 @@ class GameApp(QMainWindow):
             self.game.save_game(silent=True)
         except Exception:
             pass
+        try:
+            _g = self.game
+            MasterLog.write(
+                "SYSTEM",
+                f"Session ended — Y{_g.year} D{_g.day}  gold:{_g.inventory.gold:.0f}g",
+                sub="Shutdown",
+                game=_g,
+            )
+        except Exception:
+            pass
+        MasterLog.close()
         if hasattr(self, "sound"):
             self.sound.stop_looping_sfx("cat_purr")
             self.sound.stop_music()
@@ -7207,6 +7795,30 @@ class GameApp(QMainWindow):
         self.title_bar.show_scale(int(scale * 100))
         if hasattr(self.game, "settings") and hasattr(self.game.settings, "ui_scale"):
             self.game.settings.ui_scale = scale
+
+        # Mark all non-current screens dirty so they rebuild at the new scale
+        # when they are next visited.
+        current_name = self._stack[-1] if self._stack else ""
+        for name, screen in self.screens.items():
+            if name != current_name and screen._built:
+                for child in list(screen.children()):
+                    if isinstance(child, QTimer):
+                        child.stop()
+                        child.setParent(None)
+                        child.deleteLater()
+                    elif isinstance(child, QWidget):
+                        child.setParent(None)
+                        child.deleteLater()
+                screen._built = False
+
+        # Rebuild the currently visible screen immediately so there is no
+        # visual jump left on screen.
+        if current_name and current_name in self.screens:
+            try:
+                self.screens[current_name].rebuild()
+            except Exception:
+                pass
+
         self.update()
 
     def moveEvent(self, event) -> None:
@@ -7713,7 +8325,7 @@ class HelpScreen(Screen):
                     ],
                 ),
                 (
-                    "News & Events",
+                    "News, Events & Logs",
                     [
                         "The <b>News</b> feed is not flavor text. World events influence prices, travel safety, and the relative strength of entire sectors.",
                         "Prepared merchants profit by acting before everyone else fully reacts.",
@@ -7836,13 +8448,14 @@ class HelpScreen(Screen):
 
     def _secret_help_topic(self) -> Dict[str, Any]:
         if self.game.cat_state.get("cat_adopted", False):
-            summary = f"{self.game.cat_state.get('cat_name', 'Stray')} now lives on your dashboard."
+            cat_name = str(self.game.cat_state.get("cat_name", "Stray") or "Stray")
+            summary = f"{cat_name} haunts the ledger room. The ink-smell and the warmth seem to suit her."
         elif self.game.cat_state.get("cat_left", False):
-            summary = "The tracks fade out into the floorboards and do not return."
+            summary = "The narrow gap beneath the shelving is bare. Dust has already begun to close over the entrance."
         elif getattr(self.game, "has_cat_treat", lambda: False)():
-            summary = "Something is moving in the rafters..."
+            summary = "Following the paw prints leads to a small stack of crates behind a bakery."
         else:
-            summary = "A set of dusty tracks ends behind an old crate and waits."
+            summary = "Dried paw prints stop at a gap in the floor planking and do not continue."
         return {
             "key": "cat_secret",
             "title": "????",
@@ -7850,16 +8463,17 @@ class HelpScreen(Screen):
             "summary": summary,
             "body": [
                 (
-                    "Tracks",
+                    "A Set of Tracks",
                     [
-                        "Faint paw prints pad across the page in a looping little path.",
-                        "The marks are too clean to be random, and too deliberate to be a printing error.",
+                        "A series of soft paw impressions lead across the dirt.",
+                        "They trail off behind a stack of old crates and wooden pallets.",
+                        "It looks like something small has been living back there for a while.",
                     ],
                 ),
             ],
             "tips": [
-                "The trail only moved once you picked up the treat.",
-                "Whatever answers the treat only does so a single time.",
+                "The trail only stirred after something small turned up in the storeroom.",
+                "Whatever waits behind the shelving has been waiting considerably longer than you have.",
             ],
         }
 
@@ -7989,49 +8603,70 @@ class HelpScreen(Screen):
 
         if self.game.cat_state.get("cat_adopted", False):
             cat_name = str(self.game.cat_state.get("cat_name", "Stray") or "Stray")
-            state_lbl.setText(f"{cat_name} is already asleep on the dashboard. The little trail ends there now.")
+            state_lbl.setText(
+                f"{cat_name} has claimed the warmest corner of the ledger room and"
+                f" shows no intention of leaving.  The scratching in the walls has stopped."
+            )
             visit_btn = MtButton("Visit Dashboard", card, role="secondary")
             visit_btn.clicked.connect(lambda: self.app.show_screen("dashboard"))
             lay.addWidget(visit_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         elif self.game.cat_state.get("cat_left", False):
-            state_lbl.setText("The crate is empty. Whatever waited here accepted your answer and moved on.")
+            state_lbl.setText(
+                "The hollow beneath the iron shelving is empty.  Dust has already begun to"
+                " settle across the entrance.  Whatever lived there is gone."
+            )
         elif getattr(self.game, "has_cat_treat", lambda: False)():
-            state_lbl.setText("You remember the cat treat in your pocket. Something small behind a crate stirs as you take out the treat.")
-            use_btn = MtButton("Use Treat?", card, role="primary")
+            state_lbl.setText(
+                "Your hand finds the dried fish in your coat pocket.  Behind the iron"
+                " shelving, something goes very still and waits."
+            )
+            use_btn = MtButton("Offer the Treat", card, role="primary")
             use_btn.clicked.connect(self._use_treat_from_help)
             lay.addWidget(use_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         else:
-            state_lbl.setText("The tracks stop here for now. You already followed them once.")
+            state_lbl.setText(
+                "The prints end here.  They have not moved since you last looked."
+            )
 
         return card
 
     def _use_treat_from_help(self) -> None:
         if not getattr(self.game, "use_cat_treat", lambda: False)():
-            self.msg.warn("You no longer have the treat.")
+            self.msg.warn("The treat is no longer in your possession.")
             self.app.refresh()
             return
         adopt = _popup_confirm(
             self,
-            "Stray Kitten",
-            "A soot-smudged kitten crawls out from behind the crate, curls around your boot, and blinks up at you. Adopt the stray?",
-            confirm_text="Adopt",
-            cancel_text="Leave",
+            "A Small Visitor",
+            "A thin cat slips from the gap behind the shelving and winds once around your ankle"
+            " without looking up.  She is watching the counting-room door, not you."
+            "\n\nLet her stay?",
+            confirm_text="Yes, let her stay",
+            cancel_text="Leave her be",
         )
         if adopt:
             name = _popup_get_text(
                 self,
-                "Name Your Cat",
-                "Choose a name for the kitten. Maximum 15 characters.",
+                "She Will Need a Name",
+                "She will need something to answer to.  Choose carefully — she will ignore it either way."
+                "\n\nMaximum 15 characters.",
                 default="Stray",
-                placeholder="Cat name",
-                confirm_text="Adopt",
+                placeholder="A name for the cat",
+                confirm_text="That will do",
                 max_length=15,
             )
             cat_name = getattr(self.game, "adopt_cat", lambda value: value)(name or "Stray")
-            self.msg.ok(f"{cat_name} curls up in a warm dashboard nook and refuses to leave.")
+            self.msg.ok(
+                f"{cat_name} claims a warm corner of the ledger room."
+                f"  The mice were already leaving."
+            )
+            GameToast(self.app, f"\U0001f431  {cat_name} has claimed the ledger room. The mice know it too.", P.gold, duration_ms=15_000)
         else:
             getattr(self.game, "decline_cat", lambda: None)()
-            self.msg.info("The kitten watches you go, then slips back into the walls.")
+            self.msg.info(
+                "The cat withdraws behind the shelving.  The gap is empty when you look again."
+            )
+            GameToast(self.app, "\U0001f43e  The cat withdraws behind the shelving.", P.fg_dim, duration_ms=15_000)
         try:
             self.game.save_game(silent=True)
         except Exception:
@@ -8975,10 +9610,19 @@ class LeaseApplicantDialog(AppDialog):
         ("mult", "Rate %", 80, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
     ]
 
-    def __init__(self, parent: Optional[QWidget], property_name: str, daily_rate: float) -> None:
+    def __init__(self, parent: Optional[QWidget], property_name: str, daily_rate: float,
+                 existing_applicants: Optional[List[Dict[str, Any]]] = None) -> None:
         super().__init__(parent, f"Lease {property_name}")
         self._selected: Optional[Dict[str, Any]] = None
-        self._applicants = _generate_lease_applicants(daily_rate, 3)
+        if existing_applicants:
+            _RC = {"Excellent": P.green, "Good": P.gold, "Average": P.fg,
+                   "Risky": P.amber, "Troublesome": P.red}
+            self._applicants = [
+                {**a, "color": _RC.get(a.get("reliability", "Average"), P.fg)}
+                for a in existing_applicants
+            ]
+        else:
+            self._applicants = _generate_lease_applicants(daily_rate, 3)
         self.resize(UIScale.px(720), UIScale.px(440))
 
         root = self.body_layout(
@@ -9525,7 +10169,7 @@ def _popup_confirm(
     cancel_text: str = "Cancel",
     confirm_role: str = "primary",
 ) -> bool:
-    return ConfirmDialog(
+    result = ConfirmDialog(
         parent,
         title,
         message,
@@ -9533,9 +10177,16 @@ def _popup_confirm(
         cancel_text=cancel_text,
         confirm_role=confirm_role,
     ).ask()
+    owner = parent if isinstance(parent, GameApp) else getattr(parent, "app", None)
+    if owner is not None and hasattr(owner, "_master_log_action"):
+        owner._master_log_action(f"Confirm dialog: {title} -> {'confirm' if result else 'cancel'}", sub="Dialog")
+    return result
 
 
 def _popup_info(parent: Optional[QWidget], title: str, message: str) -> None:
+    owner = parent if isinstance(parent, GameApp) else getattr(parent, "app", None)
+    if owner is not None and hasattr(owner, "_master_log_action"):
+        owner._master_log_action(f"Info dialog shown: {title}", sub="Dialog")
     InfoDialog(parent, title, message).show_message()
 
 
@@ -9550,7 +10201,7 @@ def _popup_get_int(
     step: int = 1,
     confirm_text: str = "Confirm",
 ) -> Tuple[int, bool]:
-    return IntegerPromptDialog(
+    value_out, accepted = IntegerPromptDialog(
         parent,
         title,
         prompt,
@@ -9560,6 +10211,13 @@ def _popup_get_int(
         step=step,
         confirm_text=confirm_text,
     ).get_value()
+    owner = parent if isinstance(parent, GameApp) else getattr(parent, "app", None)
+    if owner is not None and hasattr(owner, "_master_log_action"):
+        owner._master_log_action(
+            f"Integer dialog: {title} -> {'accepted' if accepted else 'cancelled'} ({value_out})",
+            sub="Dialog",
+        )
+    return value_out, accepted
 
 
 def _popup_get_text(
@@ -9572,7 +10230,7 @@ def _popup_get_text(
     confirm_text: str = "Confirm",
     max_length: int = 0,
 ) -> Optional[str]:
-    return TextPromptDialog(
+    result = TextPromptDialog(
         parent,
         title,
         prompt,
@@ -9581,6 +10239,11 @@ def _popup_get_text(
         confirm_text=confirm_text,
         max_length=max_length,
     ).get_value()
+    owner = parent if isinstance(parent, GameApp) else getattr(parent, "app", None)
+    if owner is not None and hasattr(owner, "_master_log_action"):
+        preview = (result[:40] + "…") if isinstance(result, str) and len(result) > 40 else (result or "cancelled")
+        owner._master_log_action(f"Text dialog: {title} -> {preview}", sub="Dialog")
+    return result
 
 
 def _popup_choose(
@@ -9591,7 +10254,14 @@ def _popup_choose(
     *,
     confirm_text: str = "Select",
 ) -> Tuple[str, bool]:
-    return ChoiceListDialog(parent, title, prompt, items, confirm_text=confirm_text).choose()
+    result, accepted = ChoiceListDialog(parent, title, prompt, items, confirm_text=confirm_text).choose()
+    owner = parent if isinstance(parent, GameApp) else getattr(parent, "app", None)
+    if owner is not None and hasattr(owner, "_master_log_action"):
+        owner._master_log_action(
+            f"Choice dialog: {title} -> {'accepted' if accepted else 'cancelled'} ({result})",
+            sub="Dialog",
+        )
+    return result, accepted
 
 
 def _queue_ui(target: QObject, fn: Callable[[], None]) -> None:
@@ -10636,7 +11306,7 @@ class InboxDialog(AppDialog):
         self._msg_inner = QWidget()
         self._msg_inner.setStyleSheet("background:transparent;")
         self._msg_vlay = QVBoxLayout(self._msg_inner)
-        self._msg_vlay.setSpacing(UIScale.px(5))
+        self._msg_vlay.setSpacing(UIScale.px(8))
         self._msg_vlay.setContentsMargins(
             UIScale.px(8), UIScale.px(6), UIScale.px(8), UIScale.px(8))
         self._msg_vlay.addStretch()
@@ -10719,37 +11389,71 @@ class InboxDialog(AppDialog):
     # ── Messages tab ───────────────────────────────────────────────────────
 
     def _load_messages(self) -> None:
-        """Fetch online messages; fall back to a placeholder when offline."""
+        """Fetch online messages off the main thread; show a placeholder while loading."""
+        # Always clear layout first so we never show stale content alongside new content
+        self._clear_msg_layout()
+
         staged = getattr(self._app, "_debug_messages", None)
         if staged is not None:
             self._app._debug_messages = None
             msgs = list(staged)
             self._populate_messages(msgs)
-            self._app.game_header.set_inbox_badge(sum(0 if bool(msg.get("is_read", False)) else 1 for msg in msgs))
+            self._app.game_header.set_inbox_badge(
+                sum(0 if bool(msg.get("is_read", False)) else 1 for msg in msgs))
             return
+
         online = getattr(self._app, "online", None)
         inbox  = getattr(online, "inbox", None) if online else None
         if inbox is None or not getattr(online, "is_online", False):
-            self._show_no_messages("Sign in to online services to receive messages.")
+            self._show_placeholder("Sign in to online services to receive messages.")
             return
 
-        self._show_no_messages("Loading messages…")
-        result = inbox.list_messages(limit=50)
+        self._show_placeholder("Loading messages…")
+
+        import threading
+
+        def _fetch() -> None:
+            try:
+                result = inbox.list_messages(limit=50)
+                err    = getattr(result, "error", "Could not load messages.")
+            except Exception as exc:
+                result = None
+                err    = str(exc)
+
+            # Marshal back to the main (GUI) thread via a zero-delay timer
+            if self.isVisible():
+                QTimer.singleShot(
+                    0, lambda r=result, e=err: self._on_messages_loaded(r, e)
+                )
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _on_messages_loaded(self, result: object, error_text: str) -> None:
+        """Called on the main thread after the background fetch completes."""
         if result and getattr(result, "success", False):
             msgs = result.data if isinstance(result.data, list) else []
             self._populate_messages(msgs)
             unread = sum(0 if bool(msg.get("is_read", False)) else 1 for msg in msgs)
-            self._app.game_header.set_inbox_badge(unread)
-            return
-        self._show_no_messages(getattr(result, "error", "No messages."))
+            try:
+                self._app.game_header.set_inbox_badge(unread)
+            except Exception:
+                pass
+        else:
+            self._show_placeholder(error_text or "No messages.")
 
-    def _show_no_messages(self, text: str) -> None:
+    def _clear_msg_layout(self) -> None:
+        """Remove all content items from the messages layout, keeping only the stretch."""
         while self._msg_vlay.count() > 1:
             item = self._msg_vlay.takeAt(0)
             w = item.widget() if item else None
             if w:
+                w.hide()
                 w.deleteLater()
-        ph = self._lbl(text, Fonts.mixed, P.fg_dim, wrap=True)
+
+    def _show_placeholder(self, text: str) -> None:
+        """Show a centred placeholder label as the sole message-list item."""
+        self._clear_msg_layout()
+        ph = self._lbl(text, Fonts.mixed, P.fg_dim, self._msg_inner, wrap=True)
         ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ph.setSizePolicy(QSizePolicy.Policy.Expanding,
                          QSizePolicy.Policy.MinimumExpanding)
@@ -10758,14 +11462,14 @@ class InboxDialog(AppDialog):
             UIScale.px(12), UIScale.px(20), UIScale.px(12), UIScale.px(20))
         self._msg_vlay.insertWidget(0, ph)
 
+    # Keep backward-compat alias
+    def _show_no_messages(self, text: str) -> None:
+        self._show_placeholder(text)
+
     def _populate_messages(self, msgs: List[Dict]) -> None:
-        while self._msg_vlay.count() > 1:
-            item = self._msg_vlay.takeAt(0)
-            w = item.widget() if item else None
-            if w:
-                w.deleteLater()
+        self._clear_msg_layout()
         if not msgs:
-            self._show_no_messages("No messages.")
+            self._show_placeholder("No messages.")
             return
         for idx, msg in enumerate(msgs):
             self._msg_vlay.insertWidget(idx, self._build_message_card(msg))
@@ -10779,12 +11483,19 @@ class InboxDialog(AppDialog):
         msg_type     = str(msg.get("msg_type",         "notification"))
         msg_id       = msg.get("id")
 
-        frame = QFrame()
+        frame = QFrame(self._msg_inner)
         frame.setObjectName("dashPanel")
+        frame.setStyleSheet(
+            f"QFrame#dashPanel{{"
+            f"  background:{P.bg_panel};"
+            f"  border:1px solid {P.border};"
+            f"  border-radius:{UIScale.px(6)}px;"
+            f"}}"
+        )
         lay = QVBoxLayout(frame)
-        lay.setContentsMargins(UIScale.px(8), UIScale.px(6),
-                               UIScale.px(8), UIScale.px(6))
-        lay.setSpacing(UIScale.px(3))
+        lay.setContentsMargins(UIScale.px(10), UIScale.px(8),
+                               UIScale.px(10), UIScale.px(8))
+        lay.setSpacing(UIScale.px(4))
 
         # Header row
         hrow = QHBoxLayout()
@@ -10851,8 +11562,6 @@ class InboxDialog(AppDialog):
     # ── Actions ────────────────────────────────────────────────────────────
 
     def _claim_reward(self, msg_id: int, msg: Dict) -> None:
-        g   = self._app.game
-        inv = getattr(g, "inventory", None)
         online = getattr(self._app, "online", None)
         inbox  = getattr(online, "inbox", None) if online else None
         reward = None
@@ -10864,20 +11573,13 @@ class InboxDialog(AppDialog):
 
         if reward and getattr(reward, "success", False):
             data = reward.data if isinstance(reward.data, dict) else {}
-            gold = int(float(data.get("reward_gold", 0) or 0))
-            if gold and inv:
-                inv.gold = getattr(inv, "gold", 0) + gold
-            reward_items = data.get("reward_items", {}) or {}
-            if inv and isinstance(reward_items, dict):
-                for item_key, qty in reward_items.items():
-                    if item_key in ALL_ITEMS and int(qty) > 0:
-                        inv.add(item_key, int(qty))
-            title = str(data.get("reward_title", "") or "")
-            if title and hasattr(g, "earned_titles"):
-                g.earned_titles.add(title)
+            grants = self._app._apply_reward_payload(data, source_label="Inbox reward")
             msg["reward_claimed"] = True
             msg["is_read"] = True
-            self._app.message_bar.ok("Reward claimed.")
+            if grants:
+                self._app.message_bar.ok(f"Reward claimed: {'  ·  '.join(grants)}.")
+            else:
+                self._app.message_bar.ok("Reward claimed.")
         else:
             self._app.message_bar.err(
                 getattr(reward, "error", "Reward could not be claimed.")
@@ -13776,7 +14478,7 @@ class IntelligenceHubScreen(_DomainHubScreen):
     _DOMAIN_DESC  = "Market data, price trends and world news."
     _CARDS = [
         ("market", Sym.EXCHANGE, "Market Info",   "Price lists, trends and forecasts"),
-        ("news",   Sym.NEWS,     "News & Events", "World headlines and trade disruptions"),
+        ("news",   Sym.NEWS,     "News, Events & Logs", "World headlines and trade disruptions"),
     ]
 
 
@@ -13785,8 +14487,9 @@ class SocialHubScreen(_DomainHubScreen):
     _DOMAIN_TITLE = "Social"
     _DOMAIN_DESC  = "Build alliances, manage reputation and exert influence."
     _CARDS = [
-        ("social",    Sym.SOCIAL,    "Social Hub",  "Diplomacy, relationships and favours"),
-        ("influence", Sym.INFLUENCE, "Influence",   "Spend and earn reputation points"),
+        ("social",    Sym.SOCIAL,    "Social Hub",       "Diplomacy, relationships and favours"),
+        ("suitors",   Sym.SOCIAL,    "Courtship & Marriage", "Court suitors, build bonds, and marry well"),
+        ("influence", Sym.INFLUENCE, "Influence",        "Spend and earn reputation points"),
     ]
 
 
@@ -14202,7 +14905,7 @@ class MainMenuScreen(Screen):
         ]),
         ("INTELLIGENCE", P.gold, [
             ("market",  Sym.INTELLIGENCE, "Market Info",   "Prices & trade routes"),
-            ("news",    Sym.NEWS,         "News & Events", "World events & impacts"),
+            ("news",    Sym.NEWS,         "News, Events & Logs", "World events & impacts"),
             ("social",  Sym.SOCIAL,       "Social Hub",    "Leaderboard, friends & guilds"),
         ]),
         ("CHARACTER", P.gold, [
@@ -14596,16 +15299,6 @@ class TradeScreen(Screen):
         ("profit", "Est. Profit", 88, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
         ("local", "Local?", 62, Qt.AlignmentFlag.AlignCenter),
     ]
-    _ARB_COLS = [
-        ("item", "Item", 160),
-        ("buy", "Buy", 72, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("sell", "Sell", 72, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("dest", "To", 120),
-        ("profit_pct", "Profit%", 72, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("days", "Days", 56, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("gpd", "g/day", 68, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("stock", "Stock", 60, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-    ]
 
     def build(self) -> None:
         root = QVBoxLayout(self)
@@ -14673,21 +15366,6 @@ class TradeScreen(Screen):
         sell_actions.addWidget(self._sell_info, 1)
         sell_lay.addLayout(sell_actions)
         tabs.addTab(sell_tab, f"{Sym.EXCHANGE}  Sell")
-
-        arb_tab = QWidget(self)
-        arb_lay = QVBoxLayout(arb_tab)
-        arb_lay.setContentsMargins(0, 0, 0, 0)
-        arb_lay.setSpacing(UIScale.px(8))
-        self._arb_table = DataTable(arb_tab, self._ARB_COLS, row_height=26)
-        arb_lay.addWidget(self._arb_table, 1)
-        arb_info = QLabel(
-            "Top routes ranked by gold per day from your current market.",
-            arb_tab,
-        )
-        arb_info.setFont(Fonts.mono_small)
-        arb_info.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
-        arb_lay.addWidget(arb_info)
-        tabs.addTab(arb_tab, f"{Sym.TREND_UP}  Arbitrage")
 
         foot = QHBoxLayout()
         foot.addWidget(self.back_button())
@@ -14807,49 +15485,10 @@ class TradeScreen(Screen):
             })
         self._sell_table.load(sell_rows)
 
-        self._arb_table.load(self._build_arbitrage_rows())
         self._buy_info.setText("Select an item to inspect pricing and limits.")
         self._buy_info.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
         self._sell_info.setText("Select inventory to sell into the local market.")
         self._sell_info.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
-
-    def _build_arbitrage_rows(self) -> List[Dict[str, str]]:
-        g = self.game
-        market = g.markets[g.current_area]
-        rows: List[Dict[str, Any]] = []
-        for item_key in market.item_keys:
-            item = ALL_ITEMS.get(item_key)
-            if not item:
-                continue
-            buy_price = market.get_buy_price(item_key, g.season, g.skills.trading)
-            if buy_price <= 0:
-                continue
-            for dest in Area:
-                if dest == g.current_area:
-                    continue
-                dest_mkt = g.markets[dest]
-                if item_key not in dest_mkt.item_keys:
-                    continue
-                sell_price = dest_mkt.get_sell_price(item_key, g.season, g.skills.trading)
-                if sell_price <= buy_price:
-                    continue
-                days = AREA_INFO[g.current_area]["travel_days"].get(dest, 3)
-                margin = sell_price - buy_price
-                rows.append({
-                    "item": item.name,
-                    "buy": f"{buy_price:.1f}g",
-                    "sell": f"{sell_price:.1f}g",
-                    "dest": dest.value,
-                    "profit_pct": f"{(margin / buy_price) * 100:.0f}%",
-                    "days": str(days),
-                    "gpd": f"{margin / max(days, 1):.1f}",
-                    "stock": str(market.stock.get(item_key, 0)),
-                    "_rank": margin / max(days, 1),
-                })
-        rows.sort(key=lambda row: row["_rank"], reverse=True)
-        for row in rows:
-            row.pop("_rank", None)
-        return rows[:15]
 
     def _on_buy_select(self, row: Dict[str, Any]) -> None:
         item_key = row.get("item_key") if row else None
@@ -14944,6 +15583,8 @@ class TradeScreen(Screen):
         g._gain_skill_xp(SkillType.TRADING, 5)
         g._use_time(1)
         g._check_achievements()
+        if hasattr(g, "_log_trade"):
+            g._log_trade(f"BUY {qty}x {item.name} @ {unit_price:.2f}g each = {total:.2f}g")
         if hasattr(self.app, "sound"):
             self.app.sound.play_coin_sfx()
         if haggle_discount > 0:
@@ -15080,6 +15721,9 @@ class TradeScreen(Screen):
         g._gain_skill_xp(SkillType.TRADING, 5)
         g._use_time(1)
         g._check_achievements()
+        if hasattr(g, "_log_trade"):
+            unit_earned = earnings / max(qty, 1)
+            g._log_trade(f"SELL {qty}x {item.name} @ {unit_earned:.2f}g each = {earnings:.2f}g")
         if hasattr(self.app, "sound"):
             self.app.sound.play_coin_sfx()
         if not silent:
@@ -15556,6 +16200,13 @@ class BusinessesScreen(Screen):
         g.businesses.append(business)
         g._gain_skill_xp(SkillType.INDUSTRY, 20)
         g._check_achievements()
+        g._mlog(
+            "BUSINESS",
+            f"Purchased business: {business.name} in {business.area.value} for {cost:.0f}g",
+            sub="Purchase",
+            gold=-cost,
+            area=business.area.value,
+        )
         self.msg.ok(f"Purchased {business.name} for {cost:.0f}g in {business.area.value}.")
         self.app.refresh()
 
@@ -15579,6 +16230,13 @@ class BusinessesScreen(Screen):
         business.level += 1
         self.game._gain_skill_xp(SkillType.INDUSTRY, 10)
         self.game._check_achievements()
+        self.game._mlog(
+            "BUSINESS",
+            f"Upgraded business: {business.name} to Lv{business.level} for {cost:.0f}g",
+            sub="Upgrade",
+            gold=-cost,
+            area=business.area.value,
+        )
         self.msg.ok(f"{business.name} upgraded to Lv{business.level}.")
         self.app.refresh()
 
@@ -15611,6 +16269,12 @@ class BusinessesScreen(Screen):
             return
         business.hired_workers.append(candidate)
         business.workers = len(business.hired_workers)
+        self.game._mlog(
+            "BUSINESS",
+            f"Hired employee: {candidate['name']} for {business.name} at {candidate['wage']:.1f}g/day  (prod {candidate['productivity']:.2f}x, {candidate['trait']})",
+            sub="HireWorker",
+            area=business.area.value,
+        )
         self.msg.ok(
             f"Hired {candidate['name']} at {candidate['wage']:.1f}g/day "
             f"({candidate['productivity']:.2f}×, {candidate['trait']})."
@@ -15633,9 +16297,17 @@ class BusinessesScreen(Screen):
             confirm_role="danger",
         ):
             return
+        fired_name = "Unknown"
         if business.hired_workers:
-            business.hired_workers.pop()
+            fired = business.hired_workers.pop()
+            fired_name = str(fired.get("name", "Unknown"))
         business.workers = max(0, len(business.hired_workers) if business.hired_workers else business.workers - 1)
+        self.game._mlog(
+            "BUSINESS",
+            f"Fired employee: {fired_name} from {business.name}",
+            sub="FireWorker",
+            area=business.area.value,
+        )
         self.msg.ok(f"Fired a worker from {business.name}.")
         self.app.refresh()
 
@@ -15661,6 +16333,13 @@ class BusinessesScreen(Screen):
         self.game.inventory.gold -= cost
         business.broken_down = False
         business.repair_cost = 0.0
+        self.game._mlog(
+            "BUSINESS",
+            f"Repaired business: {business.name} for {cost:.0f}g",
+            sub="Repair",
+            gold=-cost,
+            area=business.area.value,
+        )
         self.msg.ok(f"{business.name} repaired.")
         self.app.refresh()
 
@@ -15682,6 +16361,13 @@ class BusinessesScreen(Screen):
             return
         self.game.businesses.pop(idx)
         self.game.inventory.gold += sell_price
+        self.game._mlog(
+            "BUSINESS",
+            f"Sold business: {business.name} for {sell_price:.0f}g",
+            sub="Sell",
+            gold=sell_price,
+            area=business.area.value,
+        )
         self.msg.ok(f"Sold {business.name} for {sell_price:.0f}g.")
         self.app.refresh()
 
@@ -16234,7 +16920,7 @@ class SmugglingScreen(Screen):
         lbl.setFont(Fonts.mixed_bold)
         lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
         left_lay.addWidget(lbl)
-        note = QLabel("1.25× base price  ·  +8 heat per deal", left)
+        note = QLabel("1.25× base price  ·  +6 heat per deal", left)
         note.setFont(Fonts.mono_small)
         note.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
         left_lay.addWidget(note)
@@ -16242,12 +16928,6 @@ class SmugglingScreen(Screen):
         self._buy_table.row_double_clicked.connect(self._on_buy_double)
         left_lay.addWidget(self._buy_table, 1)
         buy_act = QHBoxLayout()
-        buy_act.addWidget(QLabel("Qty:", left))
-        self._buy_qty = QSpinBox(left)
-        self._buy_qty.setRange(1, 999)
-        self._buy_qty.setValue(1)
-        self._buy_qty.setFixedWidth(UIScale.px(80))
-        buy_act.addWidget(self._buy_qty)
         buy_btn = self.action_button(f"{Sym.YES}  Buy Selected", self._do_buy, role="secondary")
         buy_btn.setFixedHeight(UIScale.px(30))
         buy_act.addWidget(buy_btn)
@@ -16262,7 +16942,7 @@ class SmugglingScreen(Screen):
         rlbl.setFont(Fonts.mixed_bold)
         rlbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
         right_lay.addWidget(rlbl)
-        rnote = QLabel("Fence payout scales with area risk  ·  selling adds heat", right)
+        rnote = QLabel("Fence payout scales with area risk  ·  +7 heat per deal", right)
         rnote.setFont(Fonts.mono_small)
         rnote.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
         right_lay.addWidget(rnote)
@@ -16270,12 +16950,6 @@ class SmugglingScreen(Screen):
         self._sell_table.row_double_clicked.connect(self._on_sell_double)
         right_lay.addWidget(self._sell_table, 1)
         sell_act = QHBoxLayout()
-        sell_act.addWidget(QLabel("Qty:", right))
-        self._sell_qty = QSpinBox(right)
-        self._sell_qty.setRange(1, 999)
-        self._sell_qty.setValue(1)
-        self._sell_qty.setFixedWidth(UIScale.px(80))
-        sell_act.addWidget(self._sell_qty)
         sell_btn = self.action_button(f"{Sym.EXCHANGE}  Sell Selected", self._do_sell, role="danger")
         sell_btn.setFixedHeight(UIScale.px(30))
         sell_all_btn = self.action_button(f"{Sym.NO}  Sell All", self._do_sell_all, role="danger")
@@ -16294,7 +16968,15 @@ class SmugglingScreen(Screen):
         bot = QHBoxLayout()
         bribe_btn = self.action_button(f"{Sym.CONTRACT}  Bribe Guards", self._do_bribe, role="secondary")
         bribe_btn.setFixedHeight(UIScale.px(30))
+        lay_low_btn = self.action_button("\U0001f575  Lay Low", self._do_lay_low, role="secondary")
+        lay_low_btn.setFixedHeight(UIScale.px(30))
+        lay_low_btn.setToolTip("Spend 2 time units to reduce heat by 15\u201322 at no gold cost")
+        scout_btn = self.action_button("\U0001f50d  Scout Den", self._do_scout_den)
+        scout_btn.setFixedHeight(UIScale.px(30))
+        scout_btn.setToolTip("Get a full threat assessment \u2014 free action")
         bot.addWidget(bribe_btn)
+        bot.addWidget(lay_low_btn)
+        bot.addWidget(scout_btn)
         bot.addWidget(self.back_button())
         bot.addStretch()
         root.addLayout(bot)
@@ -16370,9 +17052,23 @@ class SmugglingScreen(Screen):
         if g.heat >= 80:
             self.msg.err("Heat too high — cool down first.")
             return
-        qty = self._buy_qty.value()
         item = ALL_ITEMS[item_key]
         price = round(item.base_price * 1.25, 2)
+        max_qty = max(1, int(g.inventory.gold // price)) if price > 0 else 1
+        qty, ok = _popup_get_int(
+            self,
+            "Buy Contraband",
+            f"Buy {item.name} from informant at {price:.1f}g each\n"
+            f"Heat +6 per deal  ·  Current heat: {g.heat}/100\n\n"
+            f"Max quantity (by gold): {max_qty}",
+            value=1,
+            minimum=1,
+            maximum=max(1, max_qty),
+            step=1,
+            confirm_text="Buy",
+        )
+        if not ok:
+            return
         total = round(price * qty, 2)
         if total > g.inventory.gold:
             self.msg.err(f"Need {total:.0f}g, have {g.inventory.gold:.0f}g.")
@@ -16381,23 +17077,26 @@ class SmugglingScreen(Screen):
         if random.random() < catch_base:
             fine = round(total * 0.60, 2)
             g.inventory.gold = max(0.0, g.inventory.gold - fine)
-            g.heat = min(100, g.heat + 35)
+            g.heat = min(100, g.heat + 28)
             g.reputation = max(0, g.reputation - 20)
             g._track_stat("smuggle_busts")
             g._check_achievements()
-            self.msg.err(f"Sting operation. Fine {fine:.0f}g, heat +35, rep -20.")
+            GameToast(self.app, f"⚠ Sting operation! Fine {fine:.0f}g · heat +28 · rep −20", P.red, duration_ms=5_000)
+            self.msg.err(f"Sting operation. Fine {fine:.0f}g, heat +28, rep -20.")
             self.app.refresh()
             return
         g.inventory.gold -= total
         g.inventory.record_purchase(item_key, qty, price)
         g.inventory.add(item_key, qty)
-        g.heat = min(100, g.heat + 8)
+        g.heat = min(100, g.heat + 6)
         g._gain_skill_xp(SkillType.ESPIONAGE, 10)
         g._use_time(1)
         g._check_achievements()
+        if hasattr(g, "_log_trade"):
+            g._log_trade(f"SMUGGLE BUY {qty}x {item.name} @ {price:.2f}g (informant) = {total:.2f}g")
         if hasattr(self.app, "sound"):
             self.app.sound.play_coin_sfx()
-        self.msg.ok(f"Acquired {qty}× {item.name} for {total:.0f}g. Heat +8.")
+        self.msg.ok(f"Acquired {qty}× {item.name} for {total:.0f}g. Heat +6.")
         self.app.refresh()
 
     def _do_sell(self) -> None:
@@ -16409,8 +17108,29 @@ class SmugglingScreen(Screen):
         if self.game.heat >= 80:
             self.msg.err("Heat too high — cool down first.")
             return
-        max_qty = self.game.inventory.items.get(item_key, 0)
-        qty = self._sell_qty.value()
+        g = self.game
+        item = ALL_ITEMS[item_key]
+        max_qty = g.inventory.items.get(item_key, 0)
+        if max_qty <= 0:
+            self.msg.err("No stock to sell.")
+            return
+        fence_mult = g._fence_multiplier()
+        fence_label = g._fence_area_label()
+        unit_value = round(item.base_price * fence_mult, 2)
+        qty, ok = _popup_get_int(
+            self,
+            "Sell Contraband",
+            f"Fence {item.name} at {unit_value:.1f}g each ({fence_label})\n"
+            f"Heat +7 per deal  ·  Current heat: {g.heat}/100\n\n"
+            f"You have: {max_qty}",
+            value=max_qty,
+            minimum=1,
+            maximum=max_qty,
+            step=1,
+            confirm_text="Sell",
+        )
+        if not ok:
+            return
         if qty < 1 or qty > max_qty:
             self.msg.err(f"Quantity must be 1–{max_qty}.")
             return
@@ -16460,23 +17180,27 @@ class SmugglingScreen(Screen):
             g.inventory.remove(item_key, qty)
             g.inventory.gold = max(0.0, g.inventory.gold - fine)
             g.reputation = max(0, g.reputation - 25)
-            g.heat = min(100, g.heat + 35)
+            g.heat = min(100, g.heat + 28)
             g._track_stat("smuggle_busts")
             g._check_achievements()
+            GameToast(self.app, f"⚠ Busted! {qty}× {item.name} seized · fine {fine:.0f}g · heat +28", P.red, duration_ms=5_000)
             if not silent:
-                self.msg.err(f"Busted. {qty}× {item.name} seized, fine {fine:.0f}g, heat +35.")
+                self.msg.err(f"Busted. {qty}× {item.name} seized, fine {fine:.0f}g, heat +28.")
                 self.app.refresh()
             return 0.0
         g.inventory.remove(item_key, qty)
         g.inventory.gold += total
         g.total_profit += total
         g._lose_reputation(1)
-        g.heat = min(100, g.heat + 10)
+        g.heat = min(100, g.heat + 7)
         g._gain_skill_xp(SkillType.ESPIONAGE, 15)
         g._track_stat("smuggle_success")
         g._track_stat("smuggle_gold", total)
         g._use_time(1)
         g._check_achievements()
+        if hasattr(g, "_log_trade"):
+            fence_label = g._fence_area_label()
+            g._log_trade(f"FENCE {qty}x {item.name} @ {fence_label} = {total:.2f}g")
         if hasattr(self.app, "sound"):
             self.app.sound.play_coin_sfx()
         if not silent:
@@ -16508,9 +17232,9 @@ class SmugglingScreen(Screen):
             return
         g.inventory.gold -= bribe_cost
         if random.random() < backfire:
-            g.heat = min(100, g.heat + 15)
+            g.heat = min(100, g.heat + 12)
             g.reputation = max(0, g.reputation - 10)
-            self.msg.warn(f"The guard took {bribe_cost}g and filed a report. Heat +15, rep -10.")
+            self.msg.warn(f"The guard took {bribe_cost}g and filed a report. Heat +12, rep -10.")
         else:
             g.heat = max(0, g.heat - reduction)
             g._gain_skill_xp(SkillType.ESPIONAGE, 8)
@@ -16519,8 +17243,53 @@ class SmugglingScreen(Screen):
             self.msg.ok(f"The bribe worked. Heat -{reduction} to {g.heat}/100.")
         self.app.refresh()
 
+    def _do_lay_low(self) -> None:
+        g = self.game
+        if g.heat <= 0:
+            self.msg.ok("You're already running cold — no heat to dissipate.")
+            return
+        reduce = random.randint(15, 22)
+        g.heat = max(0, g.heat - reduce)
+        g._use_time(2)
+        g._gain_skill_xp(SkillType.ESPIONAGE, 4)
+        GameToast(self.app, f"\U0001f575 Laying low\u2026 Heat \u2212{reduce}. Now {g.heat}/100.", P.fg_dim, duration_ms=4000)
+        self.msg.ok(f"You keep a low profile for two time units. Heat drops \u2212{reduce} to {g.heat}/100.")
+        self.app.refresh()
 
-# ══════════════════════════════════════════════════════════════════════════════
+    def _do_scout_den(self) -> None:
+        g = self.game
+        guard = AREA_INFO[g.current_area].get("guard_strength", 0)
+        espionage = g.skills.espionage
+        catch_base = max(0.04, min(0.65, 0.20 + g.heat / 200 - espionage * 0.025))
+        sell_catch = min(0.70, catch_base + 0.05)
+        backfire = max(0.03, min(0.40, 0.10 + g.heat / 200 - espionage * 0.012))
+        bribe_cost = round(g.heat * (3 + guard * 4))
+        if g.heat < 20:
+            heat_tier = "\U0001f7e2 COLD \u2014 Guards aren't watching."
+        elif g.heat < 40:
+            heat_tier = "\U0001f7e1 WARM \u2014 Some guards are patrolling."
+        elif g.heat < 60:
+            heat_tier = "\U0001f7e0 HOT \u2014 Informants may be compromised."
+        elif g.heat < 80:
+            heat_tier = "\U0001f534 WANTED \u2014 You're being actively tracked."
+        else:
+            heat_tier = "\U0001f480 BURNED \u2014 Don't move contraband. Bribe or travel."
+        _popup_info(self, "\U0001f50d Scout Report",
+            f"[ Current Threat Assessment ]\n\n"
+            f"Heat Level: {g.heat}/100\n"
+            f"Status: {heat_tier}\n\n"
+            f"Guard strength: {guard}/3  \u00b7  Espionage skill: {espionage}\n"
+            f"Buy catch chance: {catch_base*100:.0f}%\n"
+            f"Sell catch chance: {sell_catch*100:.0f}%\n"
+            f"Bribe backfire: {backfire*100:.0f}%  \u00b7  Est. bribe cost: {bribe_cost:,.0f}g\n\n"
+            f"If caught buying: Fine 60% of cost + Heat +28 + Rep \u221220\n"
+            f"If caught selling: Goods seized + Fine 50% of value + Heat +28 + Rep \u221225\n\n"
+            f"Lay Low (2 time): reduces heat ~15\u201322 at no gold cost.\n"
+            f"Travel away: heat persists but guard strength may differ."
+        )
+
+
+
 # NEWS SCREEN  —  active events, headlines, and historical logs
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -16543,7 +17312,7 @@ class NewsScreen(Screen):
         root.setContentsMargins(UIScale.px(14), UIScale.px(12), UIScale.px(14), UIScale.px(12))
         root.setSpacing(UIScale.px(10))
 
-        root.addWidget(self.section_label("News & Events"))
+        root.addWidget(self.section_label("News, Events & Logs"))
 
         tabs = QTabWidget(self)
         tabs.setFont(Fonts.mixed_small)
@@ -16586,6 +17355,86 @@ class NewsScreen(Screen):
         trade_lay.addWidget(self._trade_table)
         tabs.addTab(trade_tab, f"{Sym.TRADE}  Trade Log")
 
+        # ── Master Log tab ────────────────────────────────────────────────────────
+        ml_tab = QWidget(self)
+        ml_lay = QVBoxLayout(ml_tab)
+        ml_lay.setContentsMargins(UIScale.px(4), UIScale.px(6), UIScale.px(4), UIScale.px(4))
+        ml_lay.setSpacing(UIScale.px(4))
+
+        # Filter bar
+        fbar = QHBoxLayout()
+        fbar.setSpacing(UIScale.px(6))
+        self._ml_search = QLineEdit(ml_tab)
+        self._ml_search.setPlaceholderText("🔍  Search messages, categories, areas…")
+        self._ml_search.setFixedHeight(UIScale.px(28))
+        self._ml_search.textChanged.connect(self._ml_apply_filter)
+        fbar.addWidget(self._ml_search, 3)
+
+        self._ml_cat_cb = QComboBox(ml_tab)
+        for _cat in ("All Categories", "TRADE", "EVENT", "WORLD", "FINANCE",
+                     "BUSINESS", "SYSTEM", "SOCIAL", "VOYAGE", "REALESTATE", "PLAYER"):
+            self._ml_cat_cb.addItem(_cat)
+        self._ml_cat_cb.setFixedHeight(UIScale.px(28))
+        self._ml_cat_cb.currentIndexChanged.connect(self._ml_apply_filter)
+        fbar.addWidget(self._ml_cat_cb, 1)
+
+        self._ml_gold_cb = QComboBox(ml_tab)
+        for _lbl in ("All Gold", "Income only (+)", "Expense only (-)", "No gold entry"):
+            self._ml_gold_cb.addItem(_lbl)
+        self._ml_gold_cb.setFixedHeight(UIScale.px(28))
+        self._ml_gold_cb.currentIndexChanged.connect(self._ml_apply_filter)
+        fbar.addWidget(self._ml_gold_cb, 1)
+
+        _clr_btn = MtButton("× Clear", ml_tab, role="secondary")
+        _clr_btn.setFixedHeight(UIScale.px(28))
+        _clr_btn.clicked.connect(self._ml_clear_filters)
+        fbar.addWidget(_clr_btn)
+        ml_lay.addLayout(fbar)
+
+        # Table
+        self._ml_table = DataTable(
+            ml_tab,
+            [
+                ("ts",   "Timestamp",  142),
+                ("gt",   "Game Time",   72,  Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
+                ("cat",  "Category",    78,  Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
+                ("area", "Area",        72),
+                ("gold", "Gold Δ",      76,  Qt.AlignmentFlag.AlignRight  | Qt.AlignmentFlag.AlignVCenter),
+                ("msg",  "Detail",     520),
+            ],
+            row_height=22,
+            stretch_last=True,
+        )
+        ml_lay.addWidget(self._ml_table, 1)
+
+        # Footer bar
+        ml_foot = QHBoxLayout()
+        ml_foot.setSpacing(UIScale.px(8))
+        self._ml_load_more_btn = MtButton("⬆ Load 50 More", ml_tab, role="secondary")
+        self._ml_load_more_btn.setFixedHeight(UIScale.px(26))
+        self._ml_load_more_btn.clicked.connect(self._ml_load_more)
+        ml_foot.addWidget(self._ml_load_more_btn)
+        self._ml_refresh_btn = MtButton("↺ Refresh", ml_tab, role="secondary")
+        self._ml_refresh_btn.setFixedHeight(UIScale.px(26))
+        self._ml_refresh_btn.clicked.connect(self._ml_do_refresh)
+        ml_foot.addWidget(self._ml_refresh_btn)
+        self._ml_count_lbl = QLabel("", ml_tab)
+        self._ml_count_lbl.setFont(Fonts.mono_small)
+        self._ml_count_lbl.setStyleSheet(f"color:{P.fg_dim};background:transparent;")
+        ml_foot.addWidget(self._ml_count_lbl)
+        ml_foot.addStretch()
+        ml_lay.addLayout(ml_foot)
+
+        tabs.addTab(ml_tab, "📋  Master Log")
+
+        # Master Log lazy-load state (populated only when tab is first opened)
+        self._ml_tab_index: int = tabs.count() - 1
+        self._ml_buffer:    List[Dict] = []   # loaded entries, newest-first
+        self._ml_visible:   int        = 100  # rows to display
+        self._ml_filtered:  List[Dict] = []   # filter-pass results
+        self._ml_loaded_once: bool     = False
+        tabs.currentChanged.connect(self._on_news_tab_changed)
+
         foot = QHBoxLayout()
         foot.addWidget(self.back_button())
         foot.addStretch()
@@ -16622,6 +17471,123 @@ class NewsScreen(Screen):
         self._feed_table.load(feed_rows)
         self._log_table.load([{"entry": str(entry)} for entry in list(getattr(g, "event_log", []))[:40]])
         self._trade_table.load([{"entry": str(entry)} for entry in list(getattr(g, "trade_log", []))[:40]])
+        # Master Log tab: if already loaded, refresh with fresh disk read so live entries appear
+        if getattr(self, "_ml_loaded_once", False):
+            self._ml_do_refresh()
+
+    # ── Master Log helpers ────────────────────────────────────────────────────
+
+    def _on_news_tab_changed(self, index: int) -> None:
+        """Lazily load the Master Log tab on first open."""
+        if index == getattr(self, "_ml_tab_index", -1) and not getattr(self, "_ml_loaded_once", False):
+            self._ml_do_refresh()
+
+    def _ml_do_refresh(self) -> None:
+        """Reset buffer and reload from the log file."""
+        n_want = max(300, getattr(self, "_ml_visible", 100))
+        entries, _ = _ml_read_tail(MASTER_LOG_FILE, n_want=n_want, skip=0)
+        self._ml_buffer   = entries
+        self._ml_visible  = getattr(self, "_ml_visible", 100)
+        self._ml_loaded_once = True
+        self._ml_apply_filter()
+
+    def _ml_apply_filter(self) -> None:
+        search    = self._ml_search.text().strip().lower() if hasattr(self, "_ml_search") else ""
+        cat_filt  = self._ml_cat_cb.currentText()  if hasattr(self, "_ml_cat_cb")  else "All Categories"
+        gold_filt = self._ml_gold_cb.currentText() if hasattr(self, "_ml_gold_cb") else "All Gold"
+        filtered: List[Dict] = []
+        for e in getattr(self, "_ml_buffer", []):
+            cat = e.get("cat", "")
+            if not cat_filt.startswith("All") and cat != cat_filt:
+                continue
+            gv = float(e.get("gold", 0) or 0)
+            if gold_filt == "Income only (+)" and gv <= 0:
+                continue
+            if gold_filt == "Expense only (-)" and gv >= 0:
+                continue
+            if gold_filt == "No gold entry" and gv != 0:
+                continue
+            if search:
+                haystack = (
+                    e.get("msg",  "").lower() + " " +
+                    e.get("cat",  "").lower() + " " +
+                    e.get("sub",  "").lower() + " " +
+                    e.get("area", "").lower() + " " +
+                    e.get("gt",   "").lower() + " " +
+                    e.get("ts",   "").lower()
+                )
+                if search not in haystack:
+                    continue
+            filtered.append(e)
+        self._ml_filtered = filtered
+        self._ml_render()
+
+    def _ml_render(self) -> None:
+        """Render the currently visible slice of filtered entries into the table."""
+        visible = getattr(self, "_ml_visible", 100)
+        slice_  = self._ml_filtered[:visible]
+        rows: List[Dict] = []
+        for e in slice_:
+            gv  = float(e.get("gold", 0) or 0)
+            cat = e.get("cat", "")
+            sub = e.get("sub", "")
+            msg = f"[{sub}]  {e.get('msg','')}" if sub else e.get("msg", "")
+            gold_str = f"+{gv:.1f}g" if gv > 0 else (f"{gv:.1f}g" if gv < 0 else "")
+            # Colour tag: gold sign takes priority, then category
+            if gv > 0:
+                tag = "green"
+            elif gv < 0:
+                tag = "red"
+            elif cat == "WORLD":
+                tag = "blue"
+            elif cat == "EVENT":
+                tag = "yellow"
+            elif cat == "SYSTEM":
+                tag = "dim"
+            elif cat == "FINANCE":
+                tag = "amber"
+            elif cat in ("BUSINESS", "REALESTATE", "VOYAGE"):
+                tag = "gold"
+            else:
+                tag = "dim"
+            rows.append({
+                "ts":   e.get("ts",   ""),
+                "gt":   e.get("gt",   ""),
+                "cat":  cat,
+                "area": e.get("area", ""),
+                "gold": gold_str,
+                "msg":  msg,
+                "_tag": tag,
+            })
+        self._ml_table.load(rows)
+        total_buf      = len(getattr(self, "_ml_buffer",   []))
+        total_filtered = len(getattr(self, "_ml_filtered", []))
+        showing        = len(slice_)
+        self._ml_count_lbl.setText(
+            f"Showing {showing} of {total_filtered} filtered  ·  {total_buf} loaded  ·  {MasterLog.count()} written this session"
+        )
+        can_load_more = showing < total_filtered or os.path.exists(MASTER_LOG_FILE)
+        self._ml_load_more_btn.setEnabled(can_load_more)
+
+    def _ml_load_more(self) -> None:
+        """Show 50 more rows; if exhausted, fetch 200 more from disk first."""
+        self._ml_visible = getattr(self, "_ml_visible", 100) + 50
+        if self._ml_visible > len(getattr(self, "_ml_filtered", [])):
+            # Grow the buffer from disk
+            new_target = len(getattr(self, "_ml_buffer", [])) + 200
+            entries, _ = _ml_read_tail(MASTER_LOG_FILE, n_want=new_target, skip=0)
+            self._ml_buffer = entries
+            self._ml_apply_filter()   # re-filter the larger buffer
+        else:
+            self._ml_render()
+
+    def _ml_clear_filters(self) -> None:
+        self._ml_search.blockSignals(True)
+        self._ml_search.clear()
+        self._ml_search.blockSignals(False)
+        self._ml_cat_cb.setCurrentIndex(0)
+        self._ml_gold_cb.setCurrentIndex(0)
+        self._ml_apply_filter()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -16787,6 +17753,11 @@ class ProgressScreen(Screen):
         for row in title_rows:
             row.pop("_order", None)
         self._title_table.load(title_rows)
+
+    def on_show(self) -> None:
+        """Re-check achievements and titles every time this screen is opened."""
+        self.game._check_achievements()
+        self.refresh()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -18140,11 +19111,13 @@ class FundManagementScreen(Screen):
 
 class InfluenceScreen(Screen):
     _MKT_COLS = [
-        ("item", "Item", 170),
+        ("item", "Item", 156),
+        ("mark", "Mark", 44, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
         ("price", "Price", 80, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+        ("active", "Active", 84, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
         ("pressure", "Pressure", 82, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
         ("trend", "Trend", 78, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("rarity", "Rarity", 90),
+        ("rarity", "Rarity", 88),
         ("camp_cost", "Camp Cost", 86, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
     ]
 
@@ -18174,26 +19147,56 @@ class InfluenceScreen(Screen):
 
         social = QWidget(self)
         social_lay = QVBoxLayout(social)
-        social_lay.setContentsMargins(0, 0, 0, 0)
-        social_lay.setSpacing(UIScale.px(8))
+        social_lay.setContentsMargins(UIScale.px(6), UIScale.px(8), UIScale.px(6), UIScale.px(8))
+        social_lay.setSpacing(UIScale.px(10))
+
+        # ── Current reputation standing card ───────────────────────────────
+        self._social_rep_lbl = QLabel("", social)
+        self._social_rep_lbl.setFont(Fonts.mono)
+        self._social_rep_lbl.setWordWrap(True)
+        self._social_rep_lbl.setStyleSheet(
+            f"color:{P.fg}; background:{P.bg_panel}; border:1px solid {P.border};"
+            f"border-radius:{UIScale.px(4)}px; padding:{UIScale.px(10)}px;"
+        )
+        social_lay.addWidget(self._social_rep_lbl)
+
+        # ── Info note ──────────────────────────────────────────────────────
         social_info = QLabel(
-            "Donate to charity to gain reputation. Rough conversion: 15g = +1 rep, with diminishing returns above 80 reputation.",
+            "Every 15g donated grants +1 reputation. Diminishing returns apply above 80 rep "
+            "(\u22121 per 100 rep already earned). Minimum donation is 15g.",
             social,
         )
         social_info.setFont(Fonts.mono_small)
         social_info.setWordWrap(True)
         social_info.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
         social_lay.addWidget(social_info)
+
+        # ── Donation preview (populated in refresh) ────────────────────────
+        self._donation_preview_lbl = QLabel("", social)
+        self._donation_preview_lbl.setFont(Fonts.mono_small)
+        self._donation_preview_lbl.setWordWrap(False)
+        self._donation_preview_lbl.setStyleSheet(
+            f"color:{P.cream}; background:{P.bg}; border:1px solid {P.border};"
+            f"border-radius:{UIScale.px(4)}px; padding:{UIScale.px(8)}px;"
+        )
+        social_lay.addWidget(self._donation_preview_lbl)
+
+        # ── Quick donate buttons ───────────────────────────────────────────
+        donate_hdr = QLabel("Quick Donate", social)
+        donate_hdr.setFont(Fonts.mixed_small_bold)
+        donate_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        social_lay.addWidget(donate_hdr)
         donate_row = QHBoxLayout()
         for amount in (20, 50, 120, 300):
             btn = self.action_button(f"Donate {amount}g", lambda checked=False, amt=amount: self._do_donate(amt), role="secondary")
-            btn.setFixedHeight(UIScale.px(30))
+            btn.setFixedHeight(UIScale.px(32))
             donate_row.addWidget(btn)
-        custom_btn = self.action_button("Donate Custom", lambda: self._do_donate(None))
-        custom_btn.setFixedHeight(UIScale.px(30))
+        custom_btn = self.action_button("Custom Amount", lambda: self._do_donate(None))
+        custom_btn.setFixedHeight(UIScale.px(32))
         donate_row.addWidget(custom_btn)
         donate_row.addStretch()
         social_lay.addLayout(donate_row)
+        social_lay.addStretch()
         tabs.addTab(social, "Social Actions")
 
         market_tab = QWidget(self)
@@ -18208,6 +19211,16 @@ class InfluenceScreen(Screen):
         market_info.setWordWrap(True)
         market_info.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
         market_lay.addWidget(market_info)
+
+        # ── Active campaigns summary ──────────────────────────────────────
+        self._active_camp_lbl = QLabel("", market_tab)
+        self._active_camp_lbl.setFont(Fonts.mono_small)
+        self._active_camp_lbl.setWordWrap(True)
+        self._active_camp_lbl.setStyleSheet(
+            f"color:{P.amber}; background:{P.bg}; border:1px solid {P.border};"
+            f"border-radius:{UIScale.px(4)}px; padding:{UIScale.px(6)}px;"
+        )
+        market_lay.addWidget(self._active_camp_lbl)
         self._mkt_table = DataTable(market_tab, self._MKT_COLS, row_height=26)
         self._mkt_table.row_selected.connect(self._on_market_select)
         market_lay.addWidget(self._mkt_table, 1)
@@ -18216,8 +19229,14 @@ class InfluenceScreen(Screen):
         camp_btn.setFixedHeight(UIScale.px(30))
         slander_btn = self.action_button("Slander Down", self._do_slander, role="danger")
         slander_btn.setFixedHeight(UIScale.px(30))
+        self._mark_camp_btn = self.action_button("📌 Mark for Campaign", self._do_mark_campaign, role="secondary")
+        self._mark_camp_btn.setFixedHeight(UIScale.px(30))
+        self._mark_slander_btn = self.action_button("🚫 Mark for Slander", self._do_mark_slander, role="secondary")
+        self._mark_slander_btn.setFixedHeight(UIScale.px(30))
         market_act.addWidget(camp_btn)
         market_act.addWidget(slander_btn)
+        market_act.addWidget(self._mark_camp_btn)
+        market_act.addWidget(self._mark_slander_btn)
         market_act.addStretch()
         market_lay.addLayout(market_act)
         self._mkt_detail = QLabel("Select an item to inspect its active campaign pressure and cooldown state.", market_tab)
@@ -18238,23 +19257,167 @@ class InfluenceScreen(Screen):
     def refresh(self) -> None:
         g = self.game
         rep_name, _rep_color = rep_label(g.reputation)
-        donate_gain_20 = max(1, int(20 / 15) - max(0, (g.reputation - 80) // 10))
-        donate_gain_50 = max(1, int(50 / 15) - max(0, (g.reputation - 80) // 10))
-        donate_gain_120 = max(1, int(120 / 15) - max(0, (g.reputation - 80) // 10))
-        text = (
-            f"Reputation:  {g.reputation:>4}   ({rep_name})\n"
-            f"Heat:        {g.heat:>4} / 100\n"
-            f"Licenses:    {len(g.licenses)} / {len(LicenseType)}\n\n"
-            f"Donate 20g  -> +{donate_gain_20} rep\n"
-            f"Donate 50g  -> +{donate_gain_50} rep\n"
-            f"Donate 120g -> +{donate_gain_120} rep\n"
-            f"Diminishing returns apply above 80 reputation."
+        today = g._absolute_day()
+
+        # ── Reputation block ──────────────────────────────────────────────
+        rep = g.reputation
+        prev_thresh = 0
+        next_tier_thresh: Optional[int] = None
+        next_tier_name: Optional[str] = None
+        for i, (threshold, label, _) in enumerate(REP_TIERS):
+            if rep < threshold:
+                next_tier_thresh = threshold
+                # label here is the current tier name; the tier we're aiming for
+                # is the next entry's label (or "Mythic" if we're on the last one)
+                next_tier_name = REP_TIERS[i + 1][1] if i + 1 < len(REP_TIERS) else "Mythic"
+                break
+            prev_thresh = threshold
+        bar_w = 24
+        if next_tier_thresh:
+            pct = (rep - prev_thresh) / max(1, next_tier_thresh - prev_thresh)
+            filled = int(min(pct, 1.0) * bar_w)
+            rep_bar = "█" * filled + "░" * (bar_w - filled)
+            rep_next = f"{next_tier_thresh - rep:>4} to {next_tier_name}"
+        else:
+            rep_bar = "█" * bar_w
+            rep_next = "MAX TIER"
+
+        # ── Heat block ────────────────────────────────────────────────────
+        heat = g.heat
+        if heat < 20:
+            heat_label = "🟢 COLD"
+            heat_desc = "Guards aren't watching."
+        elif heat < 40:
+            heat_label = "🟡 WARM"
+            heat_desc = "Some guards are patrolling."
+        elif heat < 60:
+            heat_label = "🟠 HOT"
+            heat_desc = "Informants may be compromised."
+        elif heat < 80:
+            heat_label = "🔴 WANTED"
+            heat_desc = "You're being actively tracked."
+        else:
+            heat_label = "💀 BURNED"
+            heat_desc = "Do not move contraband."
+        h_fill = int((heat / 100) * bar_w)
+        heat_bar = "█" * h_fill + "░" * (bar_w - h_fill)
+
+        # ── Active campaigns in current area ──────────────────────────────
+        market = g.markets[g.current_area]
+        active_campaigns: List[str] = []
+        for item_key in market.item_keys:
+            summary = market.active_influence_summary(item_key, today)
+            if summary and int(summary.get("days_left", 0)) > 0:
+                item_obj = ALL_ITEMS.get(item_key)
+                iname = item_obj.name if item_obj else item_key
+                lbl = summary.get("label", "?")
+                delta = summary.get("delta", 0.0)
+                days = int(summary.get("days_left", 0))
+                arrow = "▲" if delta > 0 else "▼"
+                active_campaigns.append(
+                    f"  {arrow} {iname:<20}  {lbl:<12}  {delta:+.3f}  {days}d left"
+                )
+
+        # ── Cooldowns in current area ──────────────────────────────────────
+        cooldown_lines: List[str] = []
+        prefix = f"{g.current_area.name}:"
+        for key, expires in sorted(g.influence_cooldowns.items()):
+            if key.startswith(prefix) and expires > today:
+                parts = key.split(":")
+                if len(parts) == 3:
+                    item_cd = ALL_ITEMS.get(parts[1])
+                    iname_cd = item_cd.name if item_cd else parts[1]
+                    cooldown_lines.append(
+                        f"  {iname_cd:<22}  {parts[2]:<10}  {expires - today}d remaining"
+                    )
+
+        # ── Licenses ──────────────────────────────────────────────────────
+        license_lines: List[str] = []
+        for lt in LicenseType:
+            check = "✓" if lt in g.licenses else "✗"
+            license_lines.append(f"  {check}  {lt.value}")
+
+        # ── Donation preview ──────────────────────────────────────────────
+        rep_penalty = max(0, (g.reputation - 100) // 100)
+        donate_rows: List[str] = []
+        for amt in (20, 50, 120, 300):
+            gain = max(1, int(amt / 15) - rep_penalty)
+            donate_rows.append(f"  {amt:>4}g  →  +{gain} rep")
+
+        # ── Hired Campaign Handler ────────────────────────────────────────
+        ch_mgr = next(
+            (m for m in g.hired_managers
+             if m.manager_type == ManagerType.CAMPAIGN_HANDLER.value and m.is_active),
+            None,
         )
-        self._overview_txt.setPlainText(text)
+        if ch_mgr:
+            ch_line = f"  {ch_mgr.name}  (Lv {ch_mgr.level})  —  active"
+        else:
+            ch_line = "  None hired  —  visit Managers to recruit"
+
+        # ── Assemble text ─────────────────────────────────────────────────
+        sep = "─" * 52
+        lines: List[str] = [
+            f"  STANDING    {rep:>6}  {rep_name}",
+            f"  PROGRESS    [{rep_bar}]  {rep_next}",
+            sep,
+            f"  HEAT        {heat:>3}/100  [{heat_bar}]",
+            f"              {heat_label}  —  {heat_desc}",
+            sep,
+            f"  ACTIVE CAMPAIGNS IN {g.current_area.value.upper()}",
+        ]
+        if active_campaigns:
+            lines.extend(active_campaigns)
+        else:
+            lines.append(f"  No active campaigns running in {g.current_area.value}.")
+        lines += [
+            sep,
+            f"  COOLDOWNS IN {g.current_area.value.upper()}",
+        ]
+        if cooldown_lines:
+            lines.extend(cooldown_lines)
+        else:
+            lines.append("  All items ready for new campaigns and slanders.")
+        lines += [
+            sep,
+            "  LICENSES",
+        ]
+        lines.extend(license_lines)
+        lines += [
+            sep,
+            "  DONATION PREVIEW  (Social Actions tab)",
+        ]
+        lines.extend(donate_rows)
+        if g.reputation >= 80:
+            lines.append("  (Diminishing returns active above 80 rep)")
+        lines += [
+            sep,
+            "  CAMPAIGN HANDLER MANAGER",
+            ch_line,
+        ]
+        self._overview_txt.setPlainText("\n".join(lines))
+
+        # ── Social tab live cards ─────────────────────────────────────────
+        if hasattr(self, "_social_rep_lbl"):
+            self._social_rep_lbl.setText(
+                f"  Current Rep     {rep:>6}  [{rep_name}]\n"
+                f"  Progress        [{rep_bar}]  {rep_next}\n"
+                f"  Diminishing     -{rep_penalty} rep penalty per 15g donated (penalty = (rep-100)÷100)"
+            )
+        if hasattr(self, "_donation_preview_lbl"):
+            preview_lines = [
+                f"  Amount   →   Rep Gain   (current penalty: -{rep_penalty} per 15g)",
+                "  " + "─" * 42,
+            ]
+            for amt in (20, 50, 120, 300):
+                gain = max(1, int(amt / 15) - rep_penalty)
+                preview_lines.append(f"    {amt:>4}g   →   +{gain} rep")
+            self._donation_preview_lbl.setText("\n".join(preview_lines))
 
         market = g.markets[g.current_area]
         today = g._absolute_day()
         rows: List[Dict[str, Any]] = []
+        active_summary_parts: List[str] = []
         for item_key in market.item_keys:
             item = ALL_ITEMS.get(item_key)
             if item is None:
@@ -18272,14 +19435,34 @@ class InfluenceScreen(Screen):
                 trend = "─"
                 trend_tag = "dim"
             pressure_ratio = pressure / max(natural, 0.01)
-            tag = "gold" if influence["delta"] > 0.01 else (
-                "blue" if influence["delta"] < -0.01 else (
-                    "red" if pressure_ratio > 1.2 else ("green" if pressure_ratio < 0.85 else trend_tag)
+            wave_days = int(influence.get("days_left", 0))
+            wave_delta = influence.get("delta", 0.0)
+            if wave_days > 0:
+                wave_arrow = "▲" if wave_delta > 0 else "▼"
+                active_cell = f"{wave_arrow} {wave_days}d"
+                active_summary_parts.append(
+                    f"{wave_arrow} {item.name}: {influence.get('label', '?')}  {wave_delta:+.3f}  {wave_days}d left"
                 )
-            )
+                tag = "gold" if wave_delta > 0 else "blue"
+            else:
+                active_cell = "—"
+                tag = "red" if pressure_ratio > 1.2 else ("green" if pressure_ratio < 0.85 else trend_tag)
+            mk = f"{g.current_area.name}:{item_key}"
+            if mk in g.campaign_targets:
+                mark_val = "📌"
+                if tag == "dim":
+                    tag = "green"
+            elif mk in g.slander_targets:
+                mark_val = "🚫"
+                if tag == "dim":
+                    tag = "amber"
+            else:
+                mark_val = "—"
             rows.append({
                 "item": item.name,
+                "mark": mark_val,
                 "price": f"{price:.2f}g",
+                "active": active_cell,
                 "pressure": f"{pressure:.3f}",
                 "trend": trend,
                 "rarity": getattr(item, "rarity", "common").title(),
@@ -18289,6 +19472,12 @@ class InfluenceScreen(Screen):
                 "_tag": tag,
             })
         self._mkt_table.load(rows)
+        if active_summary_parts:
+            self._active_camp_lbl.setText(
+                "Active campaigns:  " + "   ·   ".join(active_summary_parts)
+            )
+        else:
+            self._active_camp_lbl.setText("No active campaigns running in this area.")
         self._on_market_select(rows[0] if rows else None)
 
     def _on_market_select(self, row: Optional[Dict[str, Any]]) -> None:
@@ -18314,6 +19503,15 @@ class InfluenceScreen(Screen):
             f" {influence.get('delta', 0.0):+,.2f}  ·  {int(influence.get('days_left', 0))}d left\n"
             f"Cooldowns: {cooldown_text}"
         )
+        if hasattr(self, "_mark_camp_btn") and isinstance(item_key, str):
+            g = self.game
+            mk = f"{g.current_area.name}:{item_key}"
+            self._mark_camp_btn.setText(
+                "🔵 Campaign Marked  —  click to remove" if mk in g.campaign_targets else "📌 Mark for Campaign"
+            )
+            self._mark_slander_btn.setText(
+                "🔴 Slander Marked  —  click to remove" if mk in g.slander_targets else "🚫 Mark for Slander"
+            )
 
     def _do_donate(self, preset_amount: Optional[int]) -> None:
         g = self.game
@@ -18347,6 +19545,57 @@ class InfluenceScreen(Screen):
         g._check_achievements()
         self.msg.ok(f"Donated {amount:.0f}g. Rep +{rep_gain} -> {g.reputation}.")
         self.app.refresh()
+
+    def _get_campaign_handler(self):
+        """Return active Campaign Handler manager, or None."""
+        g = self.game
+        return next(
+            (m for m in g.hired_managers
+             if m.manager_type == ManagerType.CAMPAIGN_HANDLER.value and m.is_active),
+            None,
+        )
+
+    def _do_mark_campaign(self) -> None:
+        """Toggle the campaign mark on the selected item."""
+        row = self._mkt_table.selected()
+        item_key = row.get("item_key") if row else None
+        if not isinstance(item_key, str):
+            self.msg.warn("Select an item first.")
+            return
+        g = self.game
+        mk = f"{g.current_area.name}:{item_key}"
+        item = ALL_ITEMS.get(item_key)
+        iname = item.name if item else item_key
+        if mk in g.campaign_targets:
+            g.campaign_targets.remove(mk)
+            self.msg.ok(f"Campaign mark removed from {iname}.")
+        else:
+            g.campaign_targets.append(mk)
+            if mk in g.slander_targets:
+                g.slander_targets.remove(mk)
+            self.msg.ok(f"📌 {iname} marked for campaign — manager will prioritize it.")
+        self.refresh()
+
+    def _do_mark_slander(self) -> None:
+        """Toggle the slander mark on the selected item."""
+        row = self._mkt_table.selected()
+        item_key = row.get("item_key") if row else None
+        if not isinstance(item_key, str):
+            self.msg.warn("Select an item first.")
+            return
+        g = self.game
+        mk = f"{g.current_area.name}:{item_key}"
+        item = ALL_ITEMS.get(item_key)
+        iname = item.name if item else item_key
+        if mk in g.slander_targets:
+            g.slander_targets.remove(mk)
+            self.msg.ok(f"Slander mark removed from {iname}.")
+        else:
+            g.slander_targets.append(mk)
+            if mk in g.campaign_targets:
+                g.campaign_targets.remove(mk)
+            self.msg.ok(f"🚫 {iname} marked for slander — manager will prioritize it.")
+        self.refresh()
 
     def _do_market_campaign(self) -> None:
         g = self.game
@@ -18664,6 +19913,10 @@ class RealEstateScreen(Screen):
             elif prop.is_leased:
                 status = f"Leased: {(prop.tenant_name or 'Tenant')[:18]}"
                 tag = "green"
+            elif getattr(prop, "lease_posted", False):
+                n = len(getattr(prop, "lease_applications", []))
+                status = f"Listed \u2014 {n} applicant{'s' if n != 1 else ''}"
+                tag = "yellow"
             else:
                 status = "Available"
                 tag = "cyan"
@@ -18793,17 +20046,44 @@ class RealEstateScreen(Screen):
             prop.tenant_name = ""
             prop.lease_rate_mult = 1.0
             self.msg.ok("Lease ended.")
+        elif getattr(prop, "lease_posted", False):
+            apps = getattr(prop, "lease_applications", [])
+            if not apps:
+                self.msg.info(
+                    f"Listing for {prop.name} is posted — no applicants yet. "
+                    "Applicants trickle in over the coming days. Check back tomorrow."
+                )
+            else:
+                applicant = LeaseApplicantDialog(
+                    self, prop.name, prop.daily_lease or 1.0, apps
+                ).choose()
+                if applicant is None:
+                    return
+                prop.is_leased = True
+                prop.lease_posted = False
+                prop.lease_applications = []
+                prop.tenant_name = applicant["name"]
+                prop.lease_rate_mult = applicant["rate_mult"]
+                actual_rate = round((prop.daily_lease / max(prop.lease_rate_mult, 0.01)) * applicant["rate_mult"], 2)
+                self.game._gain_reputation(1)
+                self.game.ach_stats["re_leases_active"] = sum(
+                    1 for owned in self.game.real_estate if owned.is_leased and not owned.under_construction
+                )
+                self.msg.ok(f"{prop.name} leased to {applicant['name']} — {actual_rate:.2f}g/day. Rep +1.")
         else:
-            applicant = LeaseApplicantDialog(self, prop.name, prop.daily_lease or 1.0).choose()
-            if applicant is None:
+            if not _popup_confirm(
+                self, "Post for Lease",
+                f"Post {prop.name} for lease?\n\n"
+                f"Applicants will arrive over the coming days. "
+                f"Return here to review and select a tenant when you have candidates.",
+                confirm_text="Post Listing",
+            ):
                 return
-            prop.is_leased = True
-            prop.tenant_name = applicant["name"]
-            prop.lease_rate_mult = applicant["rate_mult"]
-            actual_rate = round((prop.daily_lease / max(prop.lease_rate_mult, 0.01)) * applicant["rate_mult"], 2)
-            self.game._gain_reputation(1)
-            self.game.ach_stats["re_leases_active"] = sum(1 for owned in self.game.real_estate if owned.is_leased and not owned.under_construction)
-            self.msg.ok(f"{prop.name} leased to {applicant['name']} — {actual_rate:.2f}g/day. Rep +1.")
+            prop.lease_posted = True
+            self.msg.ok(
+                f"Listing posted for {prop.name}. "
+                "Applicants will trickle in — check back over the next few days."
+            )
         self.app.refresh()
 
     def _do_repair(self) -> None:
@@ -19631,6 +20911,21 @@ class VoyageScreen(Screen):
         voyages_lay.addWidget(self._voyage_table, 1)
         self._voyage_detail = self._detail_box(voyages_tab)
         voyages_lay.addWidget(self._voyage_detail)
+
+        voyage_prog_wrap = QFrame(voyages_tab)
+        voyage_prog_wrap.setObjectName("dashPanel")
+        vp_lay = QVBoxLayout(voyage_prog_wrap)
+        vp_lay.setContentsMargins(UIScale.px(8), UIScale.px(6), UIScale.px(8), UIScale.px(6))
+        vp_lay.setSpacing(UIScale.px(4))
+        vp_hdr = QLabel(f"  {Sym.VOYAGE}  Active Voyage Progress", voyage_prog_wrap)
+        vp_hdr.setFont(Fonts.mixed_bold)
+        vp_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        vp_lay.addWidget(vp_hdr)
+        self._voyage_progress = VoyageProgressPanel(voyage_prog_wrap)
+        self._voyage_progress.setFixedHeight(UIScale.px(90))
+        vp_lay.addWidget(self._voyage_progress)
+        voyages_lay.addWidget(voyage_prog_wrap)
+
         voyage_act = QHBoxLayout()
         for text, handler, role in [
             ("Collect Results", self._collect_results, "secondary"),
@@ -19749,6 +21044,30 @@ class VoyageScreen(Screen):
                 "_tag": tag,
             })
         self._voyage_table.load(voyage_rows)
+
+        # Update animated progress panel
+        prog_rows: List[Dict[str, Any]] = []
+        for voyage in g.voyages:
+            if voyage.status not in ("sailing", "arrived"):
+                continue
+            port = VOYAGE_PORTS.get(voyage.destination_key, {})
+            dest_name = port.get("name", voyage.destination_key)
+            if voyage.status == "sailing":
+                total_days = max(1, voyage.days_total)
+                days_left = max(0, voyage.days_remaining)
+                progress = 1.0 - (days_left / float(total_days))
+                status_text = f"{days_left}d left"
+            else:
+                progress = 1.0
+                status_text = f"+{voyage.outcome_gold:,.0f}g"
+            prog_rows.append({
+                "title": f"{voyage.ship_name} \u2192 {dest_name}",
+                "status": voyage.status,
+                "progress": progress,
+                "status_text": status_text,
+            })
+        if hasattr(self, "_voyage_progress"):
+            self._voyage_progress.set_voyages(prog_rows)
 
         dest_rows: List[Dict[str, Any]] = []
         for port_key, port in VOYAGE_PORTS.items():
@@ -20274,8 +21593,8 @@ class MysteriousCofferDialog(AppDialog):
         "LEGENDARY": {"bg": "#574104", "border": "#ffd030", "glow": "#ffd030", "label": "LEGENDARY", "sfg": "#ffe38a", "short": "?"},
     }
     _PROBS_FULL: List[Tuple[str, float]] = [
-        ("C", 0.514), ("UC", 0.220), ("R", 0.120), ("UR", 0.065),
-        ("SR", 0.040), ("SSR", 0.025), ("SSS", 0.015), ("LEGENDARY", 0.001),
+        ("C", 0.505), ("UC", 0.220), ("R", 0.120), ("UR", 0.065),
+        ("SR", 0.040), ("SSR", 0.025), ("SSS", 0.015), ("LEGENDARY", 0.010),
     ]
 
     def __init__(self, parent: Optional[QWidget], app: "GameApp", game: Game, mercy: int, free_spins: int = 0) -> None:
@@ -20380,6 +21699,16 @@ class MysteriousCofferDialog(AppDialog):
         mercy_row.addWidget(self._free_lbl)
         root.addLayout(mercy_row)
 
+        # Wallet info row — always visible so player can track gold without closing dialog
+        wallet_row = QHBoxLayout()
+        self._wallet_lbl = QLabel("", self._body)
+        self._wallet_lbl.setFont(Fonts.mixed_small)
+        self._wallet_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        wallet_row.addWidget(self._wallet_lbl)
+        wallet_row.addStretch()
+        root.addLayout(wallet_row)
+        self._refresh_wallet_lbl()
+
         btns = QHBoxLayout()
         self._collect_btn = MtButton(f"{Sym.YES}  Collect & Close", self._body)
         self._collect_btn.setEnabled(False)
@@ -20400,6 +21729,22 @@ class MysteriousCofferDialog(AppDialog):
         self._update_spin_btn()
         self.center_on_parent()
         QTimer.singleShot(0, self._start_roll)
+
+    def _refresh_wallet_lbl(self) -> None:
+        """Update the wallet info label with current gold and inventory value."""
+        g = self._game
+        gold = float(getattr(g.inventory, "gold", 0.0) or 0.0)
+        inv_val = 0.0
+        for key, qty in (g.inventory.items or {}).items():
+            item = ALL_ITEMS.get(key)
+            if item and qty > 0:
+                inv_val += item.base_price * qty
+        gold_col = P.red if gold < 200 else P.gold
+        self._wallet_lbl.setText(
+            f"\u25c8 Gold: <span style='color:{gold_col}'>{gold:,.0f}g</span>"
+            f"  \u00b7  Inventory value: {inv_val:,.0f}g"
+        )
+        self._wallet_lbl.setTextFormat(Qt.TextFormat.RichText)
 
     def _normalised_pool(self, exclude_common: bool = False) -> List[Tuple[str, float]]:
         pool = [entry for entry in self._PROBS_FULL if not (exclude_common and entry[0] == "C")]
@@ -20547,6 +21892,7 @@ class MysteriousCofferDialog(AppDialog):
             self._free_spins += bonus_spins
 
         g.settings.gamble_mercy = self._mercy
+        g.settings.gamble_free_spins = self._free_spins
         g.settings.save()
 
         self._rarity_lbl.setText(spec["label"])
@@ -20570,6 +21916,7 @@ class MysteriousCofferDialog(AppDialog):
         self._redraw_mercy()
         self._update_spin_btn()
         self._collect_btn.setEnabled(True)
+        self._refresh_wallet_lbl()
 
     def _on_spin_again(self) -> None:
         if self._spinning:
@@ -20578,6 +21925,8 @@ class MysteriousCofferDialog(AppDialog):
             pass
         elif self._free_spins > 0:
             self._free_spins -= 1
+            self._game.settings.gamble_free_spins = self._free_spins
+            self._game.settings.save()
         elif self._game.inventory.gold >= 200:
             self._game.inventory.gold -= 200
             if hasattr(self._app, "sound"):
@@ -20605,7 +21954,7 @@ class GambleScreen(Screen):
         ("Super Rare", "4.0%", "500 gold", "#ff53b6"),
         ("Super Super Rare", "2.5%", "5× Silk Cloth or 4 free spins", "#40d4ff"),
         ("Triple Super Rare", "1.5%", "1,000 gold", "#ff4141"),
-        ("Legendary", "0.1%", "5,000 gold + 10 reputation", "#ffd030"),
+        ("Legendary", "1.0%", "5,000 gold + 10 reputation", "#ffd030"),
     ]
 
     def build(self) -> None:
@@ -20725,7 +22074,9 @@ class GambleScreen(Screen):
     def refresh(self) -> None:
         gold = self.game.inventory.gold
         mercy = int(getattr(self.game.settings, "gamble_mercy", 0) or 0)
-        self._status_lbl.setText(f"Wallet {gold:,.0f}g  ·  Spin cost 200g")
+        free_spins = int(getattr(self.game.settings, "gamble_free_spins", 0) or 0)
+        free_text = f"  ·  {free_spins} free spin{'s' if free_spins != 1 else ''}" if free_spins > 0 else ""
+        self._status_lbl.setText(f"Wallet {gold:,.0f}g  ·  Spin cost 200g{free_text}")
         if mercy >= 15:
             self._mercy_lbl.setText("Mercy ready: next spin is free, cannot land Common, and doubles all rewards.")
             self._mercy_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
@@ -20733,21 +22084,24 @@ class GambleScreen(Screen):
             self._mercy_lbl.setText(f"Mercy meter: {mercy}/15")
             self._mercy_lbl.setStyleSheet(f"color:{P.amber}; background:transparent;")
         self._open_btn.setText(
-            f"{Sym.GAMBLE}  Open the Coffer  (FREE Mercy Spin)" if mercy >= 15 else f"{Sym.GAMBLE}  Open the Coffer  (200g)"
+            f"{Sym.GAMBLE}  Open the Coffer  (FREE Mercy Spin)" if mercy >= 15 else (
+                f"{Sym.GAMBLE}  Open the Coffer  ({free_spins} free)" if free_spins > 0 else f"{Sym.GAMBLE}  Open the Coffer  (200g)"
+            )
         )
 
     def _open_coffer(self) -> None:
         mercy = int(getattr(self.game.settings, "gamble_mercy", 0) or 0)
-        if mercy < 15 and self.game.inventory.gold < 200:
+        free_spins = int(getattr(self.game.settings, "gamble_free_spins", 0) or 0)
+        if mercy < 15 and free_spins <= 0 and self.game.inventory.gold < 200:
             self.msg.err("Not enough gold — you need 200g to spin the coffer.")
             if hasattr(self.app, "sound"):
                 self.app.sound.play_sfx("error")
             return
-        if mercy < 15:
+        if mercy < 15 and free_spins <= 0:
             self.game.inventory.gold -= 200
             if hasattr(self.app, "sound"):
                 self.app.sound.play_coin_sfx()
-        dlg = MysteriousCofferDialog(self, self.app, self.game, mercy)
+        dlg = MysteriousCofferDialog(self, self.app, self.game, mercy, free_spins=free_spins)
         dlg.open_and_wait()
         self.app.refresh()
 
@@ -20762,22 +22116,22 @@ class SocialScreen(Screen):
         ("guild", "Guild", 170),
         ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
         ("reputation", "Reputation", 110, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("area", "Area", 120),
+        ("area", "Area", 120, Qt.AlignmentFlag.AlignCenter),
     ]
     _PENDING_COLS = [
-        ("merchant", "Merchant", 280),
+        ("merchant", "Merchant", 280, Qt.AlignmentFlag.AlignCenter),
         ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
     ]
     _FRIEND_COLS = [
-        ("status", "Status", 84),
+        ("status", "Status", 84, Qt.AlignmentFlag.AlignCenter),
         ("merchant", "Merchant", 260),
         ("net_worth", "Net Worth", 140, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-        ("seen", "Last Seen", 160),
+        ("seen", "Last Seen", 160, Qt.AlignmentFlag.AlignCenter),
     ]
     _GUILD_COLS = [
         ("name", "Guild", 220),
         ("members", "Members", 90, Qt.AlignmentFlag.AlignCenter),
-        ("focus", "Focus", 120),
+        ("focus", "Focus", 120, Qt.AlignmentFlag.AlignCenter),
         ("description", "Description", 400),
     ]
     _INVITE_COLS = [
@@ -21658,6 +23012,18 @@ class _SettingsScreen(Screen):
         sep0.setStyleSheet(f"background:{P.border_light}; border:none;")
         outer.addWidget(sep0)
 
+        redeem_row = QHBoxLayout()
+        redeem_row.setSpacing(UIScale.px(10))
+        self._redeem_btn = MtButton("Redeem Code", self, role="primary")
+        self._redeem_btn.setFixedHeight(UIScale.px(34))
+        self._redeem_btn.clicked.connect(self._redeem_code)
+        redeem_row.addWidget(self._redeem_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._redeem_status_lbl = QLabel(self)
+        self._redeem_status_lbl.setFont(Fonts.mixed_small)
+        self._redeem_status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        redeem_row.addWidget(self._redeem_status_lbl, 1)
+        outer.addLayout(redeem_row)
+
         # ── Scroll area ──────────────────────────────────────────────────
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -21710,6 +23076,7 @@ class _SettingsScreen(Screen):
         self._time_timer = QTimer(self)
         self._time_timer.timeout.connect(self.refresh)
         self._time_timer.start(1000)
+        self._refresh_redeem_controls()
 
     # ── Section helpers ────────────────────────────────────────────────────
 
@@ -21884,6 +23251,72 @@ class _SettingsScreen(Screen):
             self._scale_slider.setValue(100)
         self._apply_scale(1.0)
 
+    def _refresh_redeem_controls(self) -> None:
+        if not hasattr(self, "_redeem_btn"):
+            return
+        try:
+            online = getattr(self.app, "online", None)
+            is_online = bool(online and getattr(online, "is_online", False) and online.auth.user_id)
+            self._redeem_btn.setEnabled(is_online)
+            if is_online:
+                username = str(getattr(online.auth, "username", "") or getattr(online.auth, "email", "Merchant") or "Merchant")
+                self._redeem_status_lbl.setText(f"Online account active: {username}")
+            else:
+                self._redeem_status_lbl.setText("Redeem codes require an active online session.")
+        except RuntimeError:
+            return
+
+    def _redeem_code(self) -> None:
+        online = getattr(self.app, "online", None)
+        rewards = getattr(online, "rewards", None) if online else None
+        if not (online and getattr(online, "is_online", False) and getattr(online.auth, "user_id", "") and rewards):
+            self.msg.warn("Sign in to an online account before redeeming codes.")
+            self._refresh_redeem_controls()
+            return
+
+        raw = _popup_get_text(
+            self,
+            "Redeem Code",
+            "Enter your account reward code.",
+            placeholder="ALPHA",
+            confirm_text="Redeem",
+        )
+        if raw is None:
+            return
+
+        code = re.sub(r"[^A-Za-z0-9_-]+", "", raw.strip()).upper()[:32]
+        if not code:
+            self.msg.warn("Enter a valid redemption code.")
+            return
+
+        self._redeem_btn.setEnabled(False)
+        self.msg.info(f"Redeeming {code}…")
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res, c=code: self._handle_redeem_code_result(c, r))
+
+        try:
+            rewards.redeem_code(code, callback=_cb)
+        except Exception as exc:
+            self._redeem_btn.setEnabled(True)
+            self.msg.err(f"Code redemption failed: {exc}")
+
+    def _handle_redeem_code_result(self, code: str, res: Any) -> None:
+        self._refresh_redeem_controls()
+        if not getattr(res, "success", False):
+            self.msg.err(str(getattr(res, "error", "Code redemption failed.") or "Code redemption failed."))
+            return
+
+        data = res.data if isinstance(res.data, dict) else {}
+        grants = self.app._apply_reward_payload(data, source_label=f"Reward code {code}")
+        self.app._refresh_inbox_badge()
+        note = str(data.get("message", "") or "").strip()
+        if grants:
+            suffix = f" {note}" if note else ""
+            self.msg.ok(f"Code {code} redeemed: {'  ·  '.join(grants)}.{suffix}")
+        else:
+            self.msg.ok(note or f"Code {code} redeemed.")
+
     def _format_hotkey_display(self, binding: str) -> str:
         if not binding:
             return "—"
@@ -22037,7 +23470,7 @@ class _SettingsScreen(Screen):
         ("finance",    "Finance"),
         ("contracts",  "Contracts"),
         ("market",     "Market Info"),
-        ("news",       "News & Events"),
+        ("news",       "News, Events & Logs"),
         ("progress",   "Progress"),
         ("skills",     "Skills"),
         ("help",       "Help"),
@@ -22234,7 +23667,7 @@ class _SettingsScreen(Screen):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(f"color:{P.gold}; background:transparent;")
         root.addWidget(title)
-        body = QLabel("A dusty trail curls down the skirting board and disappears behind the help shelf.", dlg._body)
+        body = QLabel("Ah! What's this? A small creature scurries away and drops a small treat on the floor. You pick up the treat and slip it into your pocket.", dlg._body)
         body.setFont(Fonts.mixed)
         body.setWordWrap(True)
         body.setStyleSheet(f"color:{P.fg}; background:transparent;")
@@ -22258,9 +23691,10 @@ class _SettingsScreen(Screen):
         except Exception:
             pass
         if granted:
-            self.msg.ok("You found a cat treat. It slips into your inventory and refuses to count toward your carry weight.")
+            self.msg.ok("Cat treat added to inventory. Quest items can not be removed and have no weight.")
         else:
             self.msg.info("The paw prints lead back to the same hidden treat stash.")
+            GameToast(self.app, "\U0001f43e  The paw prints lead somewhere\u2026 but not today.", P.fg_dim, duration_ms=15_000)
         self.app.refresh()
 
     def _file_bankruptcy(self) -> None:
@@ -22276,6 +23710,7 @@ class _SettingsScreen(Screen):
             self.app._do_bankruptcy_restart()
 
     def refresh(self) -> None:
+        self._refresh_redeem_controls()
         if hasattr(self, "_paw_btn"):
             self._paw_btn.setVisible(not bool(self.game.cat_state.get("adoption_resolved", False)))
         if hasattr(self, "_scale_lbl"):
@@ -22296,8 +23731,2315 @@ class _SettingsScreen(Screen):
 # ── Remaining placeholder screen classes (not yet ported) ───────────────────
 InventoryScreen    = _make_stub("Inventory")
 WaitScreen         = _make_stub("Wait / Rest")
-MarketInfoScreen   = _make_stub("Market Info")
 SettingsScreen     = _SettingsScreen
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-AREA SPARKLINE  —  custom price-history chart widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _MultiAreaSparkline(QWidget):
+    """
+    Draws overlapping price-history lines for one item across all areas that
+    carry it.  Each area gets a distinct colour.  Base price shown as a dashed
+    horizontal reference.
+    """
+
+    _AREA_PALETTE = [
+        "#e8c46a",  # City       – gold
+        "#7ec87e",  # Farmland   – green
+        "#a0a0d8",  # Mountain   – blue-grey
+        "#78c8d8",  # Coast      – cyan
+        "#68b868",  # Forest     – dark green
+        "#e8a040",  # Desert     – orange
+        "#a870a8",  # Swamp      – purple
+        "#c8e0f0",  # Tundra     – ice-blue
+    ]
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._histories: Dict = {}
+        self._labels:    Dict = {}
+        self._base = 1.0
+        self.setMinimumHeight(UIScale.px(240))
+        self.setStyleSheet(f"background:{P.bg_panel}; border-radius:{UIScale.px(6)}px;")
+
+    def set_data(self, histories: Dict, labels: Dict, base: float) -> None:
+        self._histories = dict(histories)
+        self._labels    = dict(labels)
+        self._base      = max(base, 1.0)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        try:
+            self._paint(painter)
+        except Exception:
+            pass
+        finally:
+            painter.end()
+
+    def _paint(self, painter: QPainter) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        W, H = self.width(), self.height()
+        ML, MR, MT, MB = UIScale.px(56), UIScale.px(16), UIScale.px(18), UIScale.px(44)
+        cw, ch = W - ML - MR, H - MT - MB
+
+        if not self._histories or cw <= 0 or ch <= 0:
+            painter.setPen(QColor(P.fg_dim))
+            painter.setFont(Fonts.mixed_small)
+            painter.drawText(
+                QRect(0, 0, W, H),
+                Qt.AlignmentFlag.AlignCenter,
+                "No price history yet.\nTrade and advance time to accumulate data.",
+            )
+            return
+
+        all_vals = [
+            v.price if hasattr(v, "price") else float(v)
+            for h in self._histories.values() for v in h
+        ]
+        if not all_vals:
+            return
+
+        y_min = min(all_vals) * 0.90
+        y_max = max(all_vals) * 1.10
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+
+        def tx(i: int, n: int) -> int:
+            return ML + int(i / max(n - 1, 1) * cw)
+
+        def ty(v: float) -> int:
+            return MT + int((1.0 - (v - y_min) / (y_max - y_min)) * ch)
+
+        # ── Background fill ────────────────────────────────────────────────
+        painter.fillRect(ML, MT, cw, ch, QColor(P.bg))
+
+        # ── Grid lines ──────────────────────────────────────────────────────
+        num_g = 5
+        for i in range(num_g + 1):
+            gy    = MT + int(i / num_g * ch)
+            price = y_max - i / num_g * (y_max - y_min)
+            painter.setPen(QPen(QColor(P.border), 1))
+            painter.drawLine(ML, gy, ML + cw, gy)
+            painter.setFont(Fonts.tiny)
+            painter.setPen(QColor(P.fg_dim))
+            painter.drawText(
+                QRect(0, gy - UIScale.px(7), ML - UIScale.px(4), UIScale.px(14)),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"{price:.0f}g",
+            )
+
+        # ── Base-price dashed reference ─────────────────────────────────────
+        if y_min < self._base < y_max:
+            by = ty(self._base)
+            painter.setPen(QPen(QColor(P.fg_dim), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(ML, by, ML + cw, by)
+            painter.setFont(Fonts.tiny)
+            painter.setPen(QColor(P.fg_dim))
+            painter.drawText(ML + UIScale.px(3), by - UIScale.px(3), "base")
+
+        # ── Per-area lines ──────────────────────────────────────────────────
+        area_list = list(self._histories.items())
+        for a_idx, (area, hist) in enumerate(area_list):
+            if len(hist) < 2:
+                continue
+            color = QColor(self._AREA_PALETTE[a_idx % len(self._AREA_PALETTE)])
+            pen   = QPen(color, UIScale.px(2))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            pts = [(tx(i, len(hist)), ty(v.price if hasattr(v, "price") else float(v))) for i, v in enumerate(hist)]
+            for i in range(len(pts) - 1):
+                painter.drawLine(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+            # closing dot
+            if pts:
+                px, py = pts[-1]
+                painter.setBrush(QBrush(color))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPoint(px, py), UIScale.px(3), UIScale.px(3))
+
+        # ── Axis border ─────────────────────────────────────────────────────
+        painter.setPen(QPen(QColor(P.border), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(ML, MT, cw, ch)
+
+        # ── X-axis label ────────────────────────────────────────────────────
+        max_len = max((len(h) for h in self._histories.values()), default=1)
+        painter.setFont(Fonts.tiny)
+        painter.setPen(QColor(P.fg_dim))
+        painter.drawText(
+            QRect(ML, H - MB + UIScale.px(4), cw, UIScale.px(14)),
+            Qt.AlignmentFlag.AlignCenter,
+            f"Most recent {max_len} price observations (one per game-day)",
+        )
+
+        # ── Legend ──────────────────────────────────────────────────────────
+        leg_y  = H - UIScale.px(16)
+        leg_x  = ML
+        stride = UIScale.px(80)
+        for a_idx, (area, _hist) in enumerate(area_list):
+            if leg_x + stride > W - MR:
+                break
+            label = self._labels.get(area, str(area))
+            color = QColor(self._AREA_PALETTE[a_idx % len(self._AREA_PALETTE)])
+            painter.setPen(QPen(color, UIScale.px(2)))
+            painter.drawLine(leg_x, leg_y, leg_x + UIScale.px(18), leg_y)
+            painter.setPen(QColor(P.fg))
+            painter.setFont(Fonts.tiny)
+            painter.drawText(leg_x + UIScale.px(22), leg_y + UIScale.px(4), label)
+            leg_x += stride
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET INFO SCREEN  —  comprehensive market intelligence
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MarketInfoScreen(Screen):
+    """
+    Full market intelligence hub.
+
+    Tabs
+    ────
+    Overview      – stat cards, top opportunities, seasonal outlook, alerts
+    Price Matrix  – global item × location price grid with margin coding
+    Trade Routes  – ranked arbitrage routes, filterable by area / margin
+    Area Details  – per-area stock, pressure, events, and travel times
+    Price Trends  – 30-day multi-area sparkline chart per commodity
+    """
+
+    _AREA_ORDER = [
+        Area.CITY, Area.FARMLAND, Area.MOUNTAIN, Area.COAST,
+        Area.FOREST, Area.DESERT, Area.SWAMP, Area.TUNDRA,
+    ]
+    _AREA_LABEL: Dict[Area, str] = {
+        Area.CITY:     "City",
+        Area.FARMLAND: "Farmland",
+        Area.MOUNTAIN: "Mountain",
+        Area.COAST:    "Coast",
+        Area.FOREST:   "Forest",
+        Area.DESERT:   "Desert",
+        Area.SWAMP:    "Swamp",
+        Area.TUNDRA:   "Tundra",
+    }
+
+    # ── Tab QSS shared across all QTabWidgets in this screen ─────────────────
+    _TAB_QSS = ""  # set in build() after UIScale is available
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def build(self) -> None:
+        self._TAB_QSS = (
+            f"QTabWidget::pane{{border:none; background:{P.bg};}}"
+            f"QTabBar::tab{{background:{P.bg_panel}; color:{P.fg_dim};"
+            f"  padding:{UIScale.px(4)}px {UIScale.px(12)}px;"
+            f"  border:1px solid {P.border}; border-bottom:none;"
+            f"  border-radius:{UIScale.px(4)}px {UIScale.px(4)}px 0 0;"
+            f"  margin-right:{UIScale.px(2)}px;}}"
+            f"QTabBar::tab:selected{{background:{P.bg}; color:{P.gold};"
+            f"  border-bottom:2px solid {P.gold};}}"
+            f"QTabBar::tab:hover{{color:{P.cream}; background:{P.bg_hover};}}"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(
+            UIScale.px(12), UIScale.px(10), UIScale.px(12), UIScale.px(10))
+        root.setSpacing(UIScale.px(6))
+
+        # ── Title row ─────────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_row.setSpacing(UIScale.px(12))
+        title_lbl = QLabel(f"{Sym.INTELLIGENCE}  Market Intelligence", self)
+        title_lbl.setFont(Fonts.title)
+        title_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        title_row.addWidget(title_lbl)
+        title_row.addStretch()
+        self._summary_lbl = QLabel("", self)
+        self._summary_lbl.setFont(Fonts.mixed_small)
+        self._summary_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        title_row.addWidget(self._summary_lbl)
+        root.addLayout(title_row)
+
+        # ── Tabs ──────────────────────────────────────────────────────────────
+        self._tabs = QTabWidget(self)
+        self._tabs.setFont(Fonts.mixed_small)
+        self._tabs.setStyleSheet(self._TAB_QSS)
+        root.addWidget(self._tabs, 1)
+
+        self._build_overview_tab()
+        self._build_matrix_tab()
+        self._build_routes_tab()
+        self._build_area_tab()
+        self._build_trends_tab()
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        foot = QHBoxLayout()
+        foot.addWidget(self.back_button())
+        foot.addStretch()
+        self._footer_lbl = QLabel("", self)
+        self._footer_lbl.setFont(Fonts.tiny)
+        self._footer_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        foot.addWidget(self._footer_lbl)
+        root.addLayout(foot)
+
+        # Internal caches
+        self._matrix_all_rows: List[Dict] = []
+        self._routes_all_rows:  List[Dict] = []
+
+    # ── Tab builders ─────────────────────────────────────────────────────────
+
+    def _build_overview_tab(self) -> None:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(
+            UIScale.px(4), UIScale.px(8), UIScale.px(4), UIScale.px(8))
+        lay.setSpacing(UIScale.px(8))
+
+        # ── Stat hero cards ───────────────────────────────────────────────────
+        hero_row = QHBoxLayout()
+        hero_row.setSpacing(UIScale.px(8))
+        self._stat_vals: Dict[str, QLabel] = {}
+        for key, label, colour in [
+            ("items_tracked",   "Items Tracked",  P.gold),
+            ("areas_monitored", "Areas Active",   P.gold),
+            ("best_margin",     "Best Margin",    P.green),
+            ("best_item",       "Top Opportunity",P.green),
+            ("alerts",          "Active Alerts",  P.amber),
+        ]:
+            card = self.make_panel(w, object_name="card")
+            cl   = QVBoxLayout(card)
+            cl.setContentsMargins(
+                UIScale.px(10), UIScale.px(8), UIScale.px(10), UIScale.px(8))
+            cl.setSpacing(UIScale.px(2))
+            vl = QLabel("—", card)
+            vl.setFont(Fonts.mixed_bold)
+            vl.setStyleSheet(f"color:{colour}; background:transparent;")
+            vl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cl.addWidget(vl)
+            ll = QLabel(label, card)
+            ll.setFont(Fonts.tiny)
+            ll.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cl.addWidget(ll)
+            hero_row.addWidget(card, 1)
+            self._stat_vals[key] = vl
+        lay.addLayout(hero_row)
+
+        # ── Two-column split ─────────────────────────────────────────────────
+        split = QHBoxLayout()
+        split.setSpacing(UIScale.px(8))
+
+        # Left: top opportunities table
+        opp_card = self.make_panel(w, object_name="card")
+        ol = QVBoxLayout(opp_card)
+        ol.setContentsMargins(
+            UIScale.px(8), UIScale.px(8), UIScale.px(8), UIScale.px(8))
+        ol.setSpacing(UIScale.px(4))
+        _hdr = QLabel(f"{Sym.TRADE}  Best Opportunities", opp_card)
+        _hdr.setFont(Fonts.mixed_bold)
+        _hdr.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        ol.addWidget(_hdr)
+        _sep = QFrame(opp_card)
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setFixedHeight(1)
+        _sep.setStyleSheet(f"background:{P.border}; border:none;")
+        ol.addWidget(_sep)
+        self._opp_table = DataTable(opp_card, [
+            ("item",           "Item",        130),
+            ("buy_area",       "Buy At",       80),
+            ("sell_area",      "Sell At",      80),
+            ("buy_price",      "Buy",          58,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ("sell_price",     "Sell",         58,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ("margin_pct",     "Margin",       62,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ("profit_per_day", "Profit/d",     68,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+        ], row_height=24)
+        ol.addWidget(self._opp_table, 1)
+        split.addWidget(opp_card, 3)
+
+        # Right column: seasonal + alerts
+        rcol = QVBoxLayout()
+        rcol.setSpacing(UIScale.px(8))
+
+        seas_card = self.make_panel(w, object_name="card")
+        sl = QVBoxLayout(seas_card)
+        sl.setContentsMargins(
+            UIScale.px(8), UIScale.px(8), UIScale.px(8), UIScale.px(8))
+        sl.setSpacing(UIScale.px(4))
+        sh = QLabel(f"{Sym.INTELLIGENCE}  Seasonal Outlook", seas_card)
+        sh.setFont(Fonts.mixed_bold)
+        sh.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        sl.addWidget(sh)
+        self._season_lbl = QLabel("", seas_card)
+        self._season_lbl.setFont(Fonts.mixed_small)
+        self._season_lbl.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        sl.addWidget(self._season_lbl)
+        self._seas_table = DataTable(seas_card, [
+            ("item", "Item",      120),
+            ("mult", "Season ×",   72,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ("rec",  "Guidance",  190),
+        ], row_height=22)
+        sl.addWidget(self._seas_table, 1)
+        rcol.addWidget(seas_card, 3)
+
+        alert_card = self.make_panel(w, object_name="card")
+        al = QVBoxLayout(alert_card)
+        al.setContentsMargins(
+            UIScale.px(8), UIScale.px(8), UIScale.px(8), UIScale.px(8))
+        al.setSpacing(UIScale.px(4))
+        ah = QLabel(f"{Sym.WARNING}  Market Alerts", alert_card)
+        ah.setFont(Fonts.mixed_bold)
+        ah.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        al.addWidget(ah)
+        self._alert_table = DataTable(alert_card, [
+            ("item",     "Item",      110),
+            ("area",     "Area",       82),
+            ("pressure", "Pressure",   68,
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ("signal",   "Signal",    160),
+        ], row_height=22)
+        al.addWidget(self._alert_table, 1)
+        rcol.addWidget(alert_card, 2)
+
+        split.addLayout(rcol, 2)
+        lay.addLayout(split, 1)
+        self._tabs.addTab(w, f"{Sym.INTELLIGENCE}  Overview")
+
+    def _build_matrix_tab(self) -> None:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(
+            UIScale.px(4), UIScale.px(6), UIScale.px(4), UIScale.px(4))
+        lay.setSpacing(UIScale.px(6))
+
+        # Filter row
+        fr = QHBoxLayout()
+        fr.setSpacing(UIScale.px(8))
+        for lbl_txt, attr, placeholder, w_px in [
+            ("Search:", "_matrix_search", "Item name…", 200),
+        ]:
+            _l = QLabel(lbl_txt, w)
+            _l.setFont(Fonts.mixed_small)
+            _l.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            fr.addWidget(_l)
+            ed = QLineEdit(w)
+            ed.setPlaceholderText(placeholder)
+            ed.setFixedHeight(UIScale.px(26))
+            ed.setMaximumWidth(UIScale.px(w_px))
+            setattr(self, attr, ed)
+            fr.addWidget(ed)
+        self._matrix_search.textChanged.connect(self._apply_matrix_filter)
+
+        _cl = QLabel("Category:", w)
+        _cl.setFont(Fonts.mixed_small)
+        _cl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        fr.addWidget(_cl)
+        self._matrix_cat = QComboBox(w)
+        self._matrix_cat.setFont(Fonts.mixed_small)
+        self._matrix_cat.setFixedHeight(UIScale.px(26))
+        self._matrix_cat.addItem("All Categories")
+        for cat in ItemCategory:
+            self._matrix_cat.addItem(cat.name.replace("_", " ").title(), userData=cat)
+        self._matrix_cat.currentIndexChanged.connect(self._apply_matrix_filter)
+        fr.addWidget(self._matrix_cat)
+
+        fr.addStretch()
+
+        leg = QLabel(
+            f"<span style='color:{P.green}'>▼ cheapest in row</span>"
+            f"   <span style='color:{P.red}'>▲ most expensive</span>"
+            f"   — not traded here",
+            w,
+        )
+        leg.setFont(Fonts.tiny)
+        leg.setTextFormat(Qt.TextFormat.RichText)
+        leg.setStyleSheet("background:transparent;")
+        fr.addWidget(leg)
+        lay.addLayout(fr)
+
+        # Price matrix table — 1 row per item, 1 column per area
+        area_cols = [
+            (
+                a.name,
+                self._AREA_LABEL.get(a, a.name),
+                70,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            for a in self._AREA_ORDER
+        ]
+        cols = (
+            [
+                ("cat",        "Cat.",      54),
+                ("item",       "Item",     148),
+                ("base",       "Base",      58,
+                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            ]
+            + area_cols
+            + [
+                ("best_buy",   "Best Buy",  84),
+                ("best_sell",  "Best Sell", 84),
+                ("margin_pct", "Margin %",  70,
+                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                ("trend",      "30d Trend", 80,
+                 Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
+            ]
+        )
+        self._matrix_table = DataTable(
+            w, cols, row_height=22, stretch_last=False)
+        lay.addWidget(self._matrix_table, 1)
+
+        self._tabs.addTab(w, f"{Sym.EXCHANGE}  Price Matrix")
+
+    def _build_routes_tab(self) -> None:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(
+            UIScale.px(4), UIScale.px(6), UIScale.px(4), UIScale.px(4))
+        lay.setSpacing(UIScale.px(6))
+
+        fr = QHBoxLayout()
+        fr.setSpacing(UIScale.px(8))
+
+        for lbl_txt, combo_attr in [("From:", "_route_from"), ("To:", "_route_to")]:
+            _l = QLabel(lbl_txt, w)
+            _l.setFont(Fonts.mixed_small)
+            _l.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            fr.addWidget(_l)
+            cb = QComboBox(w)
+            cb.setFont(Fonts.mixed_small)
+            cb.setFixedHeight(UIScale.px(26))
+            cb.addItem("Any")
+            for a in self._AREA_ORDER:
+                cb.addItem(self._AREA_LABEL[a])
+            setattr(self, combo_attr, cb)
+            cb.currentIndexChanged.connect(self._apply_routes_filter)
+            fr.addWidget(cb)
+
+        _ml = QLabel("Min Margin:", w)
+        _ml.setFont(Fonts.mixed_small)
+        _ml.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        fr.addWidget(_ml)
+        self._min_margin = QSpinBox(w)
+        self._min_margin.setRange(0, 300)
+        self._min_margin.setValue(5)
+        self._min_margin.setSuffix("%")
+        self._min_margin.setFixedHeight(UIScale.px(26))
+        self._min_margin.setFixedWidth(UIScale.px(82))
+        self._min_margin.valueChanged.connect(self._apply_routes_filter)
+        fr.addWidget(self._min_margin)
+
+        fr.addStretch()
+
+        _sl = QLabel("Sort:", w)
+        _sl.setFont(Fonts.mixed_small)
+        _sl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        fr.addWidget(_sl)
+        self._route_sort = QComboBox(w)
+        self._route_sort.setFont(Fonts.mixed_small)
+        self._route_sort.setFixedHeight(UIScale.px(26))
+        self._route_sort.addItems(
+            ["Margin %", "Profit / Day", "Profit / Unit", "Travel Days"])
+        self._route_sort.currentIndexChanged.connect(self._apply_routes_filter)
+        fr.addWidget(self._route_sort)
+        lay.addLayout(fr)
+
+        ALR = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        ALC = Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        self._routes_table = DataTable(w, [
+            ("item",           "Item",          130),
+            ("buy_area",       "Buy Location",   90),
+            ("sell_area",      "Sell Location",  90),
+            ("buy_price",      "Buy Price",       70, ALR),
+            ("sell_price",     "Sell Price",      70, ALR),
+            ("profit_unit",    "Profit / Unit",   78, ALR),
+            ("margin_pct",     "Margin %",        70, ALR),
+            ("travel_days",    "Days",            44, ALC),
+            ("travel_risk",    "Road Risk",       70, ALC),
+            ("profit_per_day", "Profit / Day",    78, ALR),
+            ("category",       "Category",        90),
+            ("signal",         "Signal",          78, ALC),
+        ], row_height=24, stretch_last=False)
+        lay.addWidget(self._routes_table, 1)
+
+        self._tabs.addTab(w, f"{Sym.TRAVEL}  Trade Routes")
+
+    def _build_area_tab(self) -> None:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(
+            UIScale.px(4), UIScale.px(6), UIScale.px(4), UIScale.px(4))
+        lay.setSpacing(UIScale.px(6))
+
+        # Area selector
+        top = QHBoxLayout()
+        top.setSpacing(UIScale.px(8))
+        _al = QLabel(f"{Sym.LOCATION}  Area:", w)
+        _al.setFont(Fonts.mixed_small)
+        _al.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        top.addWidget(_al)
+        self._area_combo = QComboBox(w)
+        self._area_combo.setFont(Fonts.mixed_small)
+        self._area_combo.setFixedHeight(UIScale.px(26))
+        for a in self._AREA_ORDER:
+            self._area_combo.addItem(self._AREA_LABEL[a])
+        self._area_combo.currentIndexChanged.connect(self._refresh_area_details)
+        top.addWidget(self._area_combo)
+        top.addStretch()
+        lay.addLayout(top)
+
+        # Split: left = item table, right = events + travel
+        split = QHBoxLayout()
+        split.setSpacing(UIScale.px(8))
+
+        left = self.make_panel(w, object_name="card")
+        ll   = QVBoxLayout(left)
+        ll.setContentsMargins(
+            UIScale.px(10), UIScale.px(8), UIScale.px(10), UIScale.px(8))
+        ll.setSpacing(UIScale.px(4))
+
+        self._area_name_lbl = QLabel("", left)
+        self._area_name_lbl.setFont(Fonts.mixed_bold)
+        self._area_name_lbl.setStyleSheet(
+            f"color:{P.gold}; background:transparent;")
+        ll.addWidget(self._area_name_lbl)
+
+        self._area_desc_lbl = QLabel("", left)
+        self._area_desc_lbl.setFont(Fonts.mixed_small)
+        self._area_desc_lbl.setWordWrap(True)
+        self._area_desc_lbl.setStyleSheet(
+            f"color:{P.fg_dim}; background:transparent;")
+        ll.addWidget(self._area_desc_lbl)
+
+        self._area_meta_lbl = QLabel("", left)
+        self._area_meta_lbl.setFont(Fonts.tiny)
+        self._area_meta_lbl.setStyleSheet(
+            f"color:{P.fg_dim}; background:transparent;")
+        ll.addWidget(self._area_meta_lbl)
+
+        _sep = QFrame(left)
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setFixedHeight(1)
+        _sep.setStyleSheet(f"background:{P.border}; border:none;")
+        ll.addWidget(_sep)
+
+        ALR = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        self._area_item_table = DataTable(left, [
+            ("item",     "Item",          150),
+            ("stock",    "Stock",          56, ALR),
+            ("price",    "Price",          64, ALR),
+            ("pressure", "Pressure",       72, ALR),
+            ("natural",  "Natural P",      72, ALR),
+            ("restock",  "Restock / d",    78, ALR),
+            ("status",   "Status",        110),
+        ], row_height=22)
+        ll.addWidget(self._area_item_table, 1)
+        split.addWidget(left, 2)
+
+        # Right sub-column
+        rc = QVBoxLayout()
+        rc.setSpacing(UIScale.px(8))
+
+        evt_card = self.make_panel(w, object_name="card")
+        el = QVBoxLayout(evt_card)
+        el.setContentsMargins(
+            UIScale.px(10), UIScale.px(8), UIScale.px(10), UIScale.px(8))
+        el.setSpacing(UIScale.px(4))
+        _eh = QLabel(f"{Sym.WARNING}  Active Events", evt_card)
+        _eh.setFont(Fonts.mixed_bold)
+        _eh.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        el.addWidget(_eh)
+        self._area_events_lbl = QLabel("None", evt_card)
+        self._area_events_lbl.setFont(Fonts.mixed_small)
+        self._area_events_lbl.setWordWrap(True)
+        self._area_events_lbl.setStyleSheet(
+            f"color:{P.fg}; background:transparent;")
+        el.addWidget(self._area_events_lbl)
+        rc.addWidget(evt_card)
+
+        trav_card = self.make_panel(w, object_name="card")
+        tl = QVBoxLayout(trav_card)
+        tl.setContentsMargins(
+            UIScale.px(10), UIScale.px(8), UIScale.px(10), UIScale.px(8))
+        tl.setSpacing(UIScale.px(4))
+        _th = QLabel(f"{Sym.TRAVEL}  Travel Times from Here", trav_card)
+        _th.setFont(Fonts.mixed_bold)
+        _th.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        tl.addWidget(_th)
+        ALC = Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        self._travel_table = DataTable(trav_card, [
+            ("dest",  "Destination",  110),
+            ("days",  "Days",          46, ALC),
+            ("risk",  "Road Risk",     66, ALC),
+            ("guard", "Guard",         56, ALC),
+        ], row_height=22)
+        tl.addWidget(self._travel_table, 1)
+        rc.addWidget(trav_card, 1)
+
+        split.addLayout(rc, 1)
+        lay.addLayout(split, 1)
+
+        self._tabs.addTab(w, f"{Sym.LOCATION}  Area Details")
+
+    def _build_trends_tab(self) -> None:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(
+            UIScale.px(4), UIScale.px(6), UIScale.px(4), UIScale.px(4))
+        lay.setSpacing(UIScale.px(6))
+
+        fr = QHBoxLayout()
+        fr.setSpacing(UIScale.px(8))
+        _il = QLabel("Commodity:", w)
+        _il.setFont(Fonts.mixed_small)
+        _il.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        fr.addWidget(_il)
+        self._trend_combo = QComboBox(w)
+        self._trend_combo.setFont(Fonts.mixed_small)
+        self._trend_combo.setFixedHeight(UIScale.px(26))
+        self._trend_combo.setMinimumWidth(UIScale.px(200))
+        self._trend_combo.currentIndexChanged.connect(self._refresh_trend)
+        fr.addWidget(self._trend_combo)
+        fr.addStretch()
+        self._trend_info_lbl = QLabel("", w)
+        self._trend_info_lbl.setFont(Fonts.mixed_small)
+        self._trend_info_lbl.setStyleSheet(
+            f"color:{P.fg_dim}; background:transparent;")
+        fr.addWidget(self._trend_info_lbl)
+        lay.addLayout(fr)
+
+        self._sparkline = _MultiAreaSparkline(w)
+        lay.addWidget(self._sparkline, 1)
+
+        self._tabs.addTab(w, f"{Sym.TREND_UP}  Price Trends")
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        g      = self.game
+        season = getattr(g, "season", Season.SPRING)
+        day    = getattr(g, "day", 1)
+
+        self._footer_lbl.setText(
+            f"Day {day}  ·  {season.name.title()}  ·  "
+            f"{len(ALL_ITEMS)} items  ·  {len(g.markets)} markets"
+        )
+        self._summary_lbl.setText(
+            f"Day {day}  ·  Season: {season.name.title()}"
+        )
+
+        # Build global price cache (no noise — deterministic comparison)
+        self._price_cache: Dict[str, Dict[Area, float]] = {}
+        for area, mkt in g.markets.items():
+            for key in mkt.item_keys:
+                p = mkt.get_price(key, season, noise=False)
+                self._price_cache.setdefault(key, {})[area] = p
+
+        routes = self._compute_routes(season)
+        self._routes_all_rows = routes
+
+        self._refresh_overview(season, routes)
+        self._refresh_matrix(season)
+        self._apply_routes_filter()
+        self._refresh_area_details()
+        self._refresh_trends_combo()
+
+    def on_show(self) -> None:
+        self.refresh()
+
+    # ── Overview ────────────────────────────────────────────────────────────
+
+    def _refresh_overview(self, season: Season, routes: List[Dict]) -> None:
+        g = self.game
+
+        self._stat_vals["items_tracked"].setText(str(len(ALL_ITEMS)))
+        self._stat_vals["areas_monitored"].setText(str(len(g.markets)))
+
+        alerts = self._compute_alerts()
+        self._stat_vals["alerts"].setText(str(len(alerts)))
+
+        if routes:
+            best = routes[0]
+            self._stat_vals["best_margin"].setText(best.get("margin_pct", "—"))
+            self._stat_vals["best_item"].setText(
+                f"{best.get('item', '—')}  {best.get('buy_area', '')}→{best.get('sell_area', '')}"
+            )
+        else:
+            self._stat_vals["best_margin"].setText("—")
+            self._stat_vals["best_item"].setText("—")
+
+        self._opp_table.load(routes[:16])
+
+        # Seasonal table
+        self._season_lbl.setText(f"Current: {season.name.title()}")
+        seas_rows = []
+        for item_key, season_dict in SEASONAL_DEMAND.items():
+            item = ALL_ITEMS.get(item_key)
+            if not item:
+                continue
+            mult = season_dict.get(season, 1.0)
+            if mult >= 1.2:
+                rec = "Strong demand — buy and hold"
+                tag = "green"
+            elif mult >= 1.1:
+                rec = "Elevated demand"
+                tag = "yellow"
+            elif mult <= 0.7:
+                rec = "Very soft — avoid buying"
+                tag = "red"
+            elif mult <= 0.9:
+                rec = "Below normal demand"
+                tag = "dim"
+            else:
+                continue
+            seas_rows.append({
+                "item": item.name,
+                "mult": f"×{mult:.2f}",
+                "rec":  rec,
+                "_tag": tag,
+                "_mult_val": mult,
+            })
+        seas_rows.sort(key=lambda r: r["_mult_val"], reverse=True)
+        self._seas_table.load(seas_rows)
+
+        self._alert_table.load(alerts[:20])
+
+    def _compute_alerts(self) -> List[Dict]:
+        rows = []
+        for area, mkt in self.game.markets.items():
+            for key, pressure in mkt.pressure.items():
+                item = ALL_ITEMS.get(key)
+                if not item:
+                    continue
+                if pressure >= 1.5:
+                    signal = "Price surge — prime sell spot"
+                    tag = "red"
+                elif pressure >= 1.3:
+                    signal = "Above normal — good to sell"
+                    tag = "yellow"
+                elif pressure <= 0.60:
+                    signal = "Severely depressed — buy deep discount"
+                    tag = "green"
+                elif pressure <= 0.75:
+                    signal = "Below normal — buy opportunity"
+                    tag = "yellow"
+                else:
+                    continue
+                rows.append({
+                    "item":     item.name,
+                    "area":     self._AREA_LABEL.get(area, area.name),
+                    "pressure": f"{pressure:.2f}",
+                    "signal":   signal,
+                    "_tag":     tag,
+                    "_dist":    abs(pressure - 1.0),
+                })
+        rows.sort(key=lambda r: r["_dist"], reverse=True)
+        return rows
+
+    # ── Price Matrix ────────────────────────────────────────────────────────
+
+    def _refresh_matrix(self, season: Season) -> None:
+        g    = self.game
+        rows = []
+
+        for item_key, item in sorted(
+            ALL_ITEMS.items(),
+            key=lambda kv: (kv[1].category.name, kv[1].name),
+        ):
+            by_area: Dict[Area, float] = {}
+            for area in self._AREA_ORDER:
+                mkt = g.markets.get(area)
+                if mkt and item_key in mkt.item_keys:
+                    by_area[area] = mkt.get_price(item_key, season, noise=False)
+
+            if not by_area:
+                continue
+
+            vals      = list(by_area.values())
+            min_p     = min(vals)
+            max_p     = max(vals)
+            best_buy  = min(by_area, key=by_area.get)
+            best_sell = max(by_area, key=by_area.get)
+            margin    = (max_p - min_p) / min_p * 100.0 if min_p > 0 else 0.0
+            trend     = self._trend_string(g, item_key)
+
+            row: Dict = {
+                "cat":        item.category.name[:3].title(),
+                "item":       item.name,
+                "base":       f"{item.base_price:.0f}g",
+                "best_buy":   self._AREA_LABEL.get(best_buy, ""),
+                "best_sell":  self._AREA_LABEL.get(best_sell, ""),
+                "margin_pct": f"{margin:.1f}%",
+                "trend":      trend,
+                "_item_key":  item_key,
+                "_margin":    margin,
+            }
+
+            for area in self._AREA_ORDER:
+                p = by_area.get(area)
+                if p is None:
+                    row[area.name] = "—"
+                elif area is best_buy and area is not best_sell:
+                    row[area.name] = f"{p:.0f}g ▼"   # cheapest
+                elif area is best_sell and area is not best_buy:
+                    row[area.name] = f"{p:.0f}g ▲"   # dearest
+                else:
+                    row[area.name] = f"{p:.0f}g"
+
+            if margin >= 40:
+                row["_tag"] = "green"
+            elif margin >= 20:
+                row["_tag"] = "yellow"
+            elif margin < 5:
+                row["_tag"] = "dim"
+
+            rows.append(row)
+
+        self._matrix_all_rows = rows
+        self._apply_matrix_filter()
+
+    def _apply_matrix_filter(self) -> None:
+        text    = getattr(self, "_matrix_search",
+                          None) and self._matrix_search.text().lower().strip()
+        cat_idx = getattr(self, "_matrix_cat", None) and self._matrix_cat.currentIndex()
+
+        cat_obj = None
+        if cat_idx and cat_idx > 0:
+            cat_obj = self._matrix_cat.currentData()
+
+        shown = []
+        for row in self._matrix_all_rows:
+            if text and text not in row["item"].lower():
+                continue
+            if cat_obj is not None:
+                item = ALL_ITEMS.get(row.get("_item_key", ""))
+                if item and item.category is not cat_obj:
+                    continue
+            shown.append(row)
+        self._matrix_table.load(shown)
+
+    # ── Trade Routes ─────────────────────────────────────────────────────────
+
+    def _compute_routes(self, season: Season) -> List[Dict]:
+        g      = self.game
+        routes = []
+
+        for item_key, item in ALL_ITEMS.items():
+            by_area: Dict[Area, tuple] = {}
+            for area in self._AREA_ORDER:
+                mkt = g.markets.get(area)
+                if mkt and item_key in mkt.item_keys:
+                    bp = mkt.get_buy_price(item_key, season, trading_skill=1)
+                    sp = mkt.get_sell_price(item_key, season, trading_skill=1)
+                    by_area[area] = (bp, sp)
+
+            if len(by_area) < 2:
+                continue
+
+            for ba, (buy_p, _) in by_area.items():
+                for sa, (_, sell_p) in by_area.items():
+                    if ba is sa:
+                        continue
+                    profit = sell_p - buy_p
+                    if profit <= 0:
+                        continue
+                    margin = profit / buy_p * 100.0 if buy_p > 0 else 0.0
+                    if margin < 2.0:
+                        continue
+
+                    days_ba = AREA_INFO.get(ba, {}).get("travel_days", {})
+                    t_days  = days_ba.get(sa, 99)
+                    risk    = round(
+                        (AREA_INFO.get(ba, {}).get("travel_risk", 0)
+                         + AREA_INFO.get(sa, {}).get("travel_risk", 0))
+                        / 2 * 100, 1
+                    )
+                    ppd = profit / max(t_days, 1)
+
+                    if margin >= 40:
+                        sig, tag = "Excellent", "green"
+                    elif margin >= 25:
+                        sig, tag = "Good",      "yellow"
+                    elif margin >= 10:
+                        sig, tag = "Fair",      "dim"
+                    else:
+                        sig, tag = "Marginal",  "dim"
+
+                    routes.append({
+                        "item":           item.name,
+                        "buy_area":       self._AREA_LABEL.get(ba, ba.name),
+                        "sell_area":      self._AREA_LABEL.get(sa, sa.name),
+                        "buy_price":      f"{buy_p:.1f}g",
+                        "sell_price":     f"{sell_p:.1f}g",
+                        "profit_unit":    f"{profit:.1f}g",
+                        "margin_pct":     f"{margin:.1f}%",
+                        "travel_days":    str(t_days),
+                        "travel_risk":    f"{risk:.0f}%",
+                        "profit_per_day": f"{ppd:.1f}g",
+                        "category":       item.category.name.replace("_", " ").title()[:12],
+                        "signal":         sig,
+                        "_tag":           tag,
+                        "_margin":        margin,
+                        "_ppd":           ppd,
+                        "_profit":        profit,
+                        "_days":          t_days,
+                    })
+
+        routes.sort(key=lambda r: r["_margin"], reverse=True)
+        return routes
+
+    def _apply_routes_filter(self) -> None:
+        if not hasattr(self, "_routes_all_rows"):
+            return
+        from_txt = self._route_from.currentText()
+        to_txt   = self._route_to.currentText()
+        min_m    = self._min_margin.value()
+        sort_txt = self._route_sort.currentText()
+
+        shown = []
+        for row in self._routes_all_rows:
+            if from_txt != "Any" and row["buy_area"] != from_txt:
+                continue
+            if to_txt != "Any" and row["sell_area"] != to_txt:
+                continue
+            if row["_margin"] < min_m:
+                continue
+            shown.append(row)
+
+        sort_map = {
+            "Margin %":      ("_margin",  True),
+            "Profit / Day":  ("_ppd",     True),
+            "Profit / Unit": ("_profit",  True),
+            "Travel Days":   ("_days",    False),
+        }
+        sk, rev = sort_map.get(sort_txt, ("_margin", True))
+        shown.sort(key=lambda r: r.get(sk, 0), reverse=rev)
+        self._routes_table.load(shown)
+
+    # ── Area Details ─────────────────────────────────────────────────────────
+
+    def _refresh_area_details(self) -> None:
+        g      = self.game
+        season = getattr(g, "season", Season.SPRING)
+        idx    = self._area_combo.currentIndex()
+        if idx < 0 or idx >= len(self._AREA_ORDER):
+            return
+        area   = self._AREA_ORDER[idx]
+        info   = AREA_INFO.get(area, {})
+        mkt    = g.markets.get(area)
+
+        label  = self._AREA_LABEL.get(area, area.name)
+        guard  = info.get("guard_strength", 0)
+        guard_stars = ("★" * guard) if guard else "—"
+        self._area_name_lbl.setText(
+            f"{label}   ·   Guard: {guard_stars}"
+        )
+        self._area_desc_lbl.setText(info.get("description", ""))
+        risk_pct = round(info.get("travel_risk", 0) * 100, 1)
+        self._area_meta_lbl.setText(
+            f"Inherent travel risk: {risk_pct}%   ·   "
+            f"Guard strength: {guard}"
+        )
+
+        # Item table
+        item_rows: List[Dict] = []
+        if mkt:
+            for key in sorted(
+                mkt.item_keys,
+                key=lambda k: getattr(ALL_ITEMS.get(k), "name", k),
+            ):
+                item  = ALL_ITEMS.get(key)
+                if not item:
+                    continue
+                stock    = mkt.stock.get(key, 0)
+                pressure = mkt.pressure.get(key, 1.0)
+                nat_p    = mkt.natural_pressure.get(key, 1.0)
+                restock  = mkt.daily_restock.get(key, 0)
+                price    = mkt.get_price(key, season, noise=False)
+
+                if pressure >= 1.4:
+                    status, tag = "High demand", "red"
+                elif pressure >= 1.15:
+                    status, tag = "Elevated",    "yellow"
+                elif pressure <= 0.65:
+                    status, tag = "Depressed",   "green"
+                elif pressure <= 0.85:
+                    status, tag = "Below normal","yellow"
+                elif stock < 10:
+                    status, tag = "Scarce",      "amber"
+                else:
+                    status, tag = "Normal",      "dim"
+
+                item_rows.append({
+                    "item":     item.name,
+                    "stock":    str(stock),
+                    "price":    f"{price:.0f}g",
+                    "pressure": f"{pressure:.2f}",
+                    "natural":  f"{nat_p:.2f}",
+                    "restock":  f"+{restock}/d",
+                    "status":   status,
+                    "_tag":     tag,
+                })
+
+        self._area_item_table.load(item_rows)
+        events_txt = (
+            "\n".join(mkt.active_events) if mkt and mkt.active_events else "None"
+        )
+        self._area_events_lbl.setText(events_txt)
+
+        # Travel-time table from this area
+        trav_rows: List[Dict] = []
+        t_days_map = info.get("travel_days", {})
+        for dest in self._AREA_ORDER:
+            if dest is area:
+                continue
+            days  = t_days_map.get(dest, "?")
+            risk  = round(AREA_INFO.get(dest, {}).get("travel_risk", 0) * 100, 0)
+            g_str = AREA_INFO.get(dest, {}).get("guard_strength", 0)
+            trav_rows.append({
+                "dest":  self._AREA_LABEL.get(dest, dest.name),
+                "days":  str(days),
+                "risk":  f"{risk:.0f}%",
+                "guard": "★" * g_str if g_str else "—",
+            })
+        self._travel_table.load(trav_rows)
+
+    # ── Price Trends ────────────────────────────────────────────────────────
+
+    def _refresh_trends_combo(self) -> None:
+        g    = self.game
+        prev = self._trend_combo.currentText()
+        self._trend_combo.blockSignals(True)
+        self._trend_combo.clear()
+        all_keys = sorted(
+            {k for mkt in g.markets.values()
+             for k in mkt.item_keys if k in ALL_ITEMS},
+            key=lambda k: ALL_ITEMS[k].name,
+        )
+        for k in all_keys:
+            self._trend_combo.addItem(ALL_ITEMS[k].name, userData=k)
+        for i in range(self._trend_combo.count()):
+            if self._trend_combo.itemText(i) == prev:
+                self._trend_combo.setCurrentIndex(i)
+                break
+        self._trend_combo.blockSignals(False)
+        self._refresh_trend()
+
+    def _refresh_trend(self) -> None:
+        g   = self.game
+        idx = self._trend_combo.currentIndex()
+        if idx < 0:
+            return
+        item_key = self._trend_combo.itemData(idx)
+        if not item_key:
+            return
+
+        histories: Dict[Area, List[float]] = {}
+        for area in self._AREA_ORDER:
+            mkt  = g.markets.get(area)
+            if mkt and item_key in mkt.item_keys:
+                hist = list(mkt.history.get(item_key, []))
+                if hist:
+                    histories[area] = [
+                        pp.price if hasattr(pp, "price") else float(pp)
+                        for pp in hist
+                    ]
+
+        item   = ALL_ITEMS.get(item_key)
+        base   = item.base_price if item else 1.0
+        labels = {a: self._AREA_LABEL.get(a, a.name) for a in histories}
+        self._sparkline.set_data(histories, labels, base)
+
+        season = getattr(g, "season", Season.SPRING)
+        prices: Dict[Area, float] = {}
+        for area in self._AREA_ORDER:
+            mkt = g.markets.get(area)
+            if mkt and item_key in mkt.item_keys:
+                prices[area] = mkt.get_price(item_key, season, noise=False)
+
+        if prices:
+            lo_a  = min(prices, key=prices.get)
+            hi_a  = max(prices, key=prices.get)
+            lo_v, hi_v = prices[lo_a], prices[hi_a]
+            spread = hi_v - lo_v
+            margin = spread / lo_v * 100.0 if lo_v > 0 else 0.0
+            self._trend_info_lbl.setText(
+                f"Base: {base:.0f}g  ·  "
+                f"Low: {lo_v:.0f}g ({self._AREA_LABEL.get(lo_a, '')})  ·  "
+                f"High: {hi_v:.0f}g ({self._AREA_LABEL.get(hi_a, '')})  ·  "
+                f"Spread: {spread:.0f}g  ({margin:.1f}% margin)"
+            )
+        else:
+            self._trend_info_lbl.setText(f"Base price: {base:.0f}g — no market data yet")
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _trend_string(g, item_key: str) -> str:
+        """Summarise 30-day trend direction from price history across all markets."""
+        recent_avgs: List[float] = []
+        older_avgs:  List[float] = []
+        for mkt in g.markets.values():
+            hist = list(mkt.history.get(item_key, []))
+            if len(hist) >= 6:
+                prices = [pp.price if hasattr(pp, "price") else float(pp) for pp in hist]
+                recent_avgs.append(sum(prices[-3:]) / 3)
+                older_avgs.append(sum(prices[:3]) / 3)
+        if not recent_avgs:
+            return "—"
+        r = sum(recent_avgs) / len(recent_avgs)
+        o = sum(older_avgs)  / len(older_avgs)
+        d = (r - o) / max(o, 1.0)
+        if d >  0.10: return "↑↑ Rising fast"
+        if d >  0.04: return "↑ Rising"
+        if d < -0.10: return "↓↓ Falling fast"
+        if d < -0.04: return "↓ Falling"
+        return "→ Stable"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUITOR CATALOGUE  —  courtship & marriage data definitions
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _SuitorDef:
+    sid:             str
+    name:            str
+    gender:          str         # "F" / "M" / "N"
+    title:           str
+    tier:            str         # "common" / "noble" / "merchant" / "royal"
+    portrait:        str         # decorative emoji label
+    flavour:         str
+    court_hours:     float       # real-time hours required at each stage
+    court_actions:   int         # interaction count required
+    court_gifts:     int         # gifts required
+    dowry_gold:      float       # gold given to player on marriage (F partners)
+    perm_perk_desc:  str
+    perm_perk:       Dict        # {"type": value}
+    daily_perk_desc: List[str]   # [level0, level1, level2]
+    daily_perk:      List[Dict]  # [{type:val},…] per level
+
+_SUITOR_CATALOGUE: List[_SuitorDef] = [
+    # ── COMMON ──────────────────────────────────────────────────────────────
+    _SuitorDef(
+        sid="mira", name="Mira",
+        gender="F", title="Innkeeper of the Old Salt",
+        tier="common", portrait="🍺",
+        flavour="Mira runs the warmest common-room in the city. She has strong opinions about ale, honest dealings, and the kind of person worth keeping close. She notices things most people miss.",
+        court_hours=0.5, court_actions=4, court_gifts=1,
+        dowry_gold=300.0,
+        perm_perk_desc="+3% trade profit on all sales (her merchant contacts)",
+        perm_perk={"trade_pct": 3.0},
+        daily_perk_desc=[
+            "Her warmth steadies your nerves. +5 reputation gained today.",
+            "Her warm words open doors. +8 reputation gained today.",
+            "Mira introduces you to her regulars. +12 reputation gained today.",
+        ],
+        daily_perk=[{"rep_flat": 5}, {"rep_flat": 8}, {"rep_flat": 12}],
+    ),
+    _SuitorDef(
+        sid="aldwin", name="Aldwin",
+        gender="M", title="Scribe & Archivist",
+        tier="common", portrait="📜",
+        flavour="Aldwin keeps the records of half the merchants in the district. He is quiet, careful with words, and can spot a bad contract at a glance. He makes excellent tea.",
+        court_hours=0.5, court_actions=4, court_gifts=1,
+        dowry_gold=0.0,
+        perm_perk_desc="+1 daily time unit each morning (his efficient scheduling)",
+        perm_perk={"time_unit": 1},
+        daily_perk_desc=[
+            "Aldwin reviewed your contracts. Deadlines extended by 1 day.",
+            "Aldwin drafted letters on your behalf. Contracts +1 day and -5% penalty.",
+            "Aldwin networks tirelessly for you. Contracts +2 days, -10% penalty, +5 rep.",
+        ],
+        daily_perk=[{"contract_days": 1}, {"contract_days": 1, "contract_penalty_pct": -5}, {"contract_days": 2, "contract_penalty_pct": -10, "rep_flat": 5}],
+    ),
+    # ── NOBLE ───────────────────────────────────────────────────────────────
+    _SuitorDef(
+        sid="elara", name="Lady Elara",
+        gender="F", title="Daughter of House Elara, Keeper of the Coin",
+        tier="noble", portrait="🌷",
+        flavour="Lady Elara manages her family's estate with cool precision. She has never needed saving and does not plan to start. She values competence above all else.",
+        court_hours=2.0, court_actions=8, court_gifts=3,
+        dowry_gold=2000.0,
+        perm_perk_desc="+5% on all sell prices permanently (noble contacts)",
+        perm_perk={"trade_pct": 5.0},
+        daily_perk_desc=[
+            "Lady Elara's name opens doors. +15 reputation gained today.",
+            "Her recommendation precedes you. +22 reputation gained today.",
+            "The city speaks of your match. +30 reputation + rep cannot fall today.",
+        ],
+        daily_perk=[{"rep_flat": 15}, {"rep_flat": 22}, {"rep_flat": 30, "rep_shield": True}],
+    ),
+    _SuitorDef(
+        sid="gareth", name="Lord Gareth",
+        gender="M", title="Lord Gareth, Warden of the Northern Pass",
+        tier="noble", portrait="⚔",
+        flavour="Lord Gareth spent a decade commanding trade escorts along the mountain routes. He knows every bandit trail and safe shortcut. He travels light and expects the same.",
+        court_hours=2.0, court_actions=8, court_gifts=3,
+        dowry_gold=0.0,
+        perm_perk_desc="Travel costs reduced by 15% (his road knowledge)",
+        perm_perk={"travel_cost_pct": -15.0},
+        daily_perk_desc=[
+            "Gareth's scouts cleared the route. No heat gain from trades today.",
+            "His guards patrol your routes. No heat gain + travel is 1 day faster.",
+            "Gareth personally escorts your cargo. No heat, travel -1 day, +5 rep.",
+        ],
+        daily_perk=[{"no_heat": True}, {"no_heat": True, "travel_days": -1}, {"no_heat": True, "travel_days": -1, "rep_flat": 5}],
+    ),
+    # ── MERCHANT ────────────────────────────────────────────────────────────
+    _SuitorDef(
+        sid="vivienne", name="Countess Vivienne",
+        gender="F", title="Countess Vivienne, Mistress of the Merchant League",
+        tier="merchant", portrait="💎",
+        flavour="Countess Vivienne controls a network of trade agreements stretching across three kingdoms. She is charming, ruthless, and extraordinarily expensive to wine and dine. Worth every coin.",
+        court_hours=6.0, court_actions=15, court_gifts=6,
+        dowry_gold=8000.0,
+        perm_perk_desc="Haggling effective skill +1 permanently (her negotiation lessons)",
+        perm_perk={"haggle_bonus": 1},
+        daily_perk_desc=[
+            "Her market intelligence is yours. +25% trade profit on all sales today.",
+            "Her trade network routes goods to premium buyers. +35% trade profit today.",
+            "Vivienne personally supervises your trades. +50% trade profit today.",
+        ],
+        daily_perk=[{"trade_pct": 25}, {"trade_pct": 35}, {"trade_pct": 50}],
+    ),
+    _SuitorDef(
+        sid="dorian", name="Dorian",
+        gender="M", title="Dorian Fairweather, Merchant Prince of the Coast",
+        tier="merchant", portrait="🚢",
+        flavour="Dorian turned a leaky fishing boat into a coastal trading empire. He is generous with coin and short with complaints. His handshake is as good as any contract.",
+        court_hours=6.0, court_actions=15, court_gifts=6,
+        dowry_gold=0.0,
+        perm_perk_desc="Contract failure penalties reduced by 20% (his legal connections)",
+        perm_perk={"contract_penalty_pct": -20.0},
+        daily_perk_desc=[
+            "Dorian's fleet takes your orders today. Business output +20%.",
+            "His logistics are yours. Business output +30% + contracts extend 1 day.",
+            "The Prince's full network at your disposal. Output +40%, contracts +2 days.",
+        ],
+        daily_perk=[{"biz_output": 20}, {"biz_output": 30, "contract_days": 1}, {"biz_output": 40, "contract_days": 2}],
+    ),
+    # ── ROYAL ───────────────────────────────────────────────────────────────
+    _SuitorDef(
+        sid="seraphina", name="Princess Seraphina",
+        gender="F", title="Her Royal Highness, Princess Seraphina of the Golden Realm",
+        tier="royal", portrait="👑",
+        flavour="Princess Seraphina chose commerce over court long ago. She has read every economics treatise worth reading and written two more. She does not suffer fools. She chooses partners the way she chooses investments: for long-term value.",
+        court_hours=24.0, court_actions=30, court_gifts=12,
+        dowry_gold=30000.0,
+        perm_perk_desc="+20% on all gold income permanently (royal treasury backing)",
+        perm_perk={"income_pct": 20.0},
+        daily_perk_desc=[
+            "Royal favour shines on you. +30 reputation + reputation cannot decay today.",
+            "The Princess issues a royal commendation. +45 rep + no rep decay + +10% prices.",
+            "Her blessing transforms your standing. +60 rep + no decay + +20% all prices.",
+        ],
+        daily_perk=[{"rep_flat": 30, "rep_shield": True}, {"rep_flat": 45, "rep_shield": True, "trade_pct": 10}, {"rep_flat": 60, "rep_shield": True, "trade_pct": 20}],
+    ),
+    _SuitorDef(
+        sid="aldric", name="Duke Aldric",
+        gender="M", title="His Grace, Duke Aldric, Master of the Trade Winds",
+        tier="royal", portrait="⚜",
+        flavour="Duke Aldric commands the loyalty of three port cities and the respect of every admiral in the known world. He speaks little, acts decisively, and remembers every favour given and owed. A marriage to the Duke changes everything.",
+        court_hours=24.0, court_actions=30, court_gifts=12,
+        dowry_gold=0.0,
+        perm_perk_desc="Travel days reduced by 1 (min 1) on all routes (his road authority)",
+        perm_perk={"travel_days": -1},
+        daily_perk_desc=[
+            "Aldric's name clears your path. Heat reduced by 20 today + travel -1 day.",
+            "His authority suppresses all opposition. Heat -30 + travel -1 + +10 rep.",
+            "The Duke's full power behind you. Heat -40, travel -2 days, +20 rep.",
+        ],
+        daily_perk=[{"heat_flat": -20, "travel_days": -1}, {"heat_flat": -30, "travel_days": -1, "rep_flat": 10}, {"heat_flat": -40, "travel_days": -2, "rep_flat": 20}],
+    ),
+]
+
+_SUITOR_BY_ID: Dict[str, _SuitorDef] = {s.sid: s for s in _SUITOR_CATALOGUE}
+
+_GIFT_SHOP: List[Dict] = [
+    {"name": "Wildflowers",   "cost": 15,   "xp_bonus": 2,  "icon": "🌸"},
+    {"name": "Fine Wine",     "cost": 60,   "xp_bonus": 5,  "icon": "🍷"},
+    {"name": "Silk Ribbon",   "cost": 150,  "xp_bonus": 8,  "icon": "🎀"},
+    {"name": "Golden Brooch", "cost": 500,  "xp_bonus": 18, "icon": "📿"},
+    {"name": "Gemstone Ring", "cost": 1500, "xp_bonus": 40, "icon": "💍"},
+]
+
+# Relationship XP thresholds for levelling up (cumulative)
+_REL_XP_LEVELS = [0, 100, 500]   # level 0 = 0 XP, level 1 = 100 XP, level 2 = 500 XP
+
+# Tier colours
+_TIER_COLOUR: Dict[str, str] = {
+    "common":   P.fg_dim,
+    "noble":    P.amber,
+    "merchant": P.gold,
+    "royal":    "#d4aaff",
+}
+_TIER_LABEL: Dict[str, str] = {
+    "common":   "Common",
+    "noble":    "Noble",
+    "merchant": "Merchant Prince",
+    "royal":    "Royal",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUITOR SCREEN  —  courtship, marriage, and relationship management
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SuitorScreen(Screen):
+    """
+    Romance and marriage screen.
+
+    Left panel  – scrollable list of suitors with tier badge and courtship progress.
+    Right panel – detail view with portrait, flavour text, progress bars, action btns.
+    Married tab – spouse card with relationship XP, daily visit button, divorce option.
+    """
+
+    _HEARTS = ["♥", "❤", "💕", "💖", "💗", "💘", "💝"]
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(UIScale.px(14), UIScale.px(12),
+                                UIScale.px(14), UIScale.px(12))
+        root.setSpacing(UIScale.px(8))
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr_lbl = QLabel("  ♥  Courtship & Marriage  ♥", self)
+        hdr_lbl.setFont(Fonts.title)
+        hdr_lbl.setStyleSheet(f"color:{P.rose if hasattr(P,'rose') else '#e87aa0'}; background:transparent;")
+        hdr.addWidget(hdr_lbl)
+        hdr.addStretch()
+        hdr.addWidget(self.back_button())
+        root.addLayout(hdr)
+
+        sep = QFrame(self)
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{P.border_light}; border:none;")
+        root.addWidget(sep)
+
+        # ── Tabs ──────────────────────────────────────────────────────────────
+        self._tabs = QTabWidget(self)
+        self._tabs.setFont(Fonts.mixed_small)
+        self._tabs.setStyleSheet(f"""
+            QTabWidget::pane  {{ border:1px solid {P.border}; background:{P.bg_panel}; border-radius:{UIScale.px(5)}px; }}
+            QTabBar::tab      {{ background:{P.bg}; color:{P.fg_dim}; padding:{UIScale.px(6)}px {UIScale.px(16)}px;
+                                 border:1px solid {P.border}; border-bottom:none;
+                                 border-top-left-radius:{UIScale.px(4)}px; border-top-right-radius:{UIScale.px(4)}px; }}
+            QTabBar::tab:selected {{ background:{P.bg_panel}; color:{P.gold}; border-bottom:1px solid {P.bg_panel}; }}
+            QTabBar::tab:hover {{ color:{P.amber}; }}
+        """)
+
+        self._suitors_tab = QWidget()
+        self._married_tab = QWidget()
+        self._tabs.addTab(self._suitors_tab, "  💕  Available Suitors")
+        self._tabs.addTab(self._married_tab, "  💍  My Spouse")
+        root.addWidget(self._tabs, 1)
+
+        self._build_suitors_tab()
+        self._build_married_tab()
+
+        # ── Heartbeat animation timer ──────────────────────────────────────
+        self._heart_timer = QTimer(self)
+        self._heart_timer.timeout.connect(self._pulse_header)
+        self._heart_timer.start(1800)
+        self._pulse_state = 0
+
+        # ── Daily refresh timer ───────────────────────────────────────────
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self.refresh)
+        self._refresh_timer.start(5000)
+
+    def _build_suitors_tab(self) -> None:
+        lay = QHBoxLayout(self._suitors_tab)
+        lay.setContentsMargins(UIScale.px(8), UIScale.px(8),
+                               UIScale.px(8), UIScale.px(8))
+        lay.setSpacing(UIScale.px(10))
+
+        # ── Left: suitor list ──────────────────────────────────────────────
+        list_frame = QFrame(self._suitors_tab)
+        list_frame.setObjectName("dashPanel")
+        list_frame.setFixedWidth(UIScale.px(220))
+        list_lay = QVBoxLayout(list_frame)
+        list_lay.setContentsMargins(UIScale.px(6), UIScale.px(6),
+                                    UIScale.px(6), UIScale.px(6))
+        list_lay.setSpacing(UIScale.px(4))
+
+        lf_title = QLabel("  Eligible Suitors", list_frame)
+        lf_title.setFont(Fonts.mixed_bold)
+        lf_title.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        list_lay.addWidget(lf_title)
+
+        self._suitor_list = QListWidget(list_frame)
+        self._suitor_list.setStyleSheet(f"""
+            QListWidget {{
+                background:{P.bg}; border:1px solid {P.border};
+                border-radius:{UIScale.px(4)}px; color:{P.fg};
+                outline:none;
+            }}
+            QListWidget::item {{ padding:{UIScale.px(6)}px {UIScale.px(8)}px; border-radius:{UIScale.px(3)}px; }}
+            QListWidget::item:selected {{ background:{P.amber}; color:#1a1a1a; }}
+            QListWidget::item:hover    {{ background:{P.bg_panel}; }}
+        """)
+        self._suitor_list.setFont(Fonts.body_small)
+        self._suitor_list.currentRowChanged.connect(self._on_suitor_selected)
+        list_lay.addWidget(self._suitor_list, 1)
+        lay.addWidget(list_frame)
+
+        # ── Right: detail panel ────────────────────────────────────────────
+        self._detail_scroll = QScrollArea(self._suitors_tab)
+        self._detail_scroll.setWidgetResizable(True)
+        self._detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._detail_scroll.setStyleSheet("background:transparent; border:none;")
+        self._detail_inner = QWidget()
+        self._detail_inner.setStyleSheet("background:transparent;")
+        self._detail_lay = QVBoxLayout(self._detail_inner)
+        self._detail_lay.setContentsMargins(UIScale.px(4), UIScale.px(4),
+                                            UIScale.px(4), UIScale.px(4))
+        self._detail_lay.setSpacing(UIScale.px(10))
+        self._detail_scroll.setWidget(self._detail_inner)
+        lay.addWidget(self._detail_scroll, 1)
+
+        self._current_suitor_sid: Optional[str] = None
+        self._detail_widgets: Dict = {}
+
+    def _build_married_tab(self) -> None:
+        lay = QVBoxLayout(self._married_tab)
+        lay.setContentsMargins(UIScale.px(12), UIScale.px(12),
+                               UIScale.px(12), UIScale.px(12))
+        lay.setSpacing(UIScale.px(10))
+
+        self._married_inner = QWidget(self._married_tab)
+        inner_lay = QVBoxLayout(self._married_inner)
+        inner_lay.setContentsMargins(0, 0, 0, 0)
+        inner_lay.setSpacing(UIScale.px(10))
+        lay.addWidget(self._married_inner, 1)
+
+        # placeholder shown when not married
+        self._no_spouse_lbl = QLabel(
+            "  💔  You are not yet married.\n\n"
+            "  Court a suitor from the Available Suitors tab to begin.",
+            self._married_tab
+        )
+        self._no_spouse_lbl.setFont(Fonts.mixed_small)
+        self._no_spouse_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        self._no_spouse_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._no_spouse_lbl)
+        lay.addStretch()
+
+        # spouse card (shown when married, hidden otherwise)
+        self._spouse_card = QFrame(self._married_tab)
+        self._spouse_card.setObjectName("dashPanel")
+        self._spouse_card.setStyleSheet(f"""
+            QFrame#dashPanel {{
+                background:{P.bg_panel};
+                border:2px solid {'#d4aaff'};
+                border-radius:{UIScale.px(10)}px;
+            }}
+        """)
+        sc_lay = QVBoxLayout(self._spouse_card)
+        sc_lay.setContentsMargins(UIScale.px(16), UIScale.px(14),
+                                  UIScale.px(16), UIScale.px(14))
+        sc_lay.setSpacing(UIScale.px(10))
+
+        # portrait + info row
+        top_row = QHBoxLayout()
+        self._sp_portrait = QLabel("💍", self._spouse_card)
+        self._sp_portrait.setFont(Fonts.icon)
+        self._sp_portrait.setStyleSheet("background:transparent; font-size:48px;")
+        self._sp_portrait.setFixedWidth(UIScale.px(70))
+        self._sp_portrait.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_row.addWidget(self._sp_portrait)
+
+        name_col = QVBoxLayout()
+        self._sp_name_lbl = QLabel("", self._spouse_card)
+        self._sp_name_lbl.setFont(Fonts.title)
+        self._sp_name_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        self._sp_title_lbl = QLabel("", self._spouse_card)
+        self._sp_title_lbl.setFont(Fonts.mixed_small)
+        self._sp_title_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        self._sp_tier_lbl = QLabel("", self._spouse_card)
+        self._sp_tier_lbl.setFont(Fonts.mixed_small)
+        self._sp_tier_lbl.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        name_col.addWidget(self._sp_name_lbl)
+        name_col.addWidget(self._sp_title_lbl)
+        name_col.addWidget(self._sp_tier_lbl)
+        top_row.addLayout(name_col, 1)
+        sc_lay.addLayout(top_row)
+
+        sc_sep = QFrame(self._spouse_card)
+        sc_sep.setFrameShape(QFrame.Shape.HLine)
+        sc_sep.setFixedHeight(1)
+        sc_sep.setStyleSheet(f"background:{P.border}; border:none;")
+        sc_lay.addWidget(sc_sep)
+
+        # perks area
+        self._sp_perm_lbl = QLabel("", self._spouse_card)
+        self._sp_perm_lbl.setFont(Fonts.mixed_small)
+        self._sp_perm_lbl.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        self._sp_perm_lbl.setWordWrap(True)
+        sc_lay.addWidget(self._sp_perm_lbl)
+
+        # relationship XP bar
+        xp_row = QHBoxLayout()
+        xp_lbl = QLabel("Relationship:", self._spouse_card)
+        xp_lbl.setFont(Fonts.mixed_small)
+        xp_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        xp_row.addWidget(xp_lbl)
+        self._sp_xp_bar = QProgressBar(self._spouse_card)
+        self._sp_xp_bar.setFixedHeight(UIScale.px(14))
+        self._sp_xp_bar.setStyleSheet(f"""
+            QProgressBar {{ background:{P.bg}; border:1px solid {P.border};
+                            border-radius:{UIScale.px(5)}px; text-align:center;
+                            color:{P.fg}; font-size:{UIScale.px(9)}px; }}
+            QProgressBar::chunk {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #e87aa0, stop:1 {P.gold}); border-radius:{UIScale.px(4)}px; }}
+        """)
+        xp_row.addWidget(self._sp_xp_bar, 1)
+        self._sp_level_lbl = QLabel("Level 0", self._spouse_card)
+        self._sp_level_lbl.setFont(Fonts.mixed_small)
+        self._sp_level_lbl.setStyleSheet(f"color:{P.gold}; background:transparent;")
+        xp_row.addWidget(self._sp_level_lbl)
+        sc_lay.addLayout(xp_row)
+
+        # daily perk status
+        self._sp_daily_lbl = QLabel("", self._spouse_card)
+        self._sp_daily_lbl.setFont(Fonts.mixed_small)
+        self._sp_daily_lbl.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        self._sp_daily_lbl.setWordWrap(True)
+        sc_lay.addWidget(self._sp_daily_lbl)
+
+        btn_row = QHBoxLayout()
+        self._visit_btn = MtButton("  💕  Visit Today", self._spouse_card, role="primary")
+        self._visit_btn.setFixedHeight(UIScale.px(38))
+        self._visit_btn.clicked.connect(self._do_daily_visit)
+        btn_row.addWidget(self._visit_btn, 1)
+
+        self._divorce_btn = MtButton("  💔  Seek Divorce", self._spouse_card, role="danger")
+        self._divorce_btn.setFixedHeight(UIScale.px(38))
+        self._divorce_btn.clicked.connect(self._do_divorce)
+        btn_row.addWidget(self._divorce_btn)
+        sc_lay.addLayout(btn_row)
+
+        lay.addWidget(self._spouse_card)
+        self._spouse_card.setVisible(False)
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        g = self.game
+        ms = g.marriage_state
+        married = bool(ms.get("spouse_id"))
+
+        # Update available suitors list
+        self._populate_suitor_list()
+
+        # Refresh detail for currently selected suitor
+        if self._current_suitor_sid:
+            self._refresh_detail(self._current_suitor_sid)
+
+        # Married tab
+        self._no_spouse_lbl.setVisible(not married)
+        self._spouse_card.setVisible(married)
+        if married:
+            self._refresh_spouse_card()
+
+        # Switch to married tab if just got married and no suitor selected
+        if married and self._tabs.currentIndex() == 0 and not self._current_suitor_sid:
+            self._tabs.setCurrentIndex(1)
+
+    def on_show(self) -> None:
+        self.refresh()
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_ui_click()
+
+    # ── Suitor list ───────────────────────────────────────────────────────────
+
+    def _populate_suitor_list(self) -> None:
+        try:
+            g = self.game
+            ms = g.marriage_state
+            married_sid = ms.get("spouse_id")
+            prev_row = self._suitor_list.currentRow()
+
+            self._suitor_list.blockSignals(True)
+            self._suitor_list.clear()
+            for s in _SUITOR_CATALOGUE:
+                if s.sid == married_sid:
+                    continue  # spouse not in available list
+                court = g.suitor_courtship.get(s.sid, {})
+                status = self._court_status_str(s, court, g)
+                tier_col = _TIER_COLOUR.get(s.tier, P.fg)
+                item = QListWidgetItem(f"  {s.portrait}  {s.name}")
+                item.setData(Qt.ItemDataRole.UserRole, s.sid)
+                item.setForeground(QColor(tier_col))
+                item.setToolTip(f"{_TIER_LABEL.get(s.tier, s.tier)}  —  {status}")
+                self._suitor_list.addItem(item)
+            self._suitor_list.blockSignals(False)
+
+            if prev_row >= 0:
+                self._suitor_list.setCurrentRow(min(prev_row, self._suitor_list.count() - 1))
+        except RuntimeError:
+            for attr in ("_heart_timer", "_refresh_timer"):
+                t = getattr(self, attr, None)
+                if t is not None:
+                    try:
+                        t.stop()
+                    except RuntimeError:
+                        pass
+
+    def _court_status_str(self, s: "_SuitorDef", court: dict, g) -> str:
+        if not court:
+            return "Not yet courted"
+        elapsed_h = (g.time_played_seconds - court.get("started_real", 0.0)) / 3600.0
+        div_penalty = 1.0 + 0.5 * g.marriage_state.get("divorce_count", 0)
+        req_h = s.court_hours * div_penalty
+        req_a = s.court_actions
+        req_g = s.court_gifts
+        act = court.get("actions", 0)
+        gifts = court.get("gifts", 0)
+        time_ok  = elapsed_h >= req_h
+        act_ok   = act >= req_a
+        gift_ok  = gifts >= req_g
+        if time_ok and act_ok and gift_ok:
+            return "✓ Ready to propose!"
+        parts = []
+        if not time_ok:
+            remain_h = req_h - elapsed_h
+            if remain_h >= 1:
+                parts.append(f"⏱ {remain_h:.1f}h")
+            else:
+                parts.append(f"⏱ {remain_h * 60:.0f}m")
+        if not act_ok:
+            parts.append(f"💬 {act}/{req_a}")
+        if not gift_ok:
+            parts.append(f"🎁 {gifts}/{req_g}")
+        return "  ".join(parts)
+
+    # ── Detail panel ──────────────────────────────────────────────────────────
+
+    def _on_suitor_selected(self, row: int) -> None:
+        item = self._suitor_list.item(row)
+        if not item:
+            return
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if sid:
+            self._current_suitor_sid = sid
+            self._refresh_detail(sid)
+
+    def _refresh_detail(self, sid: str) -> None:
+        s = _SUITOR_BY_ID.get(sid)
+        if not s:
+            return
+
+        # Replace the entire container widget so old children are never re-used.
+        # Trying to clear a QVBoxLayout that holds nested QHBoxLayouts leaves
+        # the sub-widgets alive and parented to the old inner widget, causing
+        # visual stacking and eventual crashes when they are repainted.
+        new_inner = QWidget()
+        new_inner.setStyleSheet("background:transparent;")
+        self._detail_inner = new_inner
+        self._detail_lay = QVBoxLayout(new_inner)
+        self._detail_lay.setContentsMargins(UIScale.px(4), UIScale.px(4),
+                                            UIScale.px(4), UIScale.px(4))
+        self._detail_lay.setSpacing(UIScale.px(10))
+        self._detail_widgets = {}
+
+        g = self.game
+        court = g.suitor_courtship.get(sid, {})
+        div_penalty = 1.0 + 0.5 * g.marriage_state.get("divorce_count", 0)
+
+        # Portrait + name
+        top = QHBoxLayout()
+        portrait_lbl = QLabel(s.portrait, self._detail_inner)
+        portrait_lbl.setStyleSheet("background:transparent; font-size:40px;")
+        portrait_lbl.setFixedWidth(UIScale.px(64))
+        portrait_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top.addWidget(portrait_lbl)
+
+        name_col = QVBoxLayout()
+        n_lbl = QLabel(s.name, self._detail_inner)
+        n_lbl.setFont(Fonts.title)
+        n_lbl.setStyleSheet(f"color:{_TIER_COLOUR.get(s.tier, P.gold)}; background:transparent;")
+        t_lbl = QLabel(s.title, self._detail_inner)
+        t_lbl.setFont(Fonts.small)
+        t_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        tier_badge = QLabel(f"  {_TIER_LABEL.get(s.tier, s.tier)}", self._detail_inner)
+        tier_badge.setFont(Fonts.mixed_small)
+        tier_badge.setStyleSheet(
+            f"color:#1a1a1a; background:{_TIER_COLOUR.get(s.tier, P.amber)};"
+            f" border-radius:{UIScale.px(4)}px; padding:1px {UIScale.px(6)}px;"
+        )
+        name_col.addWidget(n_lbl)
+        name_col.addWidget(t_lbl)
+        name_col.addWidget(tier_badge)
+        top.addLayout(name_col, 1)
+        self._detail_lay.addLayout(top)
+
+        # Flavour text
+        flav = QLabel(s.flavour, self._detail_inner)
+        flav.setFont(Fonts.body_small)
+        flav.setStyleSheet(f"color:{P.fg}; background:{P.bg_panel}; "
+                           f"border-radius:{UIScale.px(5)}px; padding:{UIScale.px(8)}px; "
+                           f"border:1px solid {P.border};")
+        flav.setWordWrap(True)
+        self._detail_lay.addWidget(flav)
+
+        # Perks
+        perm_frame = QFrame(self._detail_inner)
+        perm_frame.setObjectName("dashPanel")
+        perm_lay = QVBoxLayout(perm_frame)
+        perm_lay.setContentsMargins(UIScale.px(10), UIScale.px(8),
+                                    UIScale.px(10), UIScale.px(8))
+        perm_lay.setSpacing(UIScale.px(4))
+        perm_hdr = QLabel("  ✨  Permanent Perk  (active while married):", perm_frame)
+        perm_hdr.setFont(Fonts.mixed_bold)
+        perm_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        perm_lay.addWidget(perm_hdr)
+        perm_desc = QLabel(f"  {s.perm_perk_desc}", perm_frame)
+        perm_desc.setFont(Fonts.mixed_small)
+        perm_desc.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        perm_lay.addWidget(perm_desc)
+        if s.dowry_gold > 0:
+            dowry_lbl = QLabel(f"  💰  Dowry on marriage: {s.dowry_gold:,.0f}g", perm_frame)
+            dowry_lbl.setFont(Fonts.mixed_small)
+            dowry_lbl.setStyleSheet(f"color:{P.green}; background:transparent;")
+            perm_lay.addWidget(dowry_lbl)
+        self._detail_lay.addWidget(perm_frame)
+
+        # Daily perk levels
+        daily_frame = QFrame(self._detail_inner)
+        daily_frame.setObjectName("dashPanel")
+        daily_lay = QVBoxLayout(daily_frame)
+        daily_lay.setContentsMargins(UIScale.px(10), UIScale.px(8),
+                                     UIScale.px(10), UIScale.px(8))
+        daily_lay.setSpacing(UIScale.px(4))
+        daily_hdr = QLabel("  💕  Daily Visit Perk  (visits build relationship XP):", daily_frame)
+        daily_hdr.setFont(Fonts.mixed_bold)
+        daily_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        daily_lay.addWidget(daily_hdr)
+        level_suffixes = ["  Level 0  (base):", "  Level 1  (100 XP):", "  Level 2  (500 XP — max):"]
+        for i, (lsuf, pdesc) in enumerate(zip(level_suffixes, s.daily_perk_desc)):
+            ll = QLabel(f"{lsuf}  {pdesc}", daily_frame)
+            ll.setFont(Fonts.mixed_small)
+            col = P.fg if i == 0 else P.fg_dim
+            ll.setStyleSheet(f"color:{col}; background:transparent;")
+            ll.setWordWrap(True)
+            daily_lay.addWidget(ll)
+        self._detail_lay.addWidget(daily_frame)
+
+        # Courtship progress
+        prog_frame = QFrame(self._detail_inner)
+        prog_frame.setObjectName("dashPanel")
+        prog_lay = QVBoxLayout(prog_frame)
+        prog_lay.setContentsMargins(UIScale.px(10), UIScale.px(8),
+                                    UIScale.px(10), UIScale.px(8))
+        prog_lay.setSpacing(UIScale.px(6))
+        prog_hdr = QLabel("  ⏱  Courtship Progress:", prog_frame)
+        prog_hdr.setFont(Fonts.mixed_bold)
+        prog_hdr.setStyleSheet(f"color:{P.amber}; background:transparent;")
+        prog_lay.addWidget(prog_hdr)
+
+        if court:
+            elapsed_h = (g.time_played_seconds - court.get("started_real", 0.0)) / 3600.0
+            req_h = s.court_hours * div_penalty
+            act    = court.get("actions", 0)
+            gifts  = court.get("gifts", 0)
+            req_a  = s.court_actions
+            req_g  = s.court_gifts
+
+            # Time bar
+            time_pct = min(1.0, elapsed_h / max(0.001, req_h))
+            time_bar = QProgressBar(prog_frame)
+            time_bar.setRange(0, 100)
+            time_bar.setValue(int(time_pct * 100))
+            time_bar.setFixedHeight(UIScale.px(12))
+            time_bar.setStyleSheet(f"""
+                QProgressBar {{ background:{P.bg}; border:1px solid {P.border};
+                                border-radius:{UIScale.px(4)}px; text-align:center; }}
+                QProgressBar::chunk {{ background:#e87aa0; border-radius:{UIScale.px(3)}px; }}
+            """)
+            remain_h = max(0.0, req_h - elapsed_h)
+            remain_str = f"{remain_h:.1f}h remaining" if remain_h >= 1 else \
+                         f"{remain_h * 60:.0f}m remaining" if remain_h > 0 else "✓ Time complete"
+            time_row = QHBoxLayout()
+            time_row.addWidget(QLabel("  Time:", prog_frame))
+            time_row.addWidget(time_bar, 1)
+            tl = QLabel(remain_str, prog_frame)
+            tl.setFont(Fonts.tiny)
+            tl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            time_row.addWidget(tl)
+            prog_lay.addLayout(time_row)
+
+            # Actions bar
+            act_row = QHBoxLayout()
+            act_bar = QProgressBar(prog_frame)
+            act_bar.setRange(0, req_a)
+            act_bar.setValue(min(act, req_a))
+            act_bar.setFixedHeight(UIScale.px(12))
+            act_bar.setStyleSheet(f"""
+                QProgressBar {{ background:{P.bg}; border:1px solid {P.border};
+                                border-radius:{UIScale.px(4)}px; text-align:center; }}
+                QProgressBar::chunk {{ background:{P.amber}; border-radius:{UIScale.px(3)}px; }}
+            """)
+            act_row.addWidget(QLabel("  Visits:", prog_frame))
+            act_row.addWidget(act_bar, 1)
+            al = QLabel(f"{min(act, req_a)}/{req_a}", prog_frame)
+            al.setFont(Fonts.tiny)
+            al.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            act_row.addWidget(al)
+            prog_lay.addLayout(act_row)
+
+            # Gifts bar
+            gift_row = QHBoxLayout()
+            gift_bar = QProgressBar(prog_frame)
+            gift_bar.setRange(0, req_g)
+            gift_bar.setValue(min(gifts, req_g))
+            gift_bar.setFixedHeight(UIScale.px(12))
+            gift_bar.setStyleSheet(f"""
+                QProgressBar {{ background:{P.bg}; border:1px solid {P.border};
+                                border-radius:{UIScale.px(4)}px; text-align:center; }}
+                QProgressBar::chunk {{ background:{P.gold}; border-radius:{UIScale.px(3)}px; }}
+            """)
+            gift_row.addWidget(QLabel("  Gifts:", prog_frame))
+            gift_row.addWidget(gift_bar, 1)
+            gl = QLabel(f"{min(gifts, req_g)}/{req_g}", prog_frame)
+            gl.setFont(Fonts.tiny)
+            gl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            gift_row.addWidget(gl)
+            prog_lay.addLayout(gift_row)
+
+            # Divorce penalty notice
+            if div_penalty > 1.0:
+                pen_lbl = QLabel(
+                    f"  ⚠  Divorce penalty ×{div_penalty:.1f} applied to courtship requirements.",
+                    prog_frame
+                )
+                pen_lbl.setFont(Fonts.tiny)
+                pen_lbl.setStyleSheet(f"color:{P.red}; background:transparent;")
+                prog_lay.addWidget(pen_lbl)
+        else:
+            not_started_lbl = QLabel(
+                "  You haven't begun courting yet.  Click 'Begin Courting' to start.",
+                prog_frame
+            )
+            not_started_lbl.setFont(Fonts.mixed_small)
+            not_started_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            prog_lay.addWidget(not_started_lbl)
+            if div_penalty > 1.0:
+                pen_lbl = QLabel(
+                    f"  ⚠  Previous divorce increases requirements by ×{div_penalty:.1f}!",
+                    prog_frame
+                )
+                pen_lbl.setFont(Fonts.mixed_small)
+                pen_lbl.setStyleSheet(f"color:{P.red}; background:transparent;")
+                prog_lay.addWidget(pen_lbl)
+
+        self._detail_lay.addWidget(prog_frame)
+
+        # Action buttons
+        btn_frame = QFrame(self._detail_inner)
+        btn_lay = QHBoxLayout(btn_frame)
+        btn_lay.setContentsMargins(0, 0, 0, 0)
+        btn_lay.setSpacing(UIScale.px(8))
+        btn_frame.setStyleSheet("background:transparent;")
+
+        married_to = g.marriage_state.get("spouse_id")
+        if married_to:
+            info_lbl = QLabel(f"  You are currently wed to {_SUITOR_BY_ID.get(married_to, _SuitorDef('?','Someone','?','?','common','?','',0,0,0,0,'',{},[],[])).__dict__.get('name','your spouse')}.", btn_frame)
+            info_lbl.setFont(Fonts.mixed_small)
+            info_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            btn_lay.addWidget(info_lbl)
+        else:
+            req_h = s.court_hours * div_penalty
+            req_a = s.court_actions
+            req_g = s.court_gifts
+            act  = court.get("actions", 0) if court else 0
+            gifts = court.get("gifts", 0) if court else 0
+            elapsed_h = (g.time_played_seconds - court.get("started_real", 0.0)) / 3600.0 if court else 0.0
+            time_ok  = court and elapsed_h >= req_h
+            act_ok   = act >= req_a
+            gift_ok  = gifts >= req_g
+            ready    = time_ok and act_ok and gift_ok
+
+            if not court:
+                begin_btn = MtButton("  💕  Begin Courting", btn_frame, role="primary")
+                begin_btn.setFixedHeight(UIScale.px(34))
+                begin_btn.clicked.connect(lambda: self._do_begin_courting(sid))
+                btn_lay.addWidget(begin_btn)
+            else:
+                chat_btn = MtButton("  💬  Visit & Chat", btn_frame)
+                chat_btn.setFixedHeight(UIScale.px(34))
+                chat_btn.clicked.connect(lambda: self._do_chat(sid))
+                btn_lay.addWidget(chat_btn)
+
+                gift_btn = MtButton("  🎁  Give a Gift", btn_frame)
+                gift_btn.setFixedHeight(UIScale.px(34))
+                gift_btn.clicked.connect(lambda: self._do_gift(sid))
+                btn_lay.addWidget(gift_btn)
+
+                if ready:
+                    propose_btn = MtButton("  💍  Propose Marriage!", btn_frame, role="primary")
+                    propose_btn.setFixedHeight(UIScale.px(34))
+                    propose_btn.setStyleSheet(propose_btn.styleSheet() +
+                        f"MtButton {{ border-color: {'#d4aaff'}; }}")
+                    propose_btn.clicked.connect(lambda: self._do_propose(sid))
+                    btn_lay.addWidget(propose_btn)
+
+        btn_lay.addStretch()
+        self._detail_lay.addWidget(btn_frame)
+        self._detail_lay.addStretch()
+
+        # Swap the new container into the scroll area and discard the old one.
+        old_inner = self._detail_scroll.takeWidget()
+        self._detail_scroll.setWidget(self._detail_inner)
+        if old_inner is not None:
+            old_inner.deleteLater()
+
+    # ── Spouse card ───────────────────────────────────────────────────────────
+
+    def _refresh_spouse_card(self) -> None:
+        g = self.game
+        ms = g.marriage_state
+        sid = ms.get("spouse_id")
+        s = _SUITOR_BY_ID.get(sid)
+        if not s:
+            return
+
+        self._sp_portrait.setText(s.portrait)
+        self._sp_name_lbl.setText(f"  ♥  {s.name}")
+        self._sp_title_lbl.setText(f"  {s.title}")
+        self._sp_tier_lbl.setText(f"  {_TIER_LABEL.get(s.tier, s.tier)}  ·  Married ♥")
+
+        self._sp_perm_lbl.setText(f"  ✨  Permanent perk:  {s.perm_perk_desc}")
+
+        rel_xp = ms.get("rel_xp", 0)
+        rel_level = ms.get("rel_level", 0)
+        next_threshold = _REL_XP_LEVELS[min(rel_level + 1, len(_REL_XP_LEVELS) - 1)]
+        if rel_level >= len(_REL_XP_LEVELS) - 1:
+            self._sp_xp_bar.setRange(0, 1)
+            self._sp_xp_bar.setValue(1)
+            self._sp_xp_bar.setFormat("MAX LEVEL")
+        else:
+            prev_threshold = _REL_XP_LEVELS[rel_level]
+            self._sp_xp_bar.setRange(0, max(1, next_threshold - prev_threshold))
+            self._sp_xp_bar.setValue(min(rel_xp - prev_threshold, next_threshold - prev_threshold))
+            self._sp_xp_bar.setFormat(f"{rel_xp - prev_threshold} / {next_threshold - prev_threshold} XP")
+        self._sp_level_lbl.setText(f"❤ Level {rel_level}")
+
+        perk_active = g.time_played_seconds < ms.get("perk_expires_real", 0.0)
+        lvl = min(rel_level, len(s.daily_perk_desc) - 1)
+        perk_desc = s.daily_perk_desc[lvl] if s.daily_perk_desc else ""
+        abs_day = g._absolute_day()
+        visited_today = ms.get("last_visit_abs_day", 0) == abs_day
+        if perk_active:
+            remain_secs = ms.get("perk_expires_real", 0.0) - g.time_played_seconds
+            remain_h = remain_secs / 3600
+            if remain_h >= 1:
+                remain_str = f"{remain_h:.1f}h"
+            else:
+                remain_str = f"{remain_secs / 60:.0f}m"
+            self._sp_daily_lbl.setText(
+                f"  💖  Daily perk ACTIVE ({remain_str} remaining):\n"
+                f"  {perk_desc}"
+            )
+            self._sp_daily_lbl.setStyleSheet(f"color:{P.green}; background:transparent;")
+            self._visit_btn.setEnabled(False)
+            self._visit_btn.setText("  ✓  Visited today")
+        elif visited_today:
+            self._sp_daily_lbl.setText(
+                f"  💕  Today's perk has been activated.\n  Visit again tomorrow."
+            )
+            self._sp_daily_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            self._visit_btn.setEnabled(False)
+            self._visit_btn.setText("  ✓  Visited today")
+        else:
+            self._sp_daily_lbl.setText(
+                f"  💕  Today's perk available:\n  {perk_desc}"
+            )
+            self._sp_daily_lbl.setStyleSheet(f"color:{P.amber}; background:transparent;")
+            self._visit_btn.setEnabled(True)
+            self._visit_btn.setText("  💕  Visit Today")
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _do_begin_courting(self, sid: str) -> None:
+        s = _SUITOR_BY_ID[sid]
+        if not _popup_confirm(
+            self, f"Begin Courting {s.name}",
+            f"You catch {s.name}'s attention.\n\n"
+            f"Courtship requires:\n"
+            f"  ⏱  {s.court_hours:.1f}h of real time\n"
+            f"  💬  {s.court_actions} visits & conversations\n"
+            f"  🎁  {s.court_gifts} thoughtful gift(s)\n\n"
+            f"Once all requirements are met, you may propose marriage.",
+            confirm_text="Begin Courting",
+        ):
+            return
+        g = self.game
+        g.suitor_courtship[sid] = {
+            "started_real": g.time_played_seconds,
+            "actions": 0,
+            "gifts": 0,
+        }
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_ui_click()
+        GameToast(self.app, f"  💕  You began courting {s.name}.", "#e87aa0", duration_ms=3500)
+        self.refresh()
+
+    def _do_chat(self, sid: str) -> None:
+        s = _SUITOR_BY_ID[sid]
+        g = self.game
+        court = g.suitor_courtship.get(sid, {})
+        if not court:
+            return
+        act = court.get("actions", 0)
+        req_a = s.court_actions
+        if act >= req_a:
+            self.msg.ok(f"You've shared enough conversations with {s.name} for now.")
+            return
+        # Flavour lines pool
+        chat_lines = [
+            f"You share a long evening talking by the fire with {s.name}. Something shifts between you.",
+            f"A walk through the market turns into hours of conversation. {s.name} laughs at something you said.",
+            f"You discuss trade routes and ambitions. {s.name} listens carefully and asks sharper questions than you expected.",
+            f"{s.name} tells you something personal. You tell them something in return.",
+            f"The conversation wanders into the small hours. You both forget to notice the time.",
+        ]
+        import random as _r
+        line = _r.choice(chat_lines)
+        court["actions"] = act + 1
+        g.suitor_courtship[sid] = court
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_ui_click()
+        GameToast(self.app, f"  💬  {s.name}:  visit {act + 1}/{req_a}", P.amber, duration_ms=3000)
+        self.msg.ok(line)
+        self.refresh()
+
+    def _do_gift(self, sid: str) -> None:
+        s = _SUITOR_BY_ID[sid]
+        g = self.game
+        court = g.suitor_courtship.get(sid, {})
+        if not court:
+            self.msg.warn("Begin courting first.")
+            return
+
+        gift_entries = "\n".join(
+            f"  {gf['icon']}  {gf['name']:<20}  {gf['cost']:>5}g   (+{gf['xp_bonus']} XP if married)"
+            for gf in _GIFT_SHOP
+        )
+        choices = [f"{gf['icon']} {gf['name']}  —  {gf['cost']}g" for gf in _GIFT_SHOP]
+        gift_idx, ok = _popup_get_int(
+            self, f"Gift for {s.name}",
+            f"Choose a gift (1–{len(_GIFT_SHOP)}):\n{gift_entries}",
+            value=1, minimum=1, maximum=len(_GIFT_SHOP), step=1,
+            confirm_text="Give Gift",
+        )
+        if not ok:
+            return
+        gift_idx = max(1, min(gift_idx, len(_GIFT_SHOP))) - 1
+        gift = _GIFT_SHOP[gift_idx]
+
+        if g.inventory.gold < gift["cost"]:
+            self.msg.err(f"You need {gift['cost']}g for {gift['name']}.")
+            return
+
+        g.inventory.gold -= gift["cost"]
+        court["gifts"] = court.get("gifts", 0) + 1
+        g.suitor_courtship[sid] = court
+
+        # If married to this person already, also give XP
+        if g.marriage_state.get("spouse_id") == sid:
+            g.marriage_state["rel_xp"] = g.marriage_state.get("rel_xp", 0) + gift["xp_bonus"]
+            self._update_rel_level()
+
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_coin_sfx()
+        GameToast(self.app, f"  🎁  Gift given: {gift['icon']} {gift['name']}", P.gold, duration_ms=3000)
+        self.msg.ok(
+            f"You gave {s.name} {gift['icon']} {gift['name']} for {gift['cost']}g. "
+            f"A warm smile answered you."
+        )
+        self.refresh()
+
+    def _do_propose(self, sid: str) -> None:
+        s = _SUITOR_BY_ID[sid]
+        g = self.game
+        dowry_text = (f"\n\n  💰  Dowry received upon marriage: {s.dowry_gold:,.0f}g"
+                      if s.dowry_gold > 0 else "")
+        perk_text = f"\n\n  ✨  Permanent perk:  {s.perm_perk_desc}"
+
+        if not _popup_confirm(
+            self, f"  💍  Propose to {s.name}?",
+            f"You have won the heart of {s.name}.\n"
+            f"A life together awaits — and all that comes with it.{dowry_text}{perk_text}\n\n"
+            f"Marriage lasts until you choose otherwise.\n"
+            f"Divorce costs 50% of your net worth. Choose well.",
+            confirm_text="  💍  Ask for their hand",
+            cancel_text="Not yet",
+        ):
+            return
+
+        # Apply marriage
+        ms = g.marriage_state
+        ms["spouse_id"]   = sid
+        ms["married_at_real"] = g.time_played_seconds
+        ms["rel_xp"]      = 0
+        ms["rel_level"]   = 0
+        ms["perk_expires_real"] = 0.0
+        ms["last_visit_abs_day"] = 0
+
+        # Apply permanent perks from suitor definition
+        pp = s.perm_perk
+        ms["perm_trade_pct"]    = float(pp.get("trade_pct", 0.0))
+        ms["perm_rep_daily"]    = 0  # passive rep handled separately
+        ms["perm_heat_mult"]    = 1.0 - float(pp.get("heat_reduction", 0.0))
+        ms["perm_travel_bonus"] = int(pp.get("travel_days", 0))
+        ms["daily_perk_level0"] = s.daily_perk[0] if len(s.daily_perk) > 0 else {}
+        ms["daily_perk_level1"] = s.daily_perk[1] if len(s.daily_perk) > 1 else {}
+        ms["daily_perk_level2"] = s.daily_perk[2] if len(s.daily_perk) > 2 else {}
+
+        # Award dowry
+        if s.dowry_gold > 0:
+            g.inventory.gold += s.dowry_gold
+
+        g._gain_reputation(10)
+        g._check_achievements()
+
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_coin_sfx()
+
+        # Big toast burst
+        GameToast(self.app, f"  💍  You are married to {s.name}!  ♥", "#d4aaff", duration_ms=6000)
+        if s.dowry_gold > 0:
+            GameToast(self.app, f"  💰  Dowry received: +{s.dowry_gold:,.0f}g", P.green, duration_ms=5000)
+
+        self.msg.ok(f"Congratulations! You and {s.name} are wed. May your partnership prosper.")
+        self.app.refresh()
+        self._tabs.setCurrentIndex(1)
+        self.refresh()
+
+    def _do_daily_visit(self) -> None:
+        g = self.game
+        ms = g.marriage_state
+        sid = ms.get("spouse_id")
+        s = _SUITOR_BY_ID.get(sid)
+        if not s:
+            return
+        abs_day = g._absolute_day()
+        if ms.get("last_visit_abs_day", 0) == abs_day:
+            self.msg.warn("You've already visited today. Come back tomorrow.")
+            return
+
+        ms["last_visit_abs_day"] = abs_day
+        ms["rel_xp"] = ms.get("rel_xp", 0) + 10
+        self._update_rel_level()
+
+        # Activate perk for 24 real-time hours
+        ms["perk_expires_real"] = g.time_played_seconds + 86400.0
+
+        lvl  = ms.get("rel_level", 0)
+        perk = s.daily_perk[min(lvl, len(s.daily_perk) - 1)]
+
+        # Apply immediate perk effects
+        rep_flat = perk.get("rep_flat", 0)
+        heat_flat = perk.get("heat_flat", 0)
+        if rep_flat > 0:
+            g._gain_reputation(rep_flat)
+        if heat_flat < 0:
+            g.heat = max(0, g.heat + heat_flat)
+
+        desc = s.daily_perk_desc[min(lvl, len(s.daily_perk_desc) - 1)]
+
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_ui_click()
+
+        GameToast(self.app, f"  💕  Daily visit:  {desc}", "#e87aa0", duration_ms=5000)
+        self.msg.ok(f"Your visit to {s.name} warms the day. Perk activated for 24 hours.")
+        self.app.refresh()
+        self.refresh()
+
+    def _do_divorce(self) -> None:
+        g = self.game
+        ms = g.marriage_state
+        sid = ms.get("spouse_id")
+        s = _SUITOR_BY_ID.get(sid)
+        spouse_name = s.name if s else "your spouse"
+
+        nw = g._net_worth()
+        cost = round(nw * 0.50, 2)
+        if not _popup_confirm(
+            self, "  💔  Seek Divorce?",
+            f"Divorce from {spouse_name} will cost you:\n\n"
+            f"  💸  50% of your net worth:  {cost:,.0f}g\n"
+            f"  ⚠️  All permanent perks lost immediately.\n"
+            f"  ⚠️  Future courtship requirements permanently harder.\n\n"
+            f"This cannot be undone. Are you certain?",
+            confirm_text="  💔  File for Divorce",
+            cancel_text="Stay together",
+            confirm_role="danger",
+        ):
+            return
+
+        # Apply divorce penalties
+        g.inventory.gold = max(0.0, g.inventory.gold - max(0.0, cost))
+        g._lose_reputation(30)
+        ms["divorce_count"] = ms.get("divorce_count", 0) + 1
+
+        # Reset marriage (keep divorce_count)
+        divorce_count = ms["divorce_count"]
+        g.marriage_state = g._default_marriage_state()
+        g.marriage_state["divorce_count"] = divorce_count
+
+        if hasattr(self.app, "sound"):
+            self.app.sound.play_ui_click()
+
+        GameToast(self.app, f"  💔  Divorced.  Rep -30  ·  -{cost:,.0f}g", P.red, duration_ms=6000)
+        self.msg.err(f"The separation is painful and expensive. {spouse_name} is gone.")
+        self.app.refresh()
+        self.refresh()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _update_rel_level(self) -> None:
+        ms = self.game.marriage_state
+        xp = ms.get("rel_xp", 0)
+        level = 0
+        for i, threshold in enumerate(_REL_XP_LEVELS):
+            if xp >= threshold:
+                level = i
+        old_level = ms.get("rel_level", 0)
+        ms["rel_level"] = level
+        if level > old_level:
+            s = _SUITOR_BY_ID.get(ms.get("spouse_id", ""))
+            sname = s.name if s else "your spouse"
+            GameToast(self.app,
+                      f"  ❤  Relationship level {level}!  Daily perk upgraded.",
+                      P.gold, duration_ms=5000)
+
+    def _pulse_header(self) -> None:
+        """Gentle pulsing heartbeat in the tab label."""
+        try:
+            self._pulse_state = (self._pulse_state + 1) % 2
+            hearts = ["  💕  Available Suitors", "  💗  Available Suitors"]
+            self._tabs.setTabText(0, hearts[self._pulse_state])
+        except RuntimeError:
+            if hasattr(self, "_heart_timer"):
+                self._heart_timer.stop()
 
 
 # ── Register screens in GameApp._SCREEN_MAP ──────────────────────────────────
@@ -22336,6 +26078,7 @@ GameApp._SCREEN_MAP = {
     "gamble":           GambleScreen,
     "voyage":           VoyageScreen,
     "social":           SocialScreen,
+    "suitors":          SuitorScreen,
 }
 
 

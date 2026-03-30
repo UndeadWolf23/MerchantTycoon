@@ -57,6 +57,7 @@ Supabase tables (SQL schema in each manager's docstring):
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import threading
@@ -2846,6 +2847,72 @@ class InboxManager:
         return None
 
 
+class RewardCodeManager:
+    """
+    Reward code redemption and starter inbox provisioning.
+
+    These calls are expected to hit SECURITY DEFINER Postgres RPC functions
+    so the desktop client can remain on the anon key while the database
+    enforces one-time redemption and server-side inbox inserts.
+    """
+
+    _CODE_SANITIZER = re.compile(r"[^A-Z0-9_-]+")
+
+    def __init__(self, client: "OnlineClient", auth: "AuthManager") -> None:
+        self._client = client
+        self._auth = auth
+
+    def _normalize_code(self, code: str) -> str:
+        cleaned = self._CODE_SANITIZER.sub("", str(code or "").strip().upper())
+        return cleaned[:32]
+
+    def bootstrap_inbox(
+        self,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Ensure starter reward-code letters exist for the signed-in account."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            result = self._client.post(
+                "/rest/v1/rpc/bootstrap_reward_mail",
+                body={"p_username": self._auth.username or ""},
+            )
+            if result.success and not isinstance(result.data, dict):
+                result.data = {}
+            return result
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def redeem_code(
+        self,
+        code: str,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Redeem a one-time reward code for the authenticated player."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            normalized = self._normalize_code(code)
+            if len(normalized) < 3:
+                return OnlineResult(success=False, error="Enter a valid code.")
+            result = self._client.post(
+                "/rest/v1/rpc/redeem_reward_code",
+                body={"p_code": normalized},
+            )
+            if result.success and not isinstance(result.data, dict):
+                result.data = {}
+            return result
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SYNC MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2932,6 +2999,7 @@ class OnlineServices:
         app.online.friends      — FriendsManager
         app.online.guilds       — GuildManager
         app.online.inbox        — InboxManager (mail, rewards, notifications)
+        app.online.rewards      — RewardCodeManager
 
     All callbacks receive OnlineResult on a daemon thread.
     Wrap with  app.after(0, ...)  before touching Tkinter widgets.
@@ -2947,6 +3015,7 @@ class OnlineServices:
         self.friends      = FriendsManager(self._http, self.auth)
         self.guilds       = GuildManager(self._http, self.auth)
         self.inbox        = InboxManager(self._http, self.auth)
+        self.rewards      = RewardCodeManager(self._http, self.auth)
         self.verification = VerificationServer()
 
     def startup(self) -> bool:

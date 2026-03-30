@@ -1,0 +1,940 @@
+[
+  {
+    "table_name": "cloud_saves",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": "gen_random_uuid()"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "slot",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "1"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "save_data",
+    "data_type": "jsonb",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "day",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "gold",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "reputation",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "version",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'1.0'::text"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "cloud_saves",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "earned_achievements",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "earned_achievements",
+    "column_name": "ach_key",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "earned_achievements",
+    "column_name": "earned_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "earned_titles",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "earned_titles",
+    "column_name": "title_key",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "earned_titles",
+    "column_name": "earned_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "friends",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": "gen_random_uuid()"
+  },
+  {
+    "table_name": "friends",
+    "column_name": "requester_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "friends",
+    "column_name": "addressee_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "friends",
+    "column_name": "status",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'pending'::text"
+  },
+  {
+    "table_name": "friends",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "friends",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": "gen_random_uuid()"
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "from_user",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "to_user",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "status",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'pending'::text"
+  },
+  {
+    "table_name": "guild_invites",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "username",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "role",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'member'::text"
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "joined_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guild_members",
+    "column_name": "contribution_score",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "recruitment_mode",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'open'::text"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "visibility",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'public'::text"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "allow_member_invites",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "minimum_reputation",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "minimum_net_worth",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "event_focus",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'balanced'::text"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "message_of_the_day",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "application_prompt",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "guild_policies",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "role_key",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "label",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "rank",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "100"
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "permissions",
+    "data_type": "jsonb",
+    "not_null": true,
+    "column_default": "'{}'::jsonb"
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "is_system",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "guild_roles",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": "gen_random_uuid()"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "description",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "owner_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "member_count",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "1"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "guild_score",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "motto",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "banner_color",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'#C2873B'::text"
+  },
+  {
+    "table_name": "guilds",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "id",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": "nextval('inbox_messages_id_seq'::regclass)"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "recipient_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "sender_id",
+    "data_type": "uuid",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "msg_type",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'mail'::text"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "subject",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "body",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "reward_gold",
+    "data_type": "numeric",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "reward_items",
+    "data_type": "jsonb",
+    "not_null": true,
+    "column_default": "'{}'::jsonb"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "reward_title",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "reward_description",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "is_read",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "reward_claimed",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "inbox_messages",
+    "column_name": "expires_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": "gen_random_uuid()"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "username",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "discriminator",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "title",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "score",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "day",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "gold",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "lifetime_gold",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "reputation",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "area",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "net_worth",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "player_name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "guild_name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "leaderboard",
+    "column_name": "guild_role",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "username",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "discriminator",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "title",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "avatar_url",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "lifetime_gold",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "best_day",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "best_rep",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "last_seen",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "last_networth",
+    "data_type": "double precision",
+    "not_null": true,
+    "column_default": "0.0"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "last_area",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "reputation",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "50"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "merchant_name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "guild_id",
+    "data_type": "uuid",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "guild_name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "profiles",
+    "column_name": "guild_role",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "reward_code_redemptions",
+    "column_name": "code_id",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_code_redemptions",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_code_redemptions",
+    "column_name": "redeemed_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "id",
+    "data_type": "bigint",
+    "not_null": true,
+    "column_default": "nextval('reward_codes_id_seq'::regclass)"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "code",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "description",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "reward_gold",
+    "data_type": "numeric",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "reward_reputation",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "reward_free_spins",
+    "data_type": "integer",
+    "not_null": true,
+    "column_default": "0"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "requires_new_account",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "active",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "true"
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "starts_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "expires_at",
+    "data_type": "timestamp with time zone",
+    "not_null": false,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_codes",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "reward_mail_bootstrap",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "reward_mail_bootstrap",
+    "column_name": "new_account_eligible",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "reward_mail_bootstrap",
+    "column_name": "alpha_mail_sent",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "reward_mail_bootstrap",
+    "column_name": "lootbox_mail_sent",
+    "data_type": "boolean",
+    "not_null": true,
+    "column_default": "false"
+  },
+  {
+    "table_name": "reward_mail_bootstrap",
+    "column_name": "bootstrapped_at",
+    "data_type": "timestamp with time zone",
+    "not_null": true,
+    "column_default": "now()"
+  },
+  {
+    "table_name": "title_definitions",
+    "column_name": "key",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "title_definitions",
+    "column_name": "name",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": null
+  },
+  {
+    "table_name": "title_definitions",
+    "column_name": "description",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "''::text"
+  },
+  {
+    "table_name": "title_definitions",
+    "column_name": "icon",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'🏅'::text"
+  },
+  {
+    "table_name": "title_definitions",
+    "column_name": "rarity",
+    "data_type": "text",
+    "not_null": true,
+    "column_default": "'common'::text"
+  }
+]

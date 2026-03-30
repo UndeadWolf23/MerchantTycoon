@@ -18,9 +18,13 @@ import zlib
 
 # Ensure Unicode output works on Windows terminals
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    _stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(_stdout_reconfigure):
+        _stdout_reconfigure(encoding="utf-8", errors="replace")
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    _stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_stderr_reconfigure):
+        _stderr_reconfigure(encoding="utf-8", errors="replace")
 import math
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -317,6 +321,7 @@ class GameSettings:
     enable_signatures:     bool  = True      # show parchment signing dialog for licenses/loans/etc.
     gamble_mercy:          int   = 0           # mercy counter: at 15 the next coffer roll excludes commons
     gamble_free_spins:     int   = 0           # persistent free spins granted by coffer rewards or codes
+    time_played:           int   = 0           # accumulated play time in seconds (mirror of game.time_played_seconds)
     hotkeys:               Dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_HOTKEYS)
     )
@@ -728,7 +733,7 @@ MANAGER_XP_THRESHOLDS: List[int] = [0, 50, 150, 350, 750]   # L1 base, L1→L2, 
 MANAGER_EFFICIENCY: Dict[int, float] = {1: 0.65, 2: 0.76, 3: 0.86, 4: 0.93, 5: 0.98}
 
 # Per manager-type definition: base weekly wage, required license, description, icon
-MANAGER_DEFS: Dict[str, Dict] = {
+MANAGER_DEFS: Dict[ManagerType, Dict[str, Any]] = {
     ManagerType.BUSINESS_FOREMAN: {
         "icon": "🔧", "wage": 25.0, "license": LicenseType.BUSINESS,
         "desc": "Maintains your businesses — repairs breakdowns, hires workers, and handles daily operations.",
@@ -1002,8 +1007,9 @@ class StockMarket:
 
     def on_event(self, event: object):
         """Apply immediate event shock (60% of full impact) to linked stocks."""
+        event_name = str(getattr(event, "name", "") or "")
         for sd in self.stocks.values():
-            impact = sd["linked_events"].get(event.name, 0.0)
+            impact = sd["linked_events"].get(event_name, 0.0)
             if impact != 0.0:
                 sd["price"] = max(1.0, round(sd["price"] * (1.0 + impact * 0.60), 2))
                 sd["history"].append(sd["price"])
@@ -2510,7 +2516,7 @@ class AreaMarket:
             return effect.peak_delta * (remaining / max(1, effect.decay_days))
         return 0.0
 
-    def active_influence_summary(self, item_key: str, abs_day: int) -> Dict[str, float]:
+    def active_influence_summary(self, item_key: str, abs_day: int) -> Dict[str, Any]:
         active: List[InfluenceEffect] = []
         net_delta = 0.0
         days_left = 0
@@ -2566,7 +2572,14 @@ class AreaMarket:
                         except Exception:
                             pass
                 self.history[key] = points
-        self.active_events = [str(e) for e in data.get("active_events", [])][:8] if isinstance(data, dict) else []
+        if isinstance(data, dict):
+            active_events_raw = data.get("active_events", [])
+            if isinstance(active_events_raw, list):
+                self.active_events = [str(e) for e in active_events_raw][:8]
+            else:
+                self.active_events = []
+        else:
+            self.active_events = []
         self.active_influences = []
         infl_data = data.get("active_influences", []) if isinstance(data, dict) else []
         if isinstance(infl_data, list):
@@ -2583,8 +2596,11 @@ class AreaMarket:
                     ))
                 except Exception:
                     pass
-        self.days_passed = int(data.get("days_passed", self.days_passed)) if isinstance(data, dict) else self.days_passed
-        self.travel_risk_override = float(data.get("travel_risk_override", self.travel_risk_override)) if isinstance(data, dict) else self.travel_risk_override
+        if isinstance(data, dict):
+            days_raw = data.get("days_passed", self.days_passed)
+            risk_raw = data.get("travel_risk_override", self.travel_risk_override)
+            self.days_passed = int(days_raw) if isinstance(days_raw, (int, float, str)) else self.days_passed
+            self.travel_risk_override = float(risk_raw) if isinstance(risk_raw, (int, float, str)) else self.travel_risk_override
 
     # ── Transactions ─────────────────────────────────────────────────────────
 
@@ -3295,6 +3311,8 @@ class Game:
         # ── Courtship & Marriage ──────────────────────────────────────────────
         self.marriage_state: dict = self._default_marriage_state()
         self.suitor_courtship: dict = {}  # {sid: {"started_real":float, "actions":int, "gifts":int}}
+        # ── Ghost companion ───────────────────────────────────────────────────
+        self.ghost_state: dict = {}  # persisted so Rigby unlock survives reload
         self._generate_captains()
 
     @staticmethod
@@ -3443,7 +3461,7 @@ class Game:
     def pet_cat(self) -> int:
         if not self.can_pet_cat_today():
             return 0
-        gained = self._gain_reputation(20)
+        gained = self._gain_reputation(30)
         self.cat_state["last_pet_real_day"] = date.today().isoformat()
         return gained
 
@@ -3516,7 +3534,7 @@ class Game:
 
     # ── Achievement System ───────────────────────────────────────────────────
 
-    def _track_stat(self, key: str, amount=1) -> None:
+    def _track_stat(self, key: str, amount: Any = 1) -> None:
         """Update an ach_stats counter, bool, or list."""
         if key not in self.ach_stats:
             return
@@ -3728,7 +3746,9 @@ class Game:
         today = self._absolute_day()
         key = self._haggle_key(area, item_key)
         record = self.daily_haggles.get(key)
-        if not isinstance(record, dict) or int(record.get("day", -1)) != today:
+        day_raw = record.get("day", -1) if isinstance(record, dict) else -1
+        day_val = int(day_raw) if isinstance(day_raw, (int, float, str)) else -1
+        if not isinstance(record, dict) or day_val != today:
             record = {"day": today, "attempts": 0, "discount": 0.0, "displeased": False}
             self.daily_haggles[key] = record
         return record
@@ -3737,17 +3757,20 @@ class Game:
         record = self._haggle_record(area, item_key)
         if bool(record.get("displeased", False)):
             return 0.0
-        return float(record.get("discount", 0.0) or 0.0)
+        discount_raw = record.get("discount", 0.0)
+        return float(discount_raw) if isinstance(discount_raw, (int, float, str)) else 0.0
 
     def haggle_attempts_today(self, area: Area, item_key: str) -> int:
-        return int(self._haggle_record(area, item_key).get("attempts", 0))
+        attempts_raw = self._haggle_record(area, item_key).get("attempts", 0)
+        return int(attempts_raw) if isinstance(attempts_raw, (int, float, str)) else 0
 
     def clear_haggle_offer(self, area: Area, item_key: str) -> None:
         self._haggle_record(area, item_key)["discount"] = 0.0
 
     def try_haggle(self, area: Area, item_key: str) -> Dict[str, object]:
         record = self._haggle_record(area, item_key)
-        attempts = int(record.get("attempts", 0))
+        attempts_raw = record.get("attempts", 0)
+        attempts = int(attempts_raw) if isinstance(attempts_raw, (int, float, str)) else 0
         if attempts >= 2:
             record["attempts"] = attempts + 1
             record["discount"] = 0.0
@@ -3844,6 +3867,8 @@ class Game:
     def _manager_daily_actions(self):
         """Run once per day when a business manager is employed."""
         mgr = self.business_manager
+        if mgr is None:
+            return
         mgr.days_employed += 1
         # Auto-repair broken businesses
         if mgr.auto_repair:
@@ -4870,7 +4895,7 @@ class Game:
             })
         return result
 
-    def _generate_property_listings(self, area: Area = None, count: int = 10) -> List[Dict]:
+    def _generate_property_listings(self, area: Optional[Area] = None, count: int = 10) -> List[Dict]:
         """
         Generate a list of property listings for the given area.
         Each listing dict has: prop_type, name, condition, cond_label,
@@ -4939,9 +4964,9 @@ class Game:
         if r < 100:    return c("Unknown", WHITE)
         if r < 250:    return c("Recognized", GREEN)
         if r < 500:    return c("Renowned", CYAN)
-        if r < 1000:   return c("Famed", MAGENTA)
+        if r < 1000:   return c("Famed", BLUE)
         if r < 10000:  return c("Legendary", YELLOW)
-        return                 c("Mythic", BRIGHT_YELLOW)
+        return                 c("Mythic", YELLOW)
 
     def _log_event(self, msg: str):
         self.event_log.appendleft(f"[Y{self.year} D{self.day}] {msg}")
@@ -5097,15 +5122,6 @@ class Game:
         as_txt   = c("[AS]", GREEN) if self.settings.autosave else c("[AS off]", GREY)
         std_txt  = c("Standard balance", CYAN)
         print(f"  {key('SAVE')} Save   {key('O')} Options·{std_txt} {as_txt}   {key('Q')} Quit   {key('?')} Help")
-
-    # ── Trading ──────────────────────────────────────────────────────────────
-
-    def trade_menu(self):
-        while True:
-            market = self.markets[self.current_area]
-            print(header(f"TRADE \u2014 {self.current_area.value}"))
-            print(f"  {CYAN}1{RESET}. Buy items")
-            print(f"  {CYAN}2{RESET}. Sell items")
 
     # ── Trading ──────────────────────────────────────────────────────────────
 
@@ -5466,7 +5482,8 @@ class Game:
 
         haggle = self.try_haggle(self.current_area, item_key)
         status = str(haggle.get("status", "failed"))
-        discount = float(haggle.get("discount", 0.0) or 0.0)
+        discount_raw = haggle.get("discount", 0.0)
+        discount = float(discount_raw) if isinstance(discount_raw, (int, float, str)) else 0.0
         if status == "success":
             ok(f"Haggling succeeded! {int(discount * 100)}% extra discount.")
         elif status == "refused":
@@ -5605,8 +5622,8 @@ class Game:
                     for a in areas if k in self.markets[a].item_keys
                 }
                 best_sell_p    = max(best_sell_prices.values())
-                best_buy_area  = min(buy_prices, key=buy_prices.get)
-                best_sell_area = max(best_sell_prices, key=best_sell_prices.get)
+                best_buy_area  = min(buy_prices, key=lambda area: buy_prices[area])
+                best_sell_area = max(best_sell_prices, key=lambda area: best_sell_prices[area])
                 route_profit   = best_sell_p - min_p
                 buy_ab         = _short.get(best_buy_area,  best_buy_area.value[:5])
                 sell_ab        = _short.get(best_sell_area, best_sell_area.value[:5])
@@ -5723,8 +5740,6 @@ class Game:
         # Heat slowly dissipates when traveling
         self.heat = max(0, self.heat - days_travel * 3)
 
-    def _travel_incident(self, dest: Area):
-        """Bad things can happen on the road"""
     def _travel_incident(self, dest: Area):
         """Bad things can happen on the road."""
         roll = random.random()
@@ -8372,6 +8387,8 @@ class Game:
             # ── Courtship & Marriage ────────────────────────────────────────
             "marriage_state":   self.marriage_state,
             "suitor_courtship": self.suitor_courtship,
+            # ── Ghost companion ─────────────────────────────────────────────
+            "ghost_state":      dict(getattr(self, "ghost_state", {})),
         }
 
         try:
@@ -8728,6 +8745,9 @@ class Game:
             saved_sc = data.get("suitor_courtship", {})
             if isinstance(saved_sc, dict):
                 self.suitor_courtship = saved_sc
+            # ── Ghost companion (backward-compatible) ─────────────────────
+            raw_gs = data.get("ghost_state", {})
+            self.ghost_state = dict(raw_gs) if isinstance(raw_gs, dict) else {}
 
             MasterLog.write(
                 "SYSTEM",

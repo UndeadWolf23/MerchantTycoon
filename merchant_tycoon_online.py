@@ -77,7 +77,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # per-user data isolation server-side.  Never put the service_role key here.
 # ─────────────────────────────────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv as _load_dotenv
+    from dotenv import load_dotenv as _load_dotenv  # type: ignore[reportMissingImports]
     _load_dotenv()
 except ImportError:
     pass  # python-dotenv not installed — use baked-in defaults
@@ -210,6 +210,7 @@ class OnlineResult:
     success: bool
     data: Any = None
     error: str = ""
+    server_time: Optional[float] = None  # UTC unix from HTTP Date header (anti-cheat)
 
     def __bool__(self) -> bool:
         return self.success
@@ -283,7 +284,16 @@ class OnlineClient:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 raw = resp.read().decode("utf-8")
                 data = json.loads(raw) if raw.strip() else {}
-                return OnlineResult(success=True, data=data)
+                # Capture server time from HTTP Date header (used for cheat-proof cooldown checks)
+                server_time: Optional[float] = None
+                date_hdr = resp.headers.get("Date")
+                if date_hdr:
+                    try:
+                        from email.utils import parsedate_to_datetime as _pdt
+                        server_time = _pdt(date_hdr).timestamp()
+                    except Exception:
+                        pass
+                return OnlineResult(success=True, data=data, server_time=server_time)
 
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8") if exc.fp else ""
@@ -2847,6 +2857,88 @@ class InboxManager:
         return None
 
 
+class PlayerTimerManager:
+    """
+    Syncs per-player cooldown timestamps to Supabase so that cooldowns persist
+    across devices and reinstalls.
+
+    Three timers tracked:
+        ghost_last_click   — Rigby ghost tab; 1-hour cooldown (UTC unix float)
+        cat_last_pet       — cat companion; 24-hour cooldown (UTC unix float)
+        marriage_last_visit — marriage daily visit; per-calendar-day (ISO date str)
+
+    Required Supabase SQL:
+    ─────────────────────
+        create table if not exists player_timers (
+            user_id              uuid primary key references auth.users on delete cascade,
+            ghost_last_click     float  not null default 0,
+            cat_last_pet         float  not null default 0,
+            marriage_last_visit  text   not null default '',
+            updated_at           timestamptz not null default now()
+        );
+        alter table player_timers enable row level security;
+        create policy "owner only" on player_timers
+            using (auth.uid() = user_id)
+            with check (auth.uid() = user_id);
+    """
+
+    def __init__(self, client: "OnlineClient", auth: "AuthManager") -> None:
+        self._client = client
+        self._auth   = auth
+
+    def get_timers(
+        self, callback: Optional[Callable] = None
+    ) -> Optional[OnlineResult]:
+        """Fetch the current player's timer row.  Returns data=dict or data=None."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            result = self._client.get(
+                "/rest/v1/player_timers",
+                params={"user_id": f"eq.{self._auth.user_id}", "limit": "1"},
+            )
+            if result.success:
+                rows = result.data if isinstance(result.data, list) else []
+                result.data = rows[0] if rows else None
+            return result
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+    def set_timer(
+        self,
+        *,
+        ghost_last_click: Optional[float] = None,
+        cat_last_pet: Optional[float] = None,
+        marriage_last_visit: Optional[str] = None,
+        callback: Optional[Callable] = None,
+    ) -> Optional[OnlineResult]:
+        """Upsert the player timer row with whatever fields are supplied."""
+        def _do() -> OnlineResult:
+            if not self._auth.is_authenticated:
+                return OnlineResult(success=False, error="Not signed in.")
+            body: dict = {"user_id": self._auth.user_id}
+            if ghost_last_click is not None:
+                body["ghost_last_click"] = ghost_last_click
+            if cat_last_pet is not None:
+                body["cat_last_pet"] = cat_last_pet
+            if marriage_last_visit is not None:
+                body["marriage_last_visit"] = marriage_last_visit
+            body["updated_at"] = "now()"
+            return self._client.post(
+                "/rest/v1/player_timers",
+                body=body,
+                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+
+        if callback is None:
+            return _do()
+        _run_async(_do, callback)
+        return None
+
+
 class RewardCodeManager:
     """
     Reward code redemption and starter inbox provisioning.
@@ -3016,6 +3108,7 @@ class OnlineServices:
         self.guilds       = GuildManager(self._http, self.auth)
         self.inbox        = InboxManager(self._http, self.auth)
         self.rewards      = RewardCodeManager(self._http, self.auth)
+        self.timers       = PlayerTimerManager(self._http, self.auth)
         self.verification = VerificationServer()
 
     def startup(self) -> bool:

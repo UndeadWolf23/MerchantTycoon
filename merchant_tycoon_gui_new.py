@@ -56,7 +56,7 @@ from urllib.parse import quote
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple, Type, Any
+from typing import Callable, Dict, List, Optional, Tuple, Type, Any, Union, cast
 
 try:
     import numpy as np
@@ -75,6 +75,7 @@ from PySide6.QtGui import (
     QPalette, QIcon, QCursor, QLinearGradient, QRadialGradient,
     QKeySequence, QShortcut, QGuiApplication, QScreen, QAction,
     QCloseEvent, QMouseEvent, QResizeEvent, QPen, QBrush,
+    QKeyEvent, QWheelEvent, QEnterEvent,
     QFontDatabase, QTransform, QDesktopServices,
 )
 from PySide6.QtWidgets import (
@@ -1188,7 +1189,7 @@ class FadeEffect:
         a.setEasingCurve(easing)
 
         def _cleanup() -> None:
-            self._w.setGraphicsEffect(None)
+            self._w.setGraphicsEffect(None)  # type: ignore[arg-type]
             self._anim = None
             if on_done:
                 on_done()
@@ -1236,7 +1237,7 @@ class SlideEffect:
         if parent is None:
             return
 
-        pw, ph = parent.width(), parent.height()
+        pw, ph = parent.width(), parent.height()  # type: ignore[union-attr]
         ww, wh = w.width() or UIScale.px(300), w.height() or ph
 
         hidden_geo = w.geometry()
@@ -1385,6 +1386,11 @@ class HotkeyManager(QObject):
             # Capture action name in closure
             sc.activated.connect(lambda a=action: self.triggered.emit(a))
             self._shortcuts[action] = sc
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable all managed shortcuts (e.g., during hotkey capture)."""
+        for sc in self._shortcuts.values():
+            sc.setEnabled(enabled)
 
     @staticmethod
     def _parse(binding: str) -> Optional[QKeySequence]:
@@ -1587,7 +1593,7 @@ class MtButton(QPushButton):
             anim.setStartValue(self._opacity_eff.opacity())
             anim.setEndValue(1.0)
             anim.setEasingCurve(Easing.BUTTON_RELEASE)
-            anim.finished.connect(lambda: self.setGraphicsEffect(None))
+            anim.finished.connect(lambda: self.setGraphicsEffect(None))  # type: ignore[arg-type]
             self._press_anim = anim
             anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
             self._opacity_eff = None
@@ -2666,7 +2672,7 @@ class FooterPawTrail(QWidget):
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _schedule(self, first: bool = False) -> None:
-        delay = 5_000  # DEBUG: 5 s interval; restore to 8-80 s for release
+        delay = 15_000  # 15 s between sequences
         self._trigger.start(delay)
 
     def _play(self) -> None:
@@ -3179,7 +3185,9 @@ class GuidedTutorial(QObject):
         self._resume_cloud_sync = bool(self.app._cloud_sync_timer.isActive())
         if self._resume_cloud_sync:
             self.app._cloud_sync_timer.stop()
-        QApplication.instance().installEventFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.app.game.inventory.gold = max(float(self.app.game.inventory.gold or 0.0), 1500.0)
         self.app._reset_stat_snapshot()
         self.app.goto("dashboard")
@@ -3344,7 +3352,9 @@ class GuidedTutorial(QObject):
         self._card.hide()
         self._highlight.clear_target()
         try:
-            QApplication.instance().removeEventFilter(self)
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
         except Exception:
             pass
         self._restore_snapshot(restore_dashboard=restore_dashboard)
@@ -4134,7 +4144,7 @@ class CustomTitleBar(QWidget):
         self._window     = window
         self._drag_pos:  Optional[QPoint] = None
         self._maximised  = False
-        self._max_btn:   Optional[QPushButton] = None
+        self._max_btn:   Optional[_WinCtrlButton] = None
 
         self.setObjectName("titleBar")
         self.setFixedHeight(UIScale.px(38))
@@ -4279,7 +4289,7 @@ class ScreenTransitionManager:
             # Clear the outgoing widget's temp effect, then switch.
             # Do NOT set any effect on the incoming widget — its FadeEffect
             # (set up in BaseScreen.__init__) handles the fade-in via activate().
-            current_widget.setGraphicsEffect(None)
+            current_widget.setGraphicsEffect(None)  # type: ignore[arg-type]
             self._stack.setCurrentIndex(index)
             self._in_transit = False
             if on_switched:
@@ -4306,6 +4316,11 @@ class GameHeader(QWidget):
     def __init__(self, game: "Game", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._game = game
+        # Type declarations for stat labels created via setattr() inside _stat() helper
+        self._gold_lbl: Union[AnimatedValueLabel, QLabel]
+        self._rep_lbl:  Union[AnimatedValueLabel, QLabel]
+        self._net_lbl:  QLabel
+        self._loc_lbl:  QLabel
         self.setObjectName("gameHeader")
         self.setFixedHeight(UIScale.px(self.H))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -4434,11 +4449,11 @@ class GameHeader(QWidget):
             btn.clicked.connect(slot)
             return btn
 
-        self._dbg_mail_btn = _debug_btn("Mail", "Debug: stage fake inbox mail", "secondary", self.window()._debug_send_mail)
-        self._dbg_gold_btn = _debug_btn("+5000g", "Debug: add 5000 gold", "secondary", self.window()._debug_add_gold)
-        self._dbg_cloud_btn = _debug_btn("Restore", "Debug: restore from cloud save", "secondary", self.window()._debug_cloud_restore)
-        self._dbg_simtime_btn = _debug_btn("⏱ +Time", "Debug: advance time_played_seconds (for courtship & timed tests)", "secondary", self.window()._debug_sim_time)
-        self._dbg_purge_btn = _debug_btn("Purge", "Debug: purge ALL local saves and quit", "danger", self.window()._debug_purge_saves)
+        self._dbg_mail_btn = _debug_btn("Mail", "Debug: stage fake inbox mail", "secondary", getattr(self.window(), "_debug_send_mail"))
+        self._dbg_gold_btn = _debug_btn("+5000g", "Debug: add 5000 gold", "secondary", getattr(self.window(), "_debug_add_gold"))
+        self._dbg_cloud_btn = _debug_btn("Restore", "Debug: restore from cloud save", "secondary", getattr(self.window(), "_debug_cloud_restore"))
+        self._dbg_simtime_btn = _debug_btn("⏱ +Time", "Debug: advance time_played_seconds (for courtship & timed tests)", "secondary", getattr(self.window(), "_debug_sim_time"))
+        self._dbg_purge_btn = _debug_btn("Purge", "Debug: purge ALL local saves and quit", "danger", getattr(self.window(), "_debug_purge_saves"))
 
         self._sync_lbl = QLabel("", self)
         self._sync_lbl.setFont(Fonts.tiny)
@@ -4511,7 +4526,7 @@ class GameHeader(QWidget):
         year   = getattr(g, "year",   1)
         season = getattr(g, "season", None)
         sea_s  = season.value if season and hasattr(season, "value") else "?"
-        sea_c  = SEASON_COLOURS.get(season, P.gold)
+        sea_c  = SEASON_COLOURS.get(season, P.gold) if season is not None else P.gold
         self._day_lbl.setText(f"Day {day}  ·  {sea_s}  ·  Year {year}")
         self._day_lbl.setStyleSheet(f"color:{sea_c}; background:transparent;")
 
@@ -4875,6 +4890,402 @@ class NavRail(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# KONAMI / GHOST EASTER EGG  —  glitch button, ghost dialogue, ghost peek
+# ══════════════════════════════════════════════════════════════════════════════
+
+_KONAMI_SEQUENCE = [
+    Qt.Key.Key_Up, Qt.Key.Key_Up,
+    Qt.Key.Key_Down, Qt.Key.Key_Down,
+    Qt.Key.Key_Left, Qt.Key.Key_Right,
+    Qt.Key.Key_Left, Qt.Key.Key_Right,
+    Qt.Key.Key_B, Qt.Key.Key_A,
+]
+_GLITCH_CHARS = list("!@#$%^&*?~░▒▓█▄▀■□")
+
+
+class _GlitchButton(QPushButton):
+    """
+    Animated glitchy pixel-art button spawned by the Konami code.
+    Click it 100 times — each click plays a progressively higher-pitched
+    blip — then it pops and calls `on_pop`.
+    """
+    _MAX_CLICKS = 100
+    _GLITCH_MS  = 80
+
+    def __init__(self, parent: QWidget, on_pop: Callable[[], None]) -> None:
+        super().__init__(parent)
+        self._on_pop      = on_pop
+        self._click_count = 0
+        self.setText("?  ????")
+        self.setFont(Fonts.small_bold)
+        self.setFixedHeight(UIScale.px(28))
+        self.setFixedWidth(UIScale.px(110))
+        self.setProperty("role", "primary")
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setToolTip("Something is wrong with this button.")
+
+        self._glitch_timer = QTimer(self)
+        self._glitch_timer.setInterval(self._GLITCH_MS)
+        self._glitch_timer.timeout.connect(self._glitch_tick)
+        self._glitch_timer.start()
+
+        self.clicked.connect(self._on_click)
+
+    # ── glitch visual ─────────────────────────────────────────────────────
+
+    def _glitch_tick(self) -> None:
+        import random as _r
+        n = _r.randint(3, 7)
+        chars = "".join(_r.choice(_GLITCH_CHARS) for _ in range(n))
+        pct   = self._click_count / self._MAX_CLICKS
+        r     = int(180 + 75 * pct)
+        g_c   = int(20 * (1 - pct))
+        b     = int(200 * (1 - pct))
+        self.setStyleSheet(
+            f"QPushButton{{background:#{r:02x}{g_c:02x}{b:02x};"
+            f"color:#ffffff;border:1px solid #{'ff' if _r.random()>0.5 else '00'}ff00;"
+            f"padding:0 4px;font-family:Consolas;}}"
+            f"QPushButton:hover{{background:#{min(255,r+30):02x}{g_c:02x}{b:02x};}}"
+        )
+        self.setText(f"{''.join(_r.choice(_GLITCH_CHARS) for _ in range(2))} {chars}")
+
+    # ── click handler ─────────────────────────────────────────────────────
+
+    def _on_click(self) -> None:
+        self._click_count += 1
+        pct = self._click_count / self._MAX_CLICKS
+
+        # Play a progressively higher-pitched sound via a generated tone
+        self._play_blip(pct)
+
+        if self._click_count >= self._MAX_CLICKS:
+            self._glitch_timer.stop()
+            self._pop()
+
+    def _play_blip(self, pct: float) -> None:
+        """Generate a tiny WAV blip with frequency scaling with pct (0→1)."""
+        import struct, tempfile, wave, os as _os
+        try:
+            rate    = 22050
+            freq    = 220 + int(1760 * pct)          # 220 Hz -> 1980 Hz over 100 clicks
+            dur_s   = 0.06
+            n       = int(rate * dur_s)
+            amp     = 16000
+            samples = b"".join(struct.pack('<h', int(amp * math.sin(2 * math.pi * freq * i / rate)))
+                               for i in range(n))
+            path = _os.path.join(tempfile.gettempdir(), f"mt_blip_{self._click_count}.wav")
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(samples)
+            # Find app's SoundManager to play it
+            for w in QApplication.topLevelWidgets():
+                sm = getattr(w, "sound", None)
+                if sm is not None:
+                    sm.play_sfx.__func__  # existence check
+                    break
+            # Fall back to winsound directly if available
+            try:
+                import winsound
+                winsound.PlaySound(path, winsound.SND_ASYNC | winsound.SND_FILENAME)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _pop(self) -> None:
+        """Flash white, shrink and vanish, then call on_pop."""
+        self.setEnabled(False)
+        self.setStyleSheet("QPushButton{background:#ffffff;color:#000000;border:2px solid #ff0000;}")
+        self.setText("💥 POP")
+        QTimer.singleShot(350, lambda: (self.hide(), self._on_pop()))
+
+
+class GhostTabWidget(QWidget):
+    """
+    Full tab panel for "Rigby" — the ghost companion on the Dashboard.
+
+    One click per real-time hour awards a random prize:
+      • 2 free Coffer spins
+      • 300 gold
+      • 10 reputation
+
+    On cooldown the ghost shakes to say "not yet".
+    On reward it bounces up, pauses, and slides back down.
+    """
+
+    _COOLDOWN_S = 3600  # 1 hour
+
+    def __init__(self, app: "GameApp", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._app      = app
+        self._at_rest  = True
+        self._anim: Optional[QPropertyAnimation] = None
+        self._pending_server_check: bool = False
+
+        # ── ghost image ───────────────────────────────────────────────────
+        pix_path = os.path.join(_HERE, "ghost.png")
+        raw      = QPixmap(pix_path)
+        self._px = UIScale.px(160)
+        if not raw.isNull():
+            scaled = raw.scaled(QSize(self._px, self._px),
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+            self._pixmap = scaled.transformed(
+                QTransform().rotate(8),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            self._pixmap = QPixmap()
+
+        # ── layout ────────────────────────────────────────────────────────
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(UIScale.px(16), UIScale.px(20),
+                               UIScale.px(16), UIScale.px(16))
+        lay.setSpacing(UIScale.px(12))
+        lay.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+
+        header = QLabel("👻  Rigby", self)
+        header.setFont(Fonts.mixed_heading)
+        header.setStyleSheet(f"color:{P.purple}; background:transparent;")
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(header)
+
+        sub = QLabel(
+            "Rigby wanders the market district after dark.\n"
+            "Click him once per hour to collect whatever he's found.",
+            self,
+        )
+        sub.setWordWrap(True)
+        sub.setFont(Fonts.mixed_small)
+        sub.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(sub)
+
+        # clickable ghost image container
+        self._ghost_btn = QLabel(self)
+        self._ghost_btn.setFixedSize(self._px + UIScale.px(16), self._px + UIScale.px(16))
+        self._ghost_btn.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ghost_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._ghost_btn.setToolTip("Click Rigby to collect his haul.")
+        self._ghost_btn.setStyleSheet(
+            f"background:{P.bg_card}; border:2px solid {P.border}; border-radius:{UIScale.px(12)}px;"
+        )
+        if not self._pixmap.isNull():
+            pm = self._pixmap.scaled(
+                self._ghost_btn.size() - QSize(UIScale.px(8), UIScale.px(8)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._ghost_btn.setPixmap(pm)
+        else:
+            self._ghost_btn.setText("👻")
+            self._ghost_btn.setFont(Fonts.title_large)
+        lay.addWidget(self._ghost_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self._status_lbl = QLabel("", self)
+        self._status_lbl.setFont(Fonts.mixed_small_bold)
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+        lay.addWidget(self._status_lbl)
+
+        lay.addStretch()
+        self._refresh_status()
+
+        # cooldown refresh timer — updates every 1 s for a smooth live countdown
+        self._cd_timer = QTimer(self)
+        self._cd_timer.setInterval(1_000)
+        self._cd_timer.timeout.connect(self._refresh_status)
+        self._cd_timer.start()
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _ghost_state(self) -> dict:
+        g = getattr(self._app, "game", None)
+        if g is None:
+            return {}
+        if not hasattr(g, "ghost_state"):
+            g.ghost_state = {}
+        return g.ghost_state
+
+    def _used_this_hour(self) -> bool:
+        import time as _t
+        last = float(self._ghost_state().get("last_click_real", 0.0))
+        return (_t.time() - last) < self._COOLDOWN_S
+
+    def _refresh_status(self) -> None:
+        import time as _t
+        if self._used_this_hour():
+            last = float(self._ghost_state().get("last_click_real", 0.0))
+            remaining_s = int(self._COOLDOWN_S - (_t.time() - last))
+            mins = remaining_s // 60
+            secs = remaining_s % 60
+            self._status_lbl.setText(f"Rigby is resting…  back in {mins}m {secs:02d}s")
+            self._status_lbl.setStyleSheet(f"color:{P.fg_dim}; background:transparent;")
+            self._ghost_btn.setStyleSheet(
+                f"background:{P.bg_card}; border:2px solid {P.border}; border-radius:{UIScale.px(12)}px; opacity:0.6;"
+            )
+        else:
+            self._status_lbl.setText("Rigby has something for you!  Click him to collect.")
+            self._status_lbl.setStyleSheet(f"color:{P.purple}; background:transparent;")
+            self._ghost_btn.setStyleSheet(
+                f"background:{P.bg_card}; border:2px solid {P.purple}; border-radius:{UIScale.px(12)}px;"
+            )
+
+    # ── Mouse event ────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        # Only react to clicks on the ghost button area
+        if not self._ghost_btn.geometry().contains(event.pos()):
+            return
+        if self._pending_server_check:
+            return  # already waiting for server
+
+        online = getattr(self._app, "online", None)
+        if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+            # Server-validated path: verify cooldown against real server time
+            self._pending_server_check = True
+            self._status_lbl.setText("Checking with Rigby's sources…")
+            online.timers.get_timers(
+                callback=lambda r: _queue_ui(self._app, lambda res=r: self._on_server_ghost_check(res))
+            )
+        else:
+            # Offline path — local time check only
+            if self._used_this_hour():
+                self._shake()
+            else:
+                self._award_and_bounce()
+
+    def _on_server_ghost_check(self, res: Any) -> None:
+        """Called on main thread after server timer fetch; awards or blocks based on server time."""
+        self._pending_server_check = False
+
+        if res.success and res.server_time is not None:
+            server_now  = res.server_time
+            row         = res.data or {}
+            cloud_last  = float(row.get("ghost_last_click", 0.0) or 0.0)
+            # Sync local state to the cloud value (most recent wins)
+            gs = self._ghost_state()
+            if cloud_last > float(gs.get("last_click_real", 0.0)):
+                gs["last_click_real"] = cloud_last
+            last = float(gs.get("last_click_real", 0.0))
+            remaining = int(self._COOLDOWN_S - (server_now - last))
+            if remaining > 0:
+                self._shake()
+                self._refresh_status()
+                return
+        else:
+            # Server check failed — fall back to local time
+            if self._used_this_hour():
+                self._shake()
+                return
+
+        self._award_and_bounce()
+
+    # ── Award ──────────────────────────────────────────────────────────────
+
+    def _award_and_bounce(self) -> None:
+        import time as _t
+        gs = self._ghost_state()
+        gs["last_click_real"] = _t.time()
+
+        # Push timestamp to cloud (fire-and-forget)
+        online = getattr(self._app, "online", None)
+        if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+            _click_ts = gs["last_click_real"]
+            online.timers.set_timer(ghost_last_click=_click_ts)
+
+        g = getattr(self._app, "game", None)
+        prize_roll = random.randint(0, 2)
+        if prize_roll == 0:
+            # 2 free coffer spins
+            if g is not None:
+                current = int(getattr(g.settings, "gamble_free_spins", 0) or 0)
+                g.settings.gamble_free_spins = current + 2
+            msg = "👻  Rigby rigged the Loot Coffer for you  (+2 free spins)"
+            notice = "Rigby gave you 2 free Coffer spins!"
+        elif prize_roll == 1:
+            # 300 gold
+            if g is not None:
+                g.inventory.gold = getattr(g.inventory, "gold", 0) + 300
+            msg = "👻  Rigby found some gold in the market drain  (+300g)"
+            notice = "Rigby found 300 gold for you!"
+        else:
+            # 10 reputation
+            if g is not None:
+                g._gain_reputation(10)
+            msg = "👻  Rigby put in a good word around the district  (+10 reputation)"
+            notice = "Rigby earned you 10 reputation!"
+
+        if g is not None and hasattr(g, "settings"):
+            try:
+                g.settings.save()
+            except Exception:
+                pass
+
+        GameToast(self._app, msg, P.purple, duration_ms=5000)
+        if hasattr(self._app, "app_footer"):
+            self._app.app_footer.show_notice(notice, P.purple, duration_ms=3500)
+        self._refresh_status()
+
+        # Bounce animation on the ghost label
+        if not self._at_rest:
+            return
+        self._at_rest = False
+        start_pos = self._ghost_btn.pos()
+        up_pos    = QPoint(start_pos.x(), start_pos.y() - UIScale.px(32))
+
+        def _slide_back() -> None:
+            a2 = QPropertyAnimation(self._ghost_btn, b"pos", self)
+            a2.setDuration(500)
+            a2.setStartValue(up_pos)
+            a2.setEndValue(start_pos)
+            a2.setEasingCurve(Easing.TOAST_IN)
+            a2.finished.connect(lambda: setattr(self, "_at_rest", True))
+            a2.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+            self._anim = a2
+
+        a = QPropertyAnimation(self._ghost_btn, b"pos", self)
+        a.setDuration(320)
+        a.setStartValue(start_pos)
+        a.setEndValue(up_pos)
+        a.setEasingCurve(Easing.SMOOTH)
+        a.finished.connect(lambda: QTimer.singleShot(400, _slide_back))
+        a.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._anim = a
+
+    # ── Shake (cooldown feedback) ──────────────────────────────────────────
+
+    def _shake(self) -> None:
+        if not self._at_rest:
+            return
+        self._at_rest = False
+        base = self._ghost_btn.pos()
+        d    = UIScale.px(6)
+        steps = [base + QPoint(d, 0), base - QPoint(d, 0)] * 3 + [base]
+        total_ms = 360
+        per_ms   = total_ms // len(steps)
+
+        def _next(i: int) -> None:
+            if i >= len(steps):
+                self._at_rest = True
+                return
+            a = QPropertyAnimation(self._ghost_btn, b"pos", self)
+            a.setDuration(per_ms)
+            a.setStartValue(self._ghost_btn.pos())
+            a.setEndValue(steps[i])
+            a.setEasingCurve(Easing.LINEAR)
+            a.finished.connect(lambda: _next(i + 1))
+            a.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+            self._anim = a
+
+        _next(0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # APP FOOTER  —  persistent bottom bar with Back / Save / Help / Quit
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -4963,6 +5374,41 @@ class AppFooter(QWidget):
         )
         self._notice_timer.start(max(800, int(duration_ms)))
 
+    def show_glitch_button(self) -> None:
+        """Spawn the Konami easter-egg glitch button in the footer (idempotent)."""
+        if getattr(self, "_glitch_btn", None) is not None:
+            return
+
+        def _on_pop() -> None:
+            self._glitch_btn = None
+            self._on_glitch_popped()
+
+        self._glitch_btn: Optional[_GlitchButton] = _GlitchButton(self, _on_pop)
+        # Insert before save_btn
+        lay = cast(QHBoxLayout, self.layout())
+        save_idx = lay.indexOf(self._save_btn)
+        if save_idx < 0:
+            save_idx = lay.count() - 1
+        lay.insertWidget(save_idx, self._glitch_btn)
+
+    def _on_glitch_popped(self) -> None:
+        """Show the ghost introduction dialog once the glitch button pops."""
+        dlg = GhostDialog(self)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted or True:   # always mark found
+            for w in QApplication.topLevelWidgets():
+                app = w if isinstance(w, QMainWindow) else None
+                if app is not None and hasattr(app, "game"):
+                    g = getattr(app, "game", None)
+                    if g is not None:
+                        if not hasattr(g, "ghost_state"):
+                            g.ghost_state = {}
+                        g.ghost_state["ghost_found"] = True
+                        refresh_fn = getattr(app, "refresh", None)
+                        if callable(refresh_fn):
+                            refresh_fn()
+                    break
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WINDOW RESIZER  —  edge-drag resize for frameless windows
@@ -5004,10 +5450,14 @@ class WindowResizer(QObject):
         self._dir:        str              = ""
         self._press_gpos: Optional[QPoint] = None
         self._press_geo:  Optional[QRect]  = None
-        QApplication.instance().installEventFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def uninstall(self) -> None:
-        QApplication.instance().removeEventFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
 
     # ── Edge detection ────────────────────────────────────────────────────────
 
@@ -5036,6 +5486,8 @@ class WindowResizer(QObject):
         t = event.type()
 
         if t == QEvent.Type.MouseMove:
+            if not isinstance(event, QMouseEvent):
+                return False
             gp = event.globalPosition().toPoint()
             lp = self._win.mapFromGlobal(gp)
             if self._dir:
@@ -5055,6 +5507,8 @@ class WindowResizer(QObject):
             return False
 
         elif t == QEvent.Type.MouseButtonPress:
+            if not isinstance(event, QMouseEvent):
+                return False
             if event.button() == Qt.MouseButton.LeftButton:
                 gp = event.globalPosition().toPoint()
                 lp = self._win.mapFromGlobal(gp)
@@ -5069,6 +5523,8 @@ class WindowResizer(QObject):
             return False
 
         elif t == QEvent.Type.MouseButtonRelease:
+            if not isinstance(event, QMouseEvent):
+                return False
             if self._dir and event.button() == Qt.MouseButton.LeftButton:
                 self._dir        = ""
                 self._press_gpos = None
@@ -5191,7 +5647,7 @@ class SoundManager(QObject):
         self._playlist_phase = "stopped"
 
         try:
-            from PySide6.QtMultimedia import QSoundEffect
+            from PySide6.QtMultimedia import QSoundEffect  # type: ignore[reportMissingModuleSource]
             from PySide6.QtCore import QUrl
 
             self._qt_sound_cls = QSoundEffect
@@ -5370,7 +5826,7 @@ class SoundManager(QObject):
         if self._qt_sound_cls is not None and self._qt_url_cls is not None:
             effect = self._qt_sound_cls(self)
             effect.setSource(self._qt_url_cls.fromLocalFile(path))
-            effect.setLoopCount(self._qt_sound_cls.Infinite)
+            effect.setLoopCount(-1)  # QSoundEffect.Loops.Infinite
             effect.setVolume(volume)
             effect.play()
             self._looping_sfx[key] = {"backend": "qt", "effect": effect, "path": path, "volume_scale": float(volume_scale)}
@@ -5458,7 +5914,7 @@ class SoundManager(QObject):
                 self._music_effect.deleteLater()
             self._music_effect = self._qt_sound_cls(self)
             self._music_effect.setSource(self._qt_url_cls.fromLocalFile(path))
-            self._music_effect.setLoopCount(self._qt_sound_cls.Infinite if loop else 1)
+            self._music_effect.setLoopCount(-1 if loop else 1)  # QSoundEffect.Loops.Infinite
             self._music_effect.setVolume(0.0 if self._music_enabled else 0.0)
             self._music_effect.play()
             self._fade_music_in(self._MUSIC_FADE_IN_MS)
@@ -5839,6 +6295,7 @@ class SoundManager(QObject):
             handle.writeframes(frames)
 
     def _build_longform_music_pcm(self, name: str, rate: int) -> Any:
+        assert np is not None
         spec = self._song_blueprint(name)
         beat = 60.0 / spec["bpm"]
         bar = beat * 4.0
@@ -6056,6 +6513,7 @@ class SoundManager(QObject):
         return "gentle"
 
     def _apply_master_music_envelope(self, mix: Any, rate: int, *, fade_in_s: float, fade_out_s: float) -> None:
+        assert np is not None
         length = len(mix)
         if length <= 0:
             return
@@ -6070,6 +6528,7 @@ class SoundManager(QObject):
         mix *= env
 
     def _apply_section_transition_np(self, mix: Any, boundary: float, rate: int, rng: Any, style: str) -> None:
+        assert np is not None
         center = int(boundary * rate)
         if center <= 0 or center >= len(mix):
             return
@@ -6130,6 +6589,7 @@ class SoundManager(QObject):
         release: float,
         vibrato: float = 0.0,
     ) -> None:
+        assert np is not None
         start_i = max(0, int(start * rate))
         length = max(1, int(duration * rate))
         end_i = min(len(mix), start_i + length)
@@ -6179,6 +6639,7 @@ class SoundManager(QObject):
             self._mix_noise_hit_np(mix, start + beat * beat_idx, beat * 0.08, 1200.0, amp * 0.35, rate, rng)
 
     def _mix_noise_hit_np(self, mix: Any, start: float, duration: float, tone: float, amp: float, rate: int, rng: Any) -> None:
+        assert np is not None
         start_i = max(0, int(start * rate))
         length = max(1, int(duration * rate))
         end_i = min(len(mix), start_i + length)
@@ -6321,9 +6782,15 @@ class GameApp(QMainWindow):
         # ── Window resizer — edge-drag resize for frameless window ────────
         self._resizer = WindowResizer(self)
 
+        # ── Konami code tracker ───────────────────────────────────────────
+        self._konami_idx: int = 0
+        self._last_konami_ts: int = -1   # timestamp of last processed key — prevents duplicate events for one physical keypress
+
         # ── Ctrl+Wheel → UI scale (application-level event filter) ────────
-        QApplication.instance().installEventFilter(self)
-        QApplication.instance().installEventFilter(self._tooltip_filter)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            app.installEventFilter(self._tooltip_filter)
 
         # ── Window close handler ─────────────────────────────────────────
         # (closeEvent is overridden below)
@@ -6552,14 +7019,13 @@ class GameApp(QMainWindow):
         """Drive the footer paw-trail hint based on current cat easter-egg state."""
         if not hasattr(self, "app_footer"):
             return
-        # DEBUG: always active so visuals can be verified.
-        # Restore the real condition for release:
-        #   game = getattr(self, "game", None)
-        #   has_treat = getattr(game, "has_cat_treat", lambda: False)()
-        #   help_unlocked = bool(game.cat_state.get("cat_help_unlocked", False))
-        #   resolved = bool(game.cat_state.get("adoption_resolved", False))
-        #   self.app_footer.update_cat_hint(bool(has_treat) and not help_unlocked and not resolved)
-        self.app_footer.update_cat_hint(True)
+        game = getattr(self, "game", None)
+        if game is None:
+            self.app_footer.update_cat_hint(False)
+            return
+        has_treat  = getattr(game, "has_cat_treat", lambda: False)()
+        resolved   = bool(game.cat_state.get("adoption_resolved", False))
+        self.app_footer.update_cat_hint(bool(has_treat) and not resolved)
 
     def _check_news_feed_toasts(self) -> None:
         """Show a GameToast whenever a new world event is added to the news feed."""
@@ -6937,14 +7403,84 @@ class GameApp(QMainWindow):
         local_meta = self._peek_local_save(self.game.SAVE_FILE, self.game.bound_user_id if is_online else "") if has_local else None
 
         if is_online and self.online:
-            try:
-                meta_res = self.online.saves.list_saves()
-                if meta_res and getattr(meta_res, "success", False):
-                    rows = meta_res.data if isinstance(meta_res.data, list) else []
-                    if rows:
-                        cloud_meta = rows[0]
-            except Exception:
-                cloud_meta = None
+            # list_saves() is a network call — run it off the main thread to
+            # prevent the UI from hanging (especially noticeable on new accounts).
+            self.message_bar.info("Checking cloud saves…")
+            QApplication.processEvents()
+
+            # Guard flag: ensures _resolve_startup_save_with_cloud is called
+            # exactly once regardless of whether the worker, the error handler,
+            # or the safety timeout fires first.
+            self._startup_cloud_resolved = False
+
+            def _fetch_cloud_meta() -> Optional[Dict[str, Any]]:
+                online = self.online
+                if online is None:
+                    return None
+                try:
+                    meta_res = online.saves.list_saves()
+                    if meta_res and getattr(meta_res, "success", False):
+                        rows = meta_res.data if isinstance(meta_res.data, list) else []
+                        if rows:
+                            return rows[0]
+                except Exception:
+                    pass
+                return None
+
+            def _on_cloud_meta(result: Optional[Dict[str, Any]]) -> None:
+                if getattr(self, "_startup_cloud_resolved", False):
+                    return
+                self._startup_cloud_resolved = True
+                self._startup_worker = None
+                _queue_ui(self, lambda: self._resolve_startup_save_with_cloud(
+                    online_greeting, local_meta, result))
+
+            def _on_cloud_error(_err: str) -> None:
+                if getattr(self, "_startup_cloud_resolved", False):
+                    return
+                self._startup_cloud_resolved = True
+                self._startup_worker = None
+                _queue_ui(self, lambda: self._resolve_startup_save_with_cloud(
+                    online_greeting, local_meta, None))
+
+            # Keep the worker alive on self so Python's GC doesn't collect
+            # w.signals before the background thread has a chance to emit.
+            self._startup_worker = Worker(_fetch_cloud_meta)
+            self._startup_worker.signals.result.connect(_on_cloud_meta)
+            self._startup_worker.signals.error.connect(_on_cloud_error)
+            self._pool.start(self._startup_worker)
+
+            # Safety timeout: if the network call hasn't responded in 15 s,
+            # give up and continue with whatever local data we have.
+            def _cloud_timeout() -> None:
+                if getattr(self, "_startup_cloud_resolved", False):
+                    return
+                self._startup_cloud_resolved = True
+                self._startup_worker = None
+                self.message_bar.warn("Cloud check timed out — loading local save.")
+                self._resolve_startup_save_with_cloud(online_greeting, local_meta, None)
+
+            self._startup_cloud_timer = QTimer(self)
+            self._startup_cloud_timer.setSingleShot(True)
+            self._startup_cloud_timer.timeout.connect(_cloud_timeout)
+            self._startup_cloud_timer.start(15_000)
+
+            return  # remainder runs in _resolve_startup_save_with_cloud
+
+        # Offline path — no network calls needed, run synchronously
+        self._resolve_startup_save_with_cloud(online_greeting, local_meta, None)
+
+    def _resolve_startup_save_with_cloud(
+        self,
+        online_greeting: Optional[str],
+        local_meta: Optional[Dict[str, Any]],
+        cloud_meta: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Second half of startup save resolution — runs on the main thread after
+        the async cloud-meta fetch completes (or immediately for offline play).
+        """
+        is_new_game = True
 
         if local_meta and cloud_meta and self.online:
             local_newer = self._local_save_is_newer(local_meta, cloud_meta)
@@ -6961,6 +7497,8 @@ class GameApp(QMainWindow):
             ).choose()
 
             if pick == "cloud":
+                self.message_bar.info("Downloading cloud save…")
+                QApplication.processEvents()
                 pull_res = self.online.saves.download_save()
                 if pull_res and getattr(pull_res, "success", False) and self._write_cloud_to_disk(pull_res) and self.game.load_game():
                     is_new_game = bool(getattr(self.game, "should_offer_new_game_tutorial", lambda: False)())
@@ -6985,6 +7523,8 @@ class GameApp(QMainWindow):
                 self._last_synced_day = self.game._absolute_day()
 
         elif cloud_meta and self.online:
+            self.message_bar.info("Downloading cloud save…")
+            QApplication.processEvents()
             pull_res = self.online.saves.download_save()
             if pull_res and getattr(pull_res, "success", False) and self._write_cloud_to_disk(pull_res) and self.game.load_game():
                 is_new_game = bool(getattr(self.game, "should_offer_new_game_tutorial", lambda: False)())
@@ -7058,12 +7598,60 @@ class GameApp(QMainWindow):
     def _run_post_startup_online_tasks(self, online_greeting: str) -> None:
         self._pending_online_greeting = None
         self.message_bar.ok(f"Signed in as {online_greeting}.")
-        QTimer.singleShot(150, self._bootstrap_online_reward_mail)
-        QTimer.singleShot(250, self._refresh_inbox_badge)
-        QTimer.singleShot(400, self._push_online_presence)
-        QTimer.singleShot(650, self._push_leaderboard)
-        QTimer.singleShot(900, self._update_sync_status)
+        QTimer.singleShot(50,   self._pull_player_timers)
+        QTimer.singleShot(150,  self._bootstrap_online_reward_mail)
+        QTimer.singleShot(250,  self._refresh_inbox_badge)
+        QTimer.singleShot(400,  self._push_online_presence)
+        QTimer.singleShot(650,  self._push_leaderboard)
+        QTimer.singleShot(900,  self._update_sync_status)
         QTimer.singleShot(1200, self._start_cloud_sync)
+
+    def _pull_player_timers(self) -> None:
+        """Pull cloud cooldown timestamps and apply them to local game state."""
+        online = getattr(self, "online", None)
+        if not (online and getattr(online, "is_online", False) and hasattr(online, "timers")):
+            return
+
+        def _cb(res: Any) -> None:
+            _queue_ui(self, lambda r=res: self._apply_player_timers(r))
+
+        try:
+            online.timers.get_timers(callback=_cb)
+        except Exception:
+            pass
+
+    def _apply_player_timers(self, res: Any) -> None:
+        """Apply cloud timer row to local game state, taking the more-recent value."""
+        if not getattr(res, "success", False) or not isinstance(getattr(res, "data", None), dict):
+            return
+        data = res.data
+        import time as _t
+
+        # Ghost — unix float timestamp
+        cloud_ghost = float(data.get("ghost_last_click", 0.0) or 0.0)
+        local_ghost_state = getattr(self.game, "ghost_state", {}) if hasattr(self, "game") else {}
+        local_ghost = float(local_ghost_state.get("last_click_real", 0.0))
+        if cloud_ghost > local_ghost:
+            if not hasattr(self.game, "ghost_state"):
+                self.game.ghost_state = {}
+            self.game.ghost_state["last_click_real"] = cloud_ghost
+
+        # Cat — unix float → ISO date string
+        cloud_cat_ts = float(data.get("cat_last_pet", 0.0) or 0.0)
+        if cloud_cat_ts > 0:
+            from datetime import datetime as _dt
+            cloud_cat_date = _dt.utcfromtimestamp(cloud_cat_ts).date().isoformat()
+            local_cat_date = self.game.cat_state.get("last_pet_real_day", "")
+            if cloud_cat_date >= local_cat_date:
+                self.game.cat_state["last_pet_real_day"] = cloud_cat_date
+
+        # Marriage — ISO date string; if cloud says today, mark today's visit done
+        cloud_ms = str(data.get("marriage_last_visit", "") or "")
+        if cloud_ms:
+            from datetime import date as _date
+            today = _date.today().isoformat()
+            if cloud_ms == today:
+                self.game.marriage_state["last_visit_abs_day"] = self.game._absolute_day()
 
     def _bootstrap_online_reward_mail(self) -> None:
         online = self.online
@@ -7356,9 +7944,58 @@ class GameApp(QMainWindow):
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         """
         Intercepts Ctrl+MouseWheel globally to scale the UI up / down.
-        Step: ±0.1 per wheel notch.  Clamped to 0.7 – 2.5 by UIScale.set().
+        Step: \u00b10.1 per wheel notch.  Clamped to 0.7 \u2013 2.5 by UIScale.set().
+        Also tracks the Konami code sequence to trigger the ghost easter egg.
+
+        Konami tracking uses KeyPress so arrow keys are detected (ShortcutOverride
+        is never sent for arrow keys because they have no registered shortcuts).
+        When a sequence is in progress (idx > 0), all managed hotkeys are disabled
+        so pressing B or A at the right step doesn't also navigate to a screen.
+        ShortcutOverride is used only to suppress the QShortcut for B/A when they
+        are the expected next Konami key.
         """
-        if event.type() == QEvent.Type.Wheel:
+        if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            key = event.key()
+            key_name = QKeySequence(key).toString()
+            ts = event.timestamp()
+            # A single physical keypress generates one KeyPress event per widget
+            # in the delivery chain.  Skip duplicates via timestamp deduplication
+            # so each physical keypress is counted exactly once.
+            if ts != self._last_konami_ts:
+                self._last_konami_ts = ts
+                # Ignore pure modifier keypresses
+                if key not in (Qt.Key.Key_Control, Qt.Key.Key_Shift,
+                               Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+                    expected = _KONAMI_SEQUENCE[self._konami_idx]
+                    expected_name = QKeySequence(expected).toString()
+                    if key == expected:
+                        self._konami_idx += 1
+                        # Disable hotkeys as soon as sequence starts so B/A
+                        # don't fire navigation shortcuts mid-sequence
+                        if self._konami_idx == 1:
+                            self.hotkeys.set_enabled(False)
+                        if self._konami_idx >= len(_KONAMI_SEQUENCE):
+                            self._konami_idx = 0
+                            self.hotkeys.set_enabled(True)
+                            QTimer.singleShot(0, self._on_konami)
+                    else:
+                        # Wrong key — reset and re-enable hotkeys
+                        prev_idx = self._konami_idx
+                        # Check if the wrong key restarts the sequence
+                        self._konami_idx = 1 if key == _KONAMI_SEQUENCE[0] else 0
+                        if self._konami_idx == 1 and prev_idx == 0:
+                            self.hotkeys.set_enabled(False)
+                        elif self._konami_idx == 0 and prev_idx > 0:
+                            self.hotkeys.set_enabled(True)
+
+        # When a letter/key that is a QShortcut target is the expected Konami
+        # step, suppress the shortcut via ShortcutOverride so navigation is blocked
+        if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+            key = event.key()
+            if (self._konami_idx > 0 and
+                    key == _KONAMI_SEQUENCE[self._konami_idx]):
+                event.accept()  # suppresses the matching QShortcut
+        if event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
                 if delta != 0:
@@ -7366,9 +8003,16 @@ class GameApp(QMainWindow):
                     UIScale.set(round(UIScale.factor() + step, 1))
                 return True   # always consume Ctrl+Wheel
         if event.type() == QEvent.Type.MouseButtonPress and isinstance(obj, QAbstractButton):
-            if obj.isEnabled() and obj.isVisible():
+            if obj.isEnabled() and obj.isVisible() and not isinstance(obj, _GlitchButton):
                 self.sound.play_ui_click()
         return super().eventFilter(obj, event)
+
+    def _on_konami(self) -> None:
+        """Spawn the glitch button if the ghost hasn't been found yet."""
+        gs = getattr(self.game, "ghost_state", {})
+        if gs.get("ghost_found"):
+            return
+        self.app_footer.show_glitch_button()
 
     def _do_save(self) -> None:
         self._master_log_action("Manual save requested", sub="Save")
@@ -7620,7 +8264,9 @@ class GameApp(QMainWindow):
                     pass  # already quitting, best-effort only
 
         # 4. Hard-quit — bypass closeEvent so it cannot save again
-        QApplication.instance().quit()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _do_bankruptcy_restart(self) -> None:
         deleted: List[str] = []
@@ -7786,7 +8432,9 @@ class GameApp(QMainWindow):
 
     def _on_scale_changed(self, scale: float) -> None:
         """Re-apply QSS and rebuild dynamic-height widgets when UI scale changes."""
-        QApplication.instance().setStyleSheet(_build_qss(scale))
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.setStyleSheet(_build_qss(scale))
         self.title_bar.setFixedHeight(UIScale.px(38))
         if hasattr(self, "game_header"):
             self.game_header.setFixedHeight(UIScale.px(GameHeader.H))
@@ -7837,7 +8485,7 @@ class GameApp(QMainWindow):
 
     # ── Windows native resize (WM_NCHITTEST → Aero Snap) ─────────────────────
 
-    def nativeEvent(self, event_type: QByteArray, message: object) -> tuple:
+    def nativeEvent(self, event_type: QByteArray, message: object) -> Tuple[bool, int]:
         """
         On Windows: delegate edge-zone hit-testing to the OS via WM_NCHITTEST
         so the window benefits from Aero Snap, magnetic screen edges, and the
@@ -7849,7 +8497,7 @@ class GameApp(QMainWindow):
                 import ctypes
                 import ctypes.wintypes as wt
                 WM_NCHITTEST = 0x0084
-                msg = ctypes.cast(int(message),
+                msg = ctypes.cast(int(message),  # type: ignore[arg-type]
                                   ctypes.POINTER(wt.MSG)).contents
                 if msg.message == WM_NCHITTEST and not self.isMaximized():
                     # Decode LPARAM as two signed 16-bit screen coords
@@ -7861,7 +8509,7 @@ class GameApp(QMainWindow):
                         return True, WindowResizer._HIT_CODE[d]
             except Exception:
                 pass
-        return super().nativeEvent(event_type, message)
+        return cast(Tuple[bool, int], super().nativeEvent(event_type, message))  # type: ignore[arg-type]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8453,7 +9101,7 @@ class HelpScreen(Screen):
         elif self.game.cat_state.get("cat_left", False):
             summary = "The narrow gap beneath the shelving is bare. Dust has already begun to close over the entrance."
         elif getattr(self.game, "has_cat_treat", lambda: False)():
-            summary = "Following the paw prints leads to a small stack of crates behind a bakery."
+            summary = "Following the paw prints leads to a small corner behind a bakery."
         else:
             summary = "Dried paw prints stop at a gap in the floor planking and do not continue."
         return {
@@ -8470,10 +9118,6 @@ class HelpScreen(Screen):
                         "It looks like something small has been living back there for a while.",
                     ],
                 ),
-            ],
-            "tips": [
-                "The trail only stirred after something small turned up in the storeroom.",
-                "Whatever waits behind the shelving has been waiting considerably longer than you have.",
             ],
         }
 
@@ -8617,8 +9261,7 @@ class HelpScreen(Screen):
             )
         elif getattr(self.game, "has_cat_treat", lambda: False)():
             state_lbl.setText(
-                "Your hand finds the dried fish in your coat pocket.  Behind the iron"
-                " shelving, something goes very still and waits."
+                "You remember the small treat you found. It is still there in your pocket."
             )
             use_btn = MtButton("Offer the Treat", card, role="primary")
             use_btn.clicked.connect(self._use_treat_from_help)
@@ -8637,18 +9280,18 @@ class HelpScreen(Screen):
             return
         adopt = _popup_confirm(
             self,
-            "A Small Visitor",
-            "A thin cat slips from the gap behind the shelving and winds once around your ankle"
-            " without looking up.  She is watching the counting-room door, not you."
-            "\n\nLet her stay?",
-            confirm_text="Yes, let her stay",
-            cancel_text="Leave her be",
+            "A Small Kitten",
+            "A thin, white kitten slips from the gap behind the crates and winds once around your ankle."
+            " It purrs softly and looks up to you, gently requesting the treat in your hand."
+            "\n\nAdopt the kitten?",
+            confirm_text="Adopt Kitten",
+            cancel_text="Leave it be",
         )
         if adopt:
             name = _popup_get_text(
                 self,
-                "She Will Need a Name",
-                "She will need something to answer to.  Choose carefully — she will ignore it either way."
+                "It Will Need a Name",
+                "It will need something to answer to.  Choose carefully — Name can not be changed later."
                 "\n\nMaximum 15 characters.",
                 default="Stray",
                 placeholder="A name for the cat",
@@ -8656,17 +9299,19 @@ class HelpScreen(Screen):
                 max_length=15,
             )
             cat_name = getattr(self.game, "adopt_cat", lambda value: value)(name or "Stray")
+            if hasattr(self.app, "app_footer"):
+                self.app.app_footer.update_cat_hint(False)
             self.msg.ok(
-                f"{cat_name} claims a warm corner of the ledger room."
-                f"  The mice were already leaving."
+                f"{cat_name} claims a warm corner of your dashboard."
+                f"  You can pet {cat_name} once a day for a reputation boost!"
             )
-            GameToast(self.app, f"\U0001f431  {cat_name} has claimed the ledger room. The mice know it too.", P.gold, duration_ms=15_000)
         else:
             getattr(self.game, "decline_cat", lambda: None)()
+            if hasattr(self.app, "app_footer"):
+                self.app.app_footer.update_cat_hint(False)
             self.msg.info(
                 "The cat withdraws behind the shelving.  The gap is empty when you look again."
             )
-            GameToast(self.app, "\U0001f43e  The cat withdraws behind the shelving.", P.fg_dim, duration_ms=15_000)
         try:
             self.game.save_game(silent=True)
         except Exception:
@@ -8844,6 +9489,78 @@ class AppDialog(QDialog):
                 pg.x() + max(0, (pg.width() - self.width()) // 2),
                 pg.y() + max(0, (pg.height() - self.height()) // 2),
             )
+
+
+class GhostDialog(AppDialog):
+    """
+    Post-konami ghost introduction dialog.
+    Left: ghost.png image.
+    Right: flavour text + '...uhh..ok' button.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(
+            parent,
+            "An Unexpected Guest",
+            frame_bg=P.bg_dialog,
+            body_bg=P.bg_dialog,
+            title_bg=P.bg_dialog_hdr,
+            border=P.purple,
+            title_fg=P.purple,
+        )
+        self.resize(UIScale.px(480), UIScale.px(260))
+        self._build_body()
+        self.center_on_parent()
+
+    def _build_body(self) -> None:
+        root = self.body_layout(
+            margins=(UIScale.px(16), UIScale.px(14), UIScale.px(16), UIScale.px(16)),
+            spacing=UIScale.px(10),
+        )
+
+        row = QHBoxLayout()
+        row.setSpacing(UIScale.px(14))
+
+        # Ghost image
+        img_lbl = QLabel(self._body)
+        img_lbl.setFixedSize(UIScale.px(96), UIScale.px(96))
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ghost_path = os.path.join(_HERE, "ghost.png")
+        pix = QPixmap(ghost_path)
+        if not pix.isNull():
+            img_lbl.setPixmap(pix.scaled(img_lbl.size(),
+                                          Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation))
+        else:
+            img_lbl.setText("👻")
+            img_lbl.setFont(Fonts.title_large)
+            img_lbl.setStyleSheet(f"color:{P.purple}; background:transparent;")
+        img_lbl.setStyleSheet(img_lbl.styleSheet() +
+                              f"background:{P.bg_shadow}; border:1px solid {P.purple}; border-radius:{UIScale.px(6)}px;")
+        row.addWidget(img_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        # Text side
+        txt = QVBoxLayout()
+        txt.setSpacing(UIScale.px(8))
+        msg = QLabel(
+            "OK ok!  You got me.\n\n"
+            "I guess there's no point in hiding anymore huh?\n\n"
+            "Guess I'll just hang out here with you. \n\n"
+            "I'm Rigby, by the way. Nice to meet you!",
+            self._body,
+        )
+        msg.setFont(Fonts.mixed)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color:{P.fg}; background:transparent;")
+        txt.addWidget(msg)
+        txt.addStretch()
+
+        ok_btn = MtButton("...uhh..ok", self._body, role="primary")
+        ok_btn.clicked.connect(self.accept)
+        txt.addWidget(ok_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        row.addLayout(txt, 1)
+
+        root.addLayout(row, 1)
 
 
 class ConfirmDialog(AppDialog):
@@ -9941,13 +10658,13 @@ class ManagerConfigDialog(AppDialog):
                 kind = field.get("kind", "float")
                 widget = self._widgets[key]
                 if kind == "bool":
-                    updated[key] = bool(widget.isChecked())
+                    updated[key] = bool(cast(QCheckBox, widget).isChecked())
                 elif kind == "choice":
-                    updated[key] = widget.currentData()
+                    updated[key] = cast(QComboBox, widget).currentData()
                 elif kind == "int":
-                    updated[key] = int(str(widget.text()).strip())
+                    updated[key] = int(str(cast(QLineEdit, widget).text()).strip())
                 else:
-                    value = float(str(widget.text()).strip())
+                    value = float(str(cast(QLineEdit, widget).text()).strip())
                     if field.get("clamp"):
                         lo, hi = field["clamp"]
                         value = max(lo, min(hi, value))
@@ -10756,10 +11473,13 @@ class LaunchScreen(Screen):
             self._set_busy(False)
             return
 
-        if not self._remember.isChecked():
-            self.app.online.auth.clear_saved_session()
+        online = getattr(self.app, "online", None)
+        auth = getattr(online, "auth", None) if online else None
 
-        username = self.app.online.auth.username or "Merchant"
+        if not self._remember.isChecked() and auth is not None:
+            auth.clear_saved_session()
+
+        username = getattr(auth, "username", None) or "Merchant"
         self._set_status(f"Welcome back, {username}. Preparing your save data…", P.green)
         QTimer.singleShot(250, lambda: self.app._complete_authenticated_startup(username))
 
@@ -10868,6 +11588,119 @@ class _SignaturePad(QWidget):
             p.drawPath(path)
         if self._current is not None:
             p.drawPath(self._current)
+
+
+class _SealStampOverlay(QWidget):
+    """
+    One-shot stamp impact overlay for SignatureDialog.
+    Transparent child of the dialog body; draws a red flash and an
+    expanding shockwave ring centred on the Guild Seal, then calls on_done.
+    """
+
+    _FLASH_PEAK_ALPHA = 230
+    _FLASH_FADE_MS    = 190
+    _RING_MAX_MULT    = 2.9   # seal-radii the ring expands to
+    _RING_TICK_MS     = 14    # ~70 fps
+    _RING_DURATION_MS = 390
+    _PRE_DELAY_MS     = 55    # brief settle before impact
+    _CLOSE_DELAY_MS   = 540   # ms after impact before on_done fires
+
+    def __init__(self, body: QWidget, seal: QWidget, on_done: Callable[[], None]) -> None:
+        super().__init__(body)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self._seal        = seal
+        self._on_done     = on_done
+        self._flash_alpha = 0
+        self._ring_pct    = 0.0
+        self._ring_alpha  = 0
+        self._ring_ticks  = 0
+        self._ring_total  = max(1, self._RING_DURATION_MS // self._RING_TICK_MS)
+        self._ring_timer  = QTimer(self)
+        self._ring_timer.setInterval(self._RING_TICK_MS)
+        self._ring_timer.timeout.connect(self._step_ring)
+        self._flash_ticks = 0
+        self._flash_total = max(1, self._FLASH_FADE_MS // self._RING_TICK_MS)
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(self._RING_TICK_MS)
+        self._flash_timer.timeout.connect(self._step_flash)
+        self.setGeometry(body.rect())
+        self.raise_()
+        self.show()
+        QTimer.singleShot(self._PRE_DELAY_MS, self._impact)
+
+    def _seal_center(self) -> QPoint:
+        global_tl = self._seal.mapToGlobal(QPoint(0, 0))
+        local_tl  = self.mapFromGlobal(global_tl)
+        return QPoint(local_tl.x() + self._seal.width() // 2, local_tl.y() + self._seal.height() // 2)
+
+    def _seal_radius(self) -> int:
+        return max(self._seal.width(), self._seal.height()) // 2
+
+    def _impact(self) -> None:
+        """Frame-0 of the animation: flash appears and sound fires."""
+        self._flash_alpha = self._FLASH_PEAK_ALPHA
+        self._ring_alpha  = 200
+        self._ring_pct    = 0.0
+        self.update()
+        # Play stamp sound via the top-level GameApp instance
+        for w in QApplication.topLevelWidgets():
+            sound = getattr(w, "sound", None)
+            if sound is not None and hasattr(sound, "play_sfx"):
+                sound.play_sfx("stamp")
+                break
+        self._ring_ticks  = 0
+        self._flash_ticks = 0
+        self._ring_timer.start()
+        self._flash_timer.start()
+        QTimer.singleShot(self._CLOSE_DELAY_MS, self._finish)
+
+    def _step_flash(self) -> None:
+        self._flash_ticks += 1
+        progress = min(1.0, self._flash_ticks / self._flash_total)
+        self._flash_alpha = max(0, int(self._FLASH_PEAK_ALPHA * (1.0 - progress)))
+        self.update()
+        if progress >= 1.0:
+            self._flash_timer.stop()
+
+    def _step_ring(self) -> None:
+        self._ring_ticks += 1
+        progress = min(1.0, self._ring_ticks / self._ring_total)
+        self._ring_pct   = float(progress)
+        self._ring_alpha = max(0, int(200 * (1.0 - progress ** 0.55)))
+        self.update()
+        if progress >= 1.0:
+            self._ring_timer.stop()
+
+    def _finish(self) -> None:
+        self._ring_timer.stop()
+        self._flash_timer.stop()
+        self.hide()
+        if self._on_done:
+            self._on_done()
+
+    def paintEvent(self, _event) -> None:
+        if self._flash_alpha <= 0 and self._ring_pct <= 0.0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        c  = self._seal_center()
+        cx, cy = c.x(), c.y()
+        r0 = self._seal_radius()
+        # Flash circle over the seal face
+        if self._flash_alpha > 0:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 90, 90, self._flash_alpha))
+            p.drawEllipse(QPoint(cx, cy), r0, r0)
+        # Expanding shockwave ring
+        if self._ring_pct > 0.0 and self._ring_alpha > 0:
+            ring_r = int(r0 * (1.0 + (self._RING_MAX_MULT - 1.0) * self._ring_pct))
+            pen_w  = max(1, round(4 * (1.0 - self._ring_pct) + 1))
+            pen    = QPen(QColor(210, 40, 40, self._ring_alpha))
+            pen.setWidth(pen_w)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPoint(cx, cy), ring_r, ring_r)
 
 
 class SignatureDialog(AppDialog):
@@ -11012,6 +11845,7 @@ class SignatureDialog(AppDialog):
         seal_text.setFont(Fonts.small)
         seal_text.setStyleSheet("color:#f0c0b0;background:transparent;")
         seal_lay.addWidget(seal_text)
+        self._seal = seal
         body_row.addWidget(seal, 0, Qt.AlignmentFlag.AlignBottom)
         root.addLayout(body_row, 1)
 
@@ -11035,10 +11869,12 @@ class SignatureDialog(AppDialog):
         btns.addWidget(decline_btn)
         btns.addWidget(sign_btn)
         root.addLayout(btns)
+        self._sign_btn = sign_btn
 
     def _accept(self) -> None:
         self._accepted = True
-        self.accept()
+        self._sign_btn.setEnabled(False)
+        _SealStampOverlay(self._body, self._seal, self.accept)
 
     def wait(self) -> bool:
         self.exec()
@@ -11395,7 +12231,7 @@ class InboxDialog(AppDialog):
 
         staged = getattr(self._app, "_debug_messages", None)
         if staged is not None:
-            self._app._debug_messages = None
+            self._app._debug_messages = []
             msgs = list(staged)
             self._populate_messages(msgs)
             self._app.game_header.set_inbox_badge(
@@ -11431,7 +12267,8 @@ class InboxDialog(AppDialog):
     def _on_messages_loaded(self, result: object, error_text: str) -> None:
         """Called on the main thread after the background fetch completes."""
         if result and getattr(result, "success", False):
-            msgs = result.data if isinstance(result.data, list) else []
+            data = getattr(result, "data", None)
+            msgs = data if isinstance(data, list) else []
             self._populate_messages(msgs)
             unread = sum(0 if bool(msg.get("is_read", False)) else 1 for msg in msgs)
             try:
@@ -11481,7 +12318,11 @@ class InboxDialog(AppDialog):
         body         = str(msg.get("body",             ""))
         created      = str(msg.get("created_at",       ""))[:10]
         msg_type     = str(msg.get("msg_type",         "notification"))
-        msg_id       = msg.get("id")
+        msg_id_raw   = msg.get("id")
+        try:
+            msg_id = int(msg_id_raw) if msg_id_raw is not None else None
+        except (TypeError, ValueError):
+            msg_id = None
 
         frame = QFrame(self._msg_inner)
         frame.setObjectName("dashPanel")
@@ -11544,8 +12385,11 @@ class InboxDialog(AppDialog):
             claim_btn = QPushButton(f"{Sym.YES}  Claim Reward", frame)
             claim_btn.setFont(Fonts.small)
             claim_btn.setFixedHeight(UIScale.px(24))
-            claim_btn.clicked.connect(
-                lambda _, mid=msg_id, m=msg: self._claim_reward(mid, m))
+            if msg_id is not None:
+                claim_btn.clicked.connect(
+                    lambda _, mid=msg_id, m=msg: self._claim_reward(mid, m))
+            else:
+                claim_btn.setEnabled(False)
             lay.addWidget(claim_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         # Delete button
@@ -11553,8 +12397,11 @@ class InboxDialog(AppDialog):
         del_btn.setFont(Fonts.small)
         del_btn.setFixedHeight(UIScale.px(22))
         del_btn.setProperty("role", "danger")
-        del_btn.clicked.connect(
-            lambda _, f=frame, mid=msg_id: self._delete_message(f, mid))
+        if msg_id is not None:
+            del_btn.clicked.connect(
+                lambda _, f=frame, mid=msg_id: self._delete_message(f, mid))
+        else:
+            del_btn.setEnabled(False)
         lay.addWidget(del_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         return frame
@@ -11876,9 +12723,13 @@ class ProfileDialog(AppDialog):
         self._friends_table.load([])
 
     def _load_profile_async(self) -> None:
+        online = getattr(self._app, "online", None)
+        profile = getattr(online, "profile", None) if online else None
+        if profile is None:
+            return
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._apply_profile_result(r))
-        self._app.online.profile.get_profile(callback=_cb)
+        profile.get_profile(callback=_cb)
 
     def _load_social_async(self) -> None:
         online = self._app.online
@@ -11897,11 +12748,16 @@ class ProfileDialog(AppDialog):
     def _apply_profile_result(self, res: Any) -> None:
         if not self.isVisible():
             return
+        online = getattr(self._app, "online", None)
+        profile = getattr(online, "profile", None) if online else None
+        auth = getattr(online, "auth", None) if online else None
+        if online is None or profile is None:
+            return
         if getattr(res, "success", False) and res.data is None:
-            username = self._app.online.auth.username or self._app.game.player_name or "Merchant"
+            username = getattr(auth, "username", None) or self._app.game.player_name or "Merchant"
             def _create_cb(_result: Any) -> None:
                 _queue_ui(self, self._load_profile_async)
-            self._app.online.profile.create_profile(username=username, callback=_create_cb)
+            profile.create_profile(username=username, callback=_create_cb)
             return
         if not getattr(res, "success", False) or not isinstance(res.data, dict):
             return
@@ -12018,7 +12874,9 @@ class ProfileDialog(AppDialog):
         self._app.game.active_title = title_id
         if self._app.online and self._app.online.is_online:
             try:
-                self._app.online.profile.set_active_title(title_id)
+                profile = getattr(self._app.online, "profile", None)
+                if profile is not None:
+                    profile.set_active_title(title_id)
             except Exception:
                 pass
             self._app._push_leaderboard()
@@ -12171,7 +13029,8 @@ class GuildRoleEditorDialog(AppDialog):
         root.addWidget(perms_lbl)
 
         self._permission_checks: Dict[str, QCheckBox] = {}
-        perms = self._role.get("permissions") if isinstance(self._role.get("permissions"), dict) else {}
+        raw_perms = self._role.get("permissions")
+        perms: Dict[str, Any] = raw_perms if isinstance(raw_perms, dict) else {}
         for key, label in self.PERMISSION_LABELS:
             cb = QCheckBox(label, self._body)
             cb.setChecked(bool(perms.get(key, False)))
@@ -12431,12 +13290,17 @@ class GuildManagementDialog(AppDialog):
         self._tabs.addTab(roles, f"{Sym.SKILLS}  Roles")
 
     def _permissions(self) -> Dict[str, bool]:
-        perms = self._dashboard.get("permissions")
+        dashboard = self._dashboard if isinstance(self._dashboard, dict) else {}
+        perms = dashboard.get("permissions")
         if isinstance(perms, dict) and perms:
             return perms
-        membership = self._dashboard.get("membership") if isinstance(self._dashboard.get("membership"), dict) else {}
-        guild = self._dashboard.get("guild") if isinstance(self._dashboard.get("guild"), dict) else {}
-        current_user_id = str(self._app.online.auth.user_id if self._app.online and self._app.online.auth.user_id else "")
+        raw_membership = dashboard.get("membership")
+        raw_guild = dashboard.get("guild")
+        membership: Dict[str, Any] = raw_membership if isinstance(raw_membership, dict) else {}
+        guild: Dict[str, Any] = raw_guild if isinstance(raw_guild, dict) else {}
+        online = getattr(self._app, "online", None)
+        auth = getattr(online, "auth", None) if online else None
+        current_user_id = str(getattr(auth, "user_id", "") or "")
         owner_id = str(guild.get("owner_id", "") or "")
         if current_user_id and owner_id and current_user_id == owner_id:
             return {
@@ -12551,6 +13415,9 @@ class GuildManagementDialog(AppDialog):
         )
 
         member_rows: List[Dict[str, Any]] = []
+        online = getattr(self._app, "online", None)
+        auth = getattr(online, "auth", None) if online else None
+        current_user_id = str(getattr(auth, "user_id", "") or "")
         for member in members:
             joined = str(member.get("joined_at", "") or "")
             if "T" in joined:
@@ -12562,7 +13429,7 @@ class GuildManagementDialog(AppDialog):
                 "contribution": f"{int(member.get('contribution_score', 0) or 0):,}",
                 "user_id": str(member.get("user_id", "") or ""),
                 "role_key": str(member.get("role", "member") or "member"),
-                "_tag": "cyan" if str(member.get("user_id", "") or "") == str(getattr(getattr(self._app, 'online', None), 'auth', None).user_id if getattr(self._app, 'online', None) else "") else "dim",
+                "_tag": "cyan" if str(member.get("user_id", "") or "") == current_user_id else "dim",
             })
         self._members_table.load(member_rows)
 
@@ -12616,7 +13483,12 @@ class GuildManagementDialog(AppDialog):
         def _search_cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, q=query: self._handle_invite_search(r, q))
 
-        self._app.online.profile.search_players(query, callback=_search_cb)
+        online = getattr(self._app, "online", None)
+        profile = getattr(online, "profile", None) if online else None
+        if profile is None:
+            self._app.message_bar.warn("Online profile service is unavailable.")
+            return
+        profile.search_players(query, callback=_search_cb)
 
     def _handle_invite_search(self, res: Any, query: str) -> None:
         if not getattr(res, "success", False):
@@ -12648,7 +13520,12 @@ class GuildManagementDialog(AppDialog):
         def _invite_cb(invite_res: Any) -> None:
             _queue_ui(self, lambda r=invite_res: self._handle_invite_sent(r, str(player.get('username', 'merchant') or 'merchant')))
 
-        self._app.online.guilds.send_invite(self._guild_id, player_id, callback=_invite_cb)
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.send_invite(self._guild_id, player_id, callback=_invite_cb)
 
     def _handle_invite_sent(self, res: Any, name: str) -> None:
         if getattr(res, "success", False):
@@ -12671,7 +13548,8 @@ class GuildManagementDialog(AppDialog):
         if str(row.get("role_key", "")) == "president":
             self._app.message_bar.warn("Use a dedicated leadership-transfer flow before changing the president role.")
             return
-        role_rows = self._dashboard.get("roles") if isinstance(self._dashboard.get("roles"), list) else []
+        raw_roles = self._dashboard.get("roles") if isinstance(self._dashboard, dict) else None
+        role_rows: List[Dict[str, Any]] = raw_roles if isinstance(raw_roles, list) else []
         choices: List[str] = []
         mapping: Dict[str, str] = {}
         for role in role_rows:
@@ -12691,7 +13569,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_role_assigned(r, str(row.get('merchant', 'member') or 'member')))
 
-        self._app.online.guilds.assign_member_role(self._guild_id, user_id, mapping[choice], callback=_cb)
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.assign_member_role(self._guild_id, user_id, mapping[choice], callback=_cb)
 
     def _handle_role_assigned(self, res: Any, merchant: str) -> None:
         if getattr(res, "success", False):
@@ -12707,7 +13590,10 @@ class GuildManagementDialog(AppDialog):
         if not row:
             self._app.message_bar.warn("Select a member first.")
             return
-        if str(row.get("user_id", "") or "") == str(self._app.online.auth.user_id if self._app.online else ""):
+        online = getattr(self._app, "online", None)
+        auth = getattr(online, "auth", None) if online else None
+        current_user_id = str(getattr(auth, "user_id", "") or "")
+        if str(row.get("user_id", "") or "") == current_user_id:
             self._app.message_bar.warn("Use Leave Guild for your own account.")
             return
         if str(row.get("role_key", "")) == "president":
@@ -12720,7 +13606,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_member_removed(r, merchant))
 
-        self._app.online.guilds.remove_member(self._guild_id, str(row.get("user_id", "") or ""), callback=_cb)
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.remove_member(self._guild_id, str(row.get("user_id", "") or ""), callback=_cb)
 
     def _handle_member_removed(self, res: Any, merchant: str) -> None:
         if getattr(res, "success", False):
@@ -12739,7 +13630,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_role_saved(r, str(payload.get('label', 'role') or 'role')))
 
-        self._app.online.guilds.upsert_guild_role(
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.upsert_guild_role(
             self._guild_id,
             str(payload.get("role_key", "") or "member"),
             str(payload.get("label", "Role") or "Role"),
@@ -12763,7 +13659,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_role_saved(r, str(payload.get('label', 'role') or 'role')))
 
-        self._app.online.guilds.upsert_guild_role(
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.upsert_guild_role(
             self._guild_id,
             str(payload.get("role_key", "") or row.get("role_key", "member")),
             str(payload.get("label", row.get("label", "Role")) or row.get("label", "Role")),
@@ -12798,7 +13699,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_role_deleted(r, label))
 
-        self._app.online.guilds.delete_guild_role(self._guild_id, role_key, callback=_cb)
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.delete_guild_role(self._guild_id, role_key, callback=_cb)
 
     def _handle_role_deleted(self, res: Any, label: str) -> None:
         if getattr(res, "success", False):
@@ -12817,7 +13723,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_policy_saved(r))
 
-        self._app.online.guilds.update_guild_policy(self._guild_id, payload, callback=_cb)
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.update_guild_policy(self._guild_id, payload, callback=_cb)
 
     def _handle_policy_saved(self, res: Any) -> None:
         if getattr(res, "success", False):
@@ -12829,7 +13740,8 @@ class GuildManagementDialog(AppDialog):
         if not self._can("edit_guild_profile"):
             self._app.message_bar.warn("Your role cannot edit guild details.")
             return
-        guild = self._dashboard.get("guild") if isinstance(self._dashboard.get("guild"), dict) else {}
+        raw_guild = self._dashboard.get("guild") if isinstance(self._dashboard, dict) else None
+        guild: Dict[str, Any] = raw_guild if isinstance(raw_guild, dict) else {}
         motto = TextPromptDialog(
             self,
             "Guild Motto",
@@ -12854,7 +13766,12 @@ class GuildManagementDialog(AppDialog):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res: self._handle_guild_profile_saved(r))
 
-        self._app.online.guilds.update_guild(
+        online = getattr(self._app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self._app.message_bar.warn("Guild service is unavailable.")
+            return
+        guilds.update_guild(
             self._guild_id,
             {"motto": motto.strip(), "description": description.strip()},
             callback=_cb,
@@ -13171,6 +14088,9 @@ class DashboardScreen(Screen):
         super().__init__(app)
         self._d_cat_tab: Optional[QWidget] = None
         self._d_cat_panel: Optional[CatCompanionPanel] = None
+        self._d_ghost_tab: Optional[QWidget] = None
+        self._d_ghost_panel: Optional[GhostTabWidget] = None
+        self._d_ps_frame: Optional[QFrame] = None
 
     # ── Build ──────────────────────────────────────────────────────────────
 
@@ -13294,6 +14214,7 @@ class DashboardScreen(Screen):
             ps_lay, f"{Sym.HEAT} Heat",       "\u2014", P.red,    ps_frame)
         self._d_title_val = self._stat_row(
             ps_lay, f"{Sym.INFLUENCE} Title", "\u2014", P.gold,   ps_frame)
+        self._d_ps_frame = ps_frame
         outer_lay.addWidget(ps_frame)
 
         # ── Inventory Snapshot ────────────────────────────────────────────
@@ -13434,7 +14355,7 @@ class DashboardScreen(Screen):
         lbl.setFixedHeight(UIScale.px(22))
         return lbl
 
-    def _set_focus_badge(self, badge: QLabel, prefix: str, value: str, accent: str = None) -> None:
+    def _set_focus_badge(self, badge: QLabel, prefix: str, value: str, accent: Optional[str] = None) -> None:
         accent = accent or P.gold
         badge.setText(f"{prefix}: {value}")
         badge.setStyleSheet(
@@ -13745,18 +14666,84 @@ class DashboardScreen(Screen):
             self._chart_tabs.tabBar().setTabButton(idx, QTabBar.ButtonPosition.LeftSide, PawTabLabel(label_text, self._chart_tabs.tabBar()))
             self._chart_tabs.setTabToolTip(idx, f"{str(self.game.cat_state.get('cat_name', 'Stray') or 'Stray')}'s nap corner")
 
+    def _ensure_ghost_tab(self) -> None:
+        """Add or remove the Rigby ghost tab depending on ghost_found state."""
+        found = bool(getattr(self.game, "ghost_state", {}).get("ghost_found", False))
+        if not found:
+            if self._d_ghost_tab is not None:
+                idx = self._chart_tabs.indexOf(self._d_ghost_tab)
+                if idx >= 0:
+                    self._chart_tabs.removeTab(idx)
+                self._d_ghost_tab.deleteLater()
+                self._d_ghost_tab = None
+                self._d_ghost_panel = None
+            return
+        if self._d_ghost_tab is None:
+            ghost_tab = QWidget(self)
+            ghost_lay = QVBoxLayout(ghost_tab)
+            ghost_lay.setContentsMargins(0, 0, 0, 0)
+            ghost_lay.setSpacing(0)
+            self._d_ghost_panel = GhostTabWidget(self.app, ghost_tab)
+            ghost_lay.addWidget(self._d_ghost_panel)
+            self._d_ghost_tab = ghost_tab
+            self._chart_tabs.insertTab(self._chart_tabs.count(), ghost_tab, "👻  Rigby")
+
     def _handle_cat_pet(self) -> None:
+        if getattr(self, "_cat_check_pending", False):
+            return  # already waiting for server
+
+        online = getattr(self.app, "online", None)
+        if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+            # Server-validated path
+            self._cat_check_pending = True
+            online.timers.get_timers(
+                callback=lambda r: _queue_ui(self, lambda res=r: self._on_server_cat_check(res))
+            )
+        else:
+            # Offline path — local date check
+            self._award_cat_pet()
+
+    def _on_server_cat_check(self, res: Any) -> None:
+        """Called on main thread after server timer fetch; awards or blocks cat petting."""
+        self._cat_check_pending = False
+
+        if res.success and res.server_time is not None:
+            from datetime import datetime as _dt
+            server_now   = res.server_time
+            row          = res.data or {}
+            cloud_cat_ts = float(row.get("cat_last_pet", 0.0) or 0.0)
+            # Has 24 hours passed since last pet, by server clock?
+            if cloud_cat_ts > 0 and (server_now - cloud_cat_ts) < 86400.0:
+                self.msg.info("The kitten is already thoroughly content today.")
+                self.app.refresh()
+                return
+            # Server confirmed ready — clear local guard so pet_cat() succeeds
+            self.game.cat_state["last_pet_real_day"] = ""
+
+        self._award_cat_pet()
+
+    def _award_cat_pet(self) -> None:
+        """Give the cat rep reward (local cooldown guard still applies for offline)."""
+        import time as _t
         gained = int(getattr(self.game, "pet_cat", lambda: 0)() or 0)
         if gained > 0 and hasattr(self.app, "game_header"):
             self.app.game_header.refresh()
         if gained > 0:
             self.msg.ok(f"The kitten leans into your hand. +{gained} reputation.")
+            # Sync petting timestamp to cloud
+            online = getattr(self.app, "online", None)
+            if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+                online.timers.set_timer(cat_last_pet=_t.time())
         else:
             self.msg.info("The kitten is already thoroughly content today.")
         self.app.refresh()
 
     def on_show(self) -> None:
         self._sync_cat_audio()
+        self._ensure_ghost_tab()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
 
     def on_hide(self) -> None:
         if self._d_cat_panel is not None:
@@ -14035,7 +15022,7 @@ class DashboardScreen(Screen):
         year   = int(getattr(g, "year",   1))
         season = getattr(g, "season", None)
         sea_s  = season.value if season and hasattr(season, "value") else "?"
-        sea_c  = SEASON_COLOURS.get(season, P.gold)
+        sea_c  = SEASON_COLOURS.get(season, P.gold) if season is not None else P.gold
         self._time_lbl.setText(f"Day {day}  \u00b7  {sea_s}  \u00b7  Year {year}")
         self._time_lbl.setStyleSheet(f"color:{sea_c}; background:transparent;")
 
@@ -14121,14 +15108,17 @@ class DashboardScreen(Screen):
             self._d_biz_lbl.setText("No businesses owned.")
 
         # ── Contracts ─────────────────────────────────────────────────────
-        abs_day  = getattr(g, "_absolute_day", lambda: 0)
-        abs_day  = abs_day() if callable(abs_day) else 0
+        abs_day_fn = getattr(g, "_absolute_day", lambda: 0)
+        abs_day_raw = abs_day_fn() if callable(abs_day_fn) else 0
+        abs_day = int(abs_day_raw) if isinstance(abs_day_raw, (int, float)) else 0
         active_c = [c for c in getattr(g, "contracts", [])
                     if not getattr(c, "fulfilled", True)]
         if active_c:
             lines = []
             for c in active_c[:8]:
-                dl     = getattr(c, "deadline_day", abs_day + 999) - abs_day
+                deadline_raw = getattr(c, "deadline_day", abs_day + 999)
+                deadline = int(deadline_raw) if isinstance(deadline_raw, (int, float)) else abs_day + 999
+                dl     = deadline - abs_day
                 ik     = getattr(c, "item_key", "")
                 nm     = getattr(ALL_ITEMS.get(ik), "name", ik)
                 dest   = getattr(c, "destination", None)
@@ -14205,6 +15195,9 @@ class DashboardScreen(Screen):
         if self._d_cat_panel is not None:
             self._d_cat_panel.refresh_from_game(g)
         self._sync_cat_audio()
+        self._ensure_ghost_tab()
+        if self._d_ghost_panel is not None:
+            self._d_ghost_panel._refresh_status()
 
         # ── News ──────────────────────────────────────────────────────────
         news = list(getattr(g, "news_feed", []))
@@ -14337,7 +15330,7 @@ class _HubCard(QFrame):
         self._set_hovered_style(self.underMouse())
         super().mouseReleaseEvent(ev)
 
-    def enterEvent(self, event: QEvent) -> None:
+    def enterEvent(self, event: QEnterEvent) -> None:
         self._set_hovered_style(True)
         super().enterEvent(event)
 
@@ -14673,7 +15666,7 @@ class _PrimaryNavCard(QFrame):
         if self._badge.isVisible():
             self._badge.move(self.width() - UIScale.px(28), UIScale.px(6))
 
-    def enterEvent(self, event: QEvent) -> None:
+    def enterEvent(self, event: QEnterEvent) -> None:
         self._refresh_style(True)
         super().enterEvent(event)
 
@@ -14836,7 +15829,7 @@ class _SecNavCard(QFrame):
 
     # ── Qt events ─────────────────────────────────────────────────────────────
 
-    def enterEvent(self, event: QEvent) -> None:
+    def enterEvent(self, event: QEnterEvent) -> None:
         self._refresh_style(True)
         super().enterEvent(event)
 
@@ -15097,7 +16090,8 @@ class MainMenuScreen(Screen):
         # ── Helpers ───────────────────────────────────────────────────────────
         def _day() -> int:
             fn = getattr(g, "_absolute_day", None)
-            return fn() if callable(fn) else 0
+            raw = fn() if callable(fn) else 0
+            return int(raw) if isinstance(raw, (int, float)) else 0
 
         abs_day   = _day()
         broken    = [b for b in getattr(g, "businesses", [])
@@ -15127,9 +16121,8 @@ class MainMenuScreen(Screen):
         if active_c:
             nearest = min(active_c, key=lambda c: c.deadline_day - abs_day)
             dl = nearest.deadline_day - abs_day
-            nm = ALL_ITEMS.get(
-                nearest.item_key, type("_", (), {"name": "?"})()
-            ).name
+            item_def = ALL_ITEMS.get(nearest.item_key)
+            nm = item_def.name if item_def is not None else "?"
             marker = "[!]" if dl <= 3 else "[~]"
             alerts.append(
                 f"{marker}  Contract: {nearest.quantity}× {nm}"
@@ -15605,9 +16598,10 @@ class TradeScreen(Screen):
         self.game._use_time(1)
         self.game._gain_skill_xp(SkillType.HAGGLING, 10)
         result = self.game.try_haggle(self.game.current_area, item_key)
-        status = str(result.get("status", "failed"))
-        discount = float(result.get("discount", 0.0) or 0.0)
-        attempts = int(result.get("attempts", 0))
+        result_data: Dict[str, Any] = result if isinstance(result, dict) else {}
+        status = str(result_data.get("status", "failed"))
+        discount = float(result_data.get("discount", 0.0) or 0.0)
+        attempts = int(result_data.get("attempts", 0) or 0)
         if status == "success":
             self.msg.ok(
                 f"Haggled {int(discount * 100)}% extra off {ALL_ITEMS[item_key].name}. "
@@ -17082,7 +18076,6 @@ class SmugglingScreen(Screen):
             g._track_stat("smuggle_busts")
             g._check_achievements()
             GameToast(self.app, f"⚠ Sting operation! Fine {fine:.0f}g · heat +28 · rep −20", P.red, duration_ms=5_000)
-            self.msg.err(f"Sting operation. Fine {fine:.0f}g, heat +28, rep -20.")
             self.app.refresh()
             return
         g.inventory.gold -= total
@@ -17185,7 +18178,6 @@ class SmugglingScreen(Screen):
             g._check_achievements()
             GameToast(self.app, f"⚠ Busted! {qty}× {item.name} seized · fine {fine:.0f}g · heat +28", P.red, duration_ms=5_000)
             if not silent:
-                self.msg.err(f"Busted. {qty}× {item.name} seized, fine {fine:.0f}g, heat +28.")
                 self.app.refresh()
             return 0.0
         g.inventory.remove(item_key, qty)
@@ -17252,7 +18244,6 @@ class SmugglingScreen(Screen):
         g.heat = max(0, g.heat - reduce)
         g._use_time(2)
         g._gain_skill_xp(SkillType.ESPIONAGE, 4)
-        GameToast(self.app, f"\U0001f575 Laying low\u2026 Heat \u2212{reduce}. Now {g.heat}/100.", P.fg_dim, duration_ms=4000)
         self.msg.ok(f"You keep a low profile for two time units. Heat drops \u2212{reduce} to {g.heat}/100.")
         self.app.refresh()
 
@@ -18753,10 +19744,10 @@ class StockMarketScreen(Screen):
         lo = min(hist) if hist else price
         avg = sum(hist) / len(hist) if hist else price
         holding = self.game.stock_holdings.get(sym)
-        points = [(index + 1, value) for index, value in enumerate(hist or [price])]
+        points = [(float(index + 1), float(value)) for index, value in enumerate(hist or [price])]
         series: List[Tuple[str, str, List[Tuple[float, float]]]] = [(sym, P.gold, points)]
         if holding:
-            series.append(("Avg Cost", P.cream, [(index + 1, holding.avg_cost) for index, _ in enumerate(hist or [price])]))
+            series.append(("Avg Cost", P.cream, [(float(index + 1), float(holding.avg_cost)) for index, _ in enumerate(hist or [price])]))
         self._detail_chart.set_data(series)
         self._detail_name.setText(f"{stock['name']}  ({sym})")
         self._detail_stats.setText(
@@ -20573,41 +21564,44 @@ class ManagersScreen(Screen):
 
     def _do_hire(self) -> None:
         g = self.game
-        available: List[Tuple[ManagerType, Dict[str, Any], bool, bool]] = []
+        available: List[Tuple[str, Dict[str, Any], bool, bool]] = []
         labels: List[str] = []
         for mt, defn in MANAGER_DEFS.items():
+            mt_name = str(getattr(mt, "value", mt))
             required = defn.get("license")
             unlocked = required is None or required in g.licenses
-            already = any(mgr.manager_type == mt.value for mgr in g.hired_managers)
-            available.append((mt, defn, unlocked, already))
-            status = "Hired" if already else ("Available" if unlocked else f"Need {required.value}")
-            labels.append(f"{defn.get('icon', '⚙')}  {mt.value}  —  {defn['wage']:.0f}g/wk  [{status}]")
+            already = any(mgr.manager_type == mt_name for mgr in g.hired_managers)
+            available.append((mt_name, defn, unlocked, already))
+            required_name = str(getattr(required, "value", required)) if required is not None else ""
+            status = "Hired" if already else ("Available" if unlocked else f"Need {required_name}")
+            labels.append(f"{defn.get('icon', '⚙')}  {mt_name}  —  {defn['wage']:.0f}g/wk  [{status}]")
         choice, ok = _popup_choose(self, "Hire Manager", "Choose a manager type to recruit:", labels, confirm_text="Select")
         if not ok:
             return
         idx = labels.index(choice)
-        mt, defn, unlocked, already = available[idx]
+        mt_name, defn, unlocked, already = available[idx]
         if already:
-            self.msg.warn(f"You already have a {mt.value} hired.")
+            self.msg.warn(f"You already have a {mt_name} hired.")
             return
         if not unlocked:
             required = defn.get("license")
-            self.msg.err(f"You need {required.value} to hire this manager.")
+            required_name = str(getattr(required, "value", required)) if required is not None else "required license"
+            self.msg.err(f"You need {required_name} to hire this manager.")
             return
         name = self._random_name()
         if not _popup_confirm(
             self,
             "Hire Manager",
-            f"Hire {name} as {mt.value}?\nWeekly wage: {defn['wage']:.0f}g/week\nStarting efficiency: 65% (Lv1)",
+            f"Hire {name} as {mt_name}?\nWeekly wage: {defn['wage']:.0f}g/week\nStarting efficiency: 65% (Lv1)",
             confirm_text="Hire Manager",
         ):
             return
-        cfg = dict(_MANAGER_DEFAULT_CONFIGS.get(mt.value, {}))
-        g.hired_managers.append(HiredManager(manager_type=mt.value, name=name, weekly_wage=defn["wage"], config=cfg))
+        cfg = dict(_MANAGER_DEFAULT_CONFIGS.get(mt_name, {}))
+        g.hired_managers.append(HiredManager(manager_type=mt_name, name=name, weekly_wage=defn["wage"], config=cfg))
         if hasattr(g, "_log_trade"):
-            g._log_trade(f"Hired {name} as {mt.value} at {defn['wage']:.0f}g/wk")
+            g._log_trade(f"Hired {name} as {mt_name} at {defn['wage']:.0f}g/wk")
         self._selected_manager_id = name
-        self.msg.ok(f"Hired {name} as {mt.value}.")
+        self.msg.ok(f"Hired {name} as {mt_name}.")
         self.app.refresh()
 
     def _do_fire(self) -> None:
@@ -21808,6 +22802,9 @@ class MysteriousCofferDialog(AppDialog):
             return
         self._spinning = True
         self._was_mercy_roll = self._mercy >= 15
+        if not self._was_mercy_roll and self._free_spins > 0:
+            self._free_spins -= 1
+            self._game.settings.gamble_free_spins = self._free_spins
         self._winner = self._pick_rarity()
         strip = [self._random_strip_rarity() for _ in range(_CofferReelWidget.ITEM_COUNT)]
         strip[_CofferReelWidget.WINNER_INDEX] = self._winner
@@ -22583,7 +23580,12 @@ class SocialScreen(Screen):
         label = self._player_label(player)
         def _send_cb(send_res: Any) -> None:
             _queue_ui(self, lambda r=send_res, name=label: self._after_send_request(r, name))
-        self.app.online.friends.send_request(player_id, callback=_send_cb)
+        online = getattr(self.app, "online", None)
+        friends = getattr(online, "friends", None) if online else None
+        if friends is None:
+            self.msg.warn("Friends service is unavailable.")
+            return
+        friends.send_request(player_id, callback=_send_cb)
 
     def _after_send_request(self, res: Any, name: str) -> None:
         if getattr(res, "success", False):
@@ -22607,7 +23609,12 @@ class SocialScreen(Screen):
             return
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, accepted=accept: self._after_respond(r, row, accepted))
-        self.app.online.friends.respond_to_request(requester_id, accept, callback=_cb)
+        online = getattr(self.app, "online", None)
+        friends = getattr(online, "friends", None) if online else None
+        if friends is None:
+            self.msg.warn("Friends service is unavailable.")
+            return
+        friends.respond_to_request(requester_id, accept, callback=_cb)
 
     def _after_respond(self, res: Any, row: Dict[str, Any], accept: bool) -> None:
         if getattr(res, "success", False):
@@ -22636,7 +23643,12 @@ class SocialScreen(Screen):
             return
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, friend_name=name: self._after_remove_friend(r, friend_name))
-        self.app.online.friends.remove_friend(friend_id, callback=_cb)
+        online = getattr(self.app, "online", None)
+        friends = getattr(online, "friends", None) if online else None
+        if friends is None:
+            self.msg.warn("Friends service is unavailable.")
+            return
+        friends.remove_friend(friend_id, callback=_cb)
 
     def _after_remove_friend(self, res: Any, name: str) -> None:
         if getattr(res, "success", False):
@@ -22736,7 +23748,8 @@ class SocialScreen(Screen):
             desc = self._my_guild.get("description") or "No description."
             count = int(self._my_guild.get("member_count", 0) or 0)
             role_label = str(self._my_guild.get("my_role_label", self._my_guild.get("my_role", "")) or "")
-            policy = self._my_guild.get("policy") if isinstance(self._my_guild.get("policy"), dict) else {}
+            policy_raw = self._my_guild.get("policy")
+            policy: Dict[str, Any] = policy_raw if isinstance(policy_raw, dict) else {}
             focus = str(policy.get("event_focus", "balanced") or "balanced").replace("_", " ").title()
             self._guild_name_lbl.setText(str(name))
             self._guild_desc_lbl.setText(str(desc))
@@ -22856,7 +23869,12 @@ class SocialScreen(Screen):
             return
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, guild_name=name: self._after_join_guild(r, guild_name))
-        self.app.online.guilds.join_guild(guild_id, callback=_cb)
+        online = getattr(self.app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self.msg.warn("Guild service is unavailable.")
+            return
+        guilds.join_guild(guild_id, callback=_cb)
 
     def _after_join_guild(self, res: Any, name: str) -> None:
         if getattr(res, "success", False):
@@ -22884,7 +23902,12 @@ class SocialScreen(Screen):
             return
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, guild_name=name: self._after_leave_guild(r, guild_name))
-        self.app.online.guilds.leave_guild(guild_id, callback=_cb)
+        online = getattr(self.app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self.msg.warn("Guild service is unavailable.")
+            return
+        guilds.leave_guild(guild_id, callback=_cb)
 
     def _after_leave_guild(self, res: Any, name: str) -> None:
         if getattr(res, "success", False):
@@ -22911,7 +23934,12 @@ class SocialScreen(Screen):
         def _cb(res: Any) -> None:
             _queue_ui(self, lambda r=res, accepted=accept, guild_name=str(row.get('guild', 'guild') or 'guild'): self._after_respond_guild_invite(r, accepted, guild_name))
 
-        self.app.online.guilds.respond_to_invite(invite_id, accept, callback=_cb)
+        online = getattr(self.app, "online", None)
+        guilds = getattr(online, "guilds", None) if online else None
+        if guilds is None:
+            self.msg.warn("Guild service is unavailable.")
+            return
+        guilds.respond_to_invite(invite_id, accept, callback=_cb)
 
     def _after_respond_guild_invite(self, res: Any, accept: bool, guild_name: str) -> None:
         if getattr(res, "success", False):
@@ -22924,7 +23952,8 @@ class SocialScreen(Screen):
         if not isinstance(payload, dict):
             return
         guild = payload.get("guild") if isinstance(payload.get("guild"), dict) else payload
-        membership = payload.get("membership") if isinstance(payload.get("membership"), dict) else {}
+        membership_raw = payload.get("membership")
+        membership: Dict[str, Any] = membership_raw if isinstance(membership_raw, dict) else {}
         if not isinstance(guild, dict):
             return
         self.app._cached_guild_id = str(guild.get("id", guild.get("guild_id", "")) or "")
@@ -23259,7 +24288,8 @@ class _SettingsScreen(Screen):
             is_online = bool(online and getattr(online, "is_online", False) and online.auth.user_id)
             self._redeem_btn.setEnabled(is_online)
             if is_online:
-                username = str(getattr(online.auth, "username", "") or getattr(online.auth, "email", "Merchant") or "Merchant")
+                auth = getattr(online, "auth", None) if online else None
+                username = str(getattr(auth, "username", "") or getattr(auth, "email", "Merchant") or "Merchant")
                 self._redeem_status_lbl.setText(f"Online account active: {username}")
             else:
                 self._redeem_status_lbl.setText("Redeem codes require an active online session.")
@@ -23550,13 +24580,18 @@ class _SettingsScreen(Screen):
         if self._pending_hotkey:
             old_action, old_btn = self._pending_hotkey
             old_btn.setText("Set")
-            old_btn.setRole("secondary") if isinstance(old_btn, MtButton) else None
+            if isinstance(old_btn, MtButton):
+                old_btn.setRole("secondary")
 
         self._pending_hotkey = (action, btn)
-        btn.setText("Press key")
-        btn.setRole("primary") if isinstance(btn, MtButton) else None
+        btn.setText("Press key\u2026")
+        if isinstance(btn, MtButton):
+            btn.setRole("primary")
         self._capture_lbl = lbl
-        # Install a one-shot key filter by grabbing keyboard
+        # Disable all hotkeys so the pressed key isn't acted on as a shortcut
+        if hasattr(self.app, "hotkeys"):
+            self.app.hotkeys.set_enabled(False)
+        # Grab keyboard so only this widget receives key events
         self.grabKeyboard()
 
     def keyPressEvent(self, event: Any) -> None:
@@ -23568,9 +24603,13 @@ class _SettingsScreen(Screen):
         # Escape cancels
         if event.key() == Qt.Key.Key_Escape:
             btn.setText("Set")
-            btn.setRole("secondary") if isinstance(btn, MtButton) else None
+            if isinstance(btn, MtButton):
+                btn.setRole("secondary")
             self._pending_hotkey = None
             self.releaseKeyboard()
+            # Re-enable hotkeys now that capture is cancelled
+            if hasattr(self.app, "hotkeys"):
+                self.app.hotkeys.set_enabled(True)
             return
         # Build key string
         mods  = event.modifiers()
@@ -23594,7 +24633,16 @@ class _SettingsScreen(Screen):
         if not binding:
             return
 
-        # Apply
+        # Remove any existing binding that uses the same key sequence (prevent duplicates)
+        conflicts = [a for a, b in self.game.settings.hotkeys.items()
+                     if a != action and b == binding]
+        for conflict_action in conflicts:
+            self.game.settings.hotkeys[conflict_action] = ""
+            if conflict_action in self._hotkey_value_labels:
+                self._hotkey_value_labels[conflict_action].setText(
+                    self._format_hotkey_display(""))
+
+        # Apply new binding
         self.game.settings.hotkeys[action] = binding
         self.game.settings.save()
         if hasattr(self.app, "hotkeys"):
@@ -23602,11 +24650,20 @@ class _SettingsScreen(Screen):
 
         self._capture_lbl.setText(self._format_hotkey_display(binding))
         btn.setText("Set")
-        btn.setRole("secondary") if isinstance(btn, MtButton) else None
+        if isinstance(btn, MtButton):
+            btn.setRole("secondary")
         self._pending_hotkey = None
         self.releaseKeyboard()
-        self.msg.ok(
-            f"Hotkey '{action}' → {self._format_hotkey_display(binding)}")
+        # Re-enable hotkeys now that capture is complete
+        if hasattr(self.app, "hotkeys"):
+            self.app.hotkeys.set_enabled(True)
+        if conflicts:
+            self.msg.ok(
+                f"Hotkey '{action}' \u2192 {self._format_hotkey_display(binding)} "
+                f"(unbound from: {', '.join(conflicts)})")
+        else:
+            self.msg.ok(
+                f"Hotkey '{action}' \u2192 {self._format_hotkey_display(binding)}")
 
     def _reset_hotkeys(self) -> None:
         self.game.settings.hotkeys = dict(DEFAULT_HOTKEYS)
@@ -23928,6 +24985,9 @@ class MarketInfoScreen(Screen):
 
     # ── Tab QSS shared across all QTabWidgets in this screen ─────────────────
     _TAB_QSS = ""  # set in build() after UIScale is available
+    _matrix_search: QLineEdit
+    _route_from: QComboBox
+    _route_to: QComboBox
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
@@ -24569,8 +25629,8 @@ class MarketInfoScreen(Screen):
             vals      = list(by_area.values())
             min_p     = min(vals)
             max_p     = max(vals)
-            best_buy  = min(by_area, key=by_area.get)
-            best_sell = max(by_area, key=by_area.get)
+            best_buy  = min(by_area, key=lambda area: by_area[area])
+            best_sell = max(by_area, key=lambda area: by_area[area])
             margin    = (max_p - min_p) / min_p * 100.0 if min_p > 0 else 0.0
             trend     = self._trend_string(g, item_key)
 
@@ -24869,8 +25929,8 @@ class MarketInfoScreen(Screen):
                 prices[area] = mkt.get_price(item_key, season, noise=False)
 
         if prices:
-            lo_a  = min(prices, key=prices.get)
-            hi_a  = max(prices, key=prices.get)
+            lo_a  = min(prices, key=lambda area: prices[area])
+            hi_a  = max(prices, key=lambda area: prices[area])
             lo_v, hi_v = prices[lo_a], prices[hi_a]
             spread = hi_v - lo_v
             margin = spread / lo_v * 100.0 if lo_v > 0 else 0.0
@@ -25120,7 +26180,7 @@ class SuitorScreen(Screen):
         hdr = QHBoxLayout()
         hdr_lbl = QLabel("  ♥  Courtship & Marriage  ♥", self)
         hdr_lbl.setFont(Fonts.title)
-        hdr_lbl.setStyleSheet(f"color:{P.rose if hasattr(P,'rose') else '#e87aa0'}; background:transparent;")
+        hdr_lbl.setStyleSheet(f"color:{getattr(P, 'rose', '#e87aa0')}; background:transparent;")
         hdr.addWidget(hdr_lbl)
         hdr.addStretch()
         hdr.addWidget(self.back_button())
@@ -25442,7 +26502,7 @@ class SuitorScreen(Screen):
             self._refresh_detail(sid)
 
     def _refresh_detail(self, sid: str) -> None:
-        s = _SUITOR_BY_ID.get(sid)
+        s = _SUITOR_BY_ID.get(str(sid or ""))
         if not s:
             return
 
@@ -25716,7 +26776,7 @@ class SuitorScreen(Screen):
         g = self.game
         ms = g.marriage_state
         sid = ms.get("spouse_id")
-        s = _SUITOR_BY_ID.get(sid)
+        s = _SUITOR_BY_ID.get(str(sid or ""))
         if not s:
             return
 
@@ -25869,7 +26929,6 @@ class SuitorScreen(Screen):
 
         if hasattr(self.app, "sound"):
             self.app.sound.play_coin_sfx()
-        GameToast(self.app, f"  🎁  Gift given: {gift['icon']} {gift['name']}", P.gold, duration_ms=3000)
         self.msg.ok(
             f"You gave {s.name} {gift['icon']} {gift['name']} for {gift['cost']}g. "
             f"A warm smile answered you."
@@ -25928,7 +26987,6 @@ class SuitorScreen(Screen):
         if s.dowry_gold > 0:
             GameToast(self.app, f"  💰  Dowry received: +{s.dowry_gold:,.0f}g", P.green, duration_ms=5000)
 
-        self.msg.ok(f"Congratulations! You and {s.name} are wed. May your partnership prosper.")
         self.app.refresh()
         self._tabs.setCurrentIndex(1)
         self.refresh()
@@ -25937,13 +26995,61 @@ class SuitorScreen(Screen):
         g = self.game
         ms = g.marriage_state
         sid = ms.get("spouse_id")
-        s = _SUITOR_BY_ID.get(sid)
+        s = _SUITOR_BY_ID.get(str(sid or ""))
+        if not s:
+            return
+
+        if getattr(self, "_visit_check_pending", False):
+            return  # already waiting for server
+
+        online = getattr(self.app, "online", None)
+        if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+            # Server-validated path
+            self._visit_check_pending = True
+            online.timers.get_timers(
+                callback=lambda r: _queue_ui(self, lambda res=r: self._on_server_visit_check(res))
+            )
+        else:
+            # Offline path — local game-day check
+            abs_day = g._absolute_day()
+            if ms.get("last_visit_abs_day", 0) == abs_day:
+                self.msg.warn("You've already visited today. Come back tomorrow.")
+                return
+            self._apply_daily_visit_award()
+
+    def _on_server_visit_check(self, res: Any) -> None:
+        """Called on main thread after server timer fetch; awards or blocks daily visit."""
+        self._visit_check_pending = False
+        g  = self.game
+        ms = g.marriage_state
+
+        if res.success and res.server_time is not None:
+            from datetime import datetime as _dt
+            server_date  = _dt.utcfromtimestamp(res.server_time).date().isoformat()
+            cloud_visit  = str((res.data or {}).get("marriage_last_visit", "") or "")
+            if cloud_visit == server_date:
+                self.msg.warn("You've already visited today. Come back tomorrow.")
+                return
+            # Server confirmed not visited today — clear local block so award proceeds
+            ms["last_visit_abs_day"] = 0
+        else:
+            # Server check failed — fall back to local game-day check
+            abs_day = g._absolute_day()
+            if ms.get("last_visit_abs_day", 0) == abs_day:
+                self.msg.warn("You've already visited today. Come back tomorrow.")
+                return
+
+        self._apply_daily_visit_award()
+
+    def _apply_daily_visit_award(self) -> None:
+        """Award the daily spouse visit reward (shared by online and offline paths)."""
+        g = self.game
+        ms = g.marriage_state
+        sid = ms.get("spouse_id")
+        s = _SUITOR_BY_ID.get(str(sid or ""))
         if not s:
             return
         abs_day = g._absolute_day()
-        if ms.get("last_visit_abs_day", 0) == abs_day:
-            self.msg.warn("You've already visited today. Come back tomorrow.")
-            return
 
         ms["last_visit_abs_day"] = abs_day
         ms["rel_xp"] = ms.get("rel_xp", 0) + 10
@@ -25956,7 +27062,7 @@ class SuitorScreen(Screen):
         perk = s.daily_perk[min(lvl, len(s.daily_perk) - 1)]
 
         # Apply immediate perk effects
-        rep_flat = perk.get("rep_flat", 0)
+        rep_flat  = perk.get("rep_flat", 0)
         heat_flat = perk.get("heat_flat", 0)
         if rep_flat > 0:
             g._gain_reputation(rep_flat)
@@ -25968,8 +27074,13 @@ class SuitorScreen(Screen):
         if hasattr(self.app, "sound"):
             self.app.sound.play_ui_click()
 
+        # Sync marriage visit date to cloud
+        online = getattr(self.app, "online", None)
+        if online and getattr(online, "is_online", False) and hasattr(online, "timers"):
+            from datetime import date as _date
+            online.timers.set_timer(marriage_last_visit=_date.today().isoformat())
+
         GameToast(self.app, f"  💕  Daily visit:  {desc}", "#e87aa0", duration_ms=5000)
-        self.msg.ok(f"Your visit to {s.name} warms the day. Perk activated for 24 hours.")
         self.app.refresh()
         self.refresh()
 
@@ -25977,7 +27088,7 @@ class SuitorScreen(Screen):
         g = self.game
         ms = g.marriage_state
         sid = ms.get("spouse_id")
-        s = _SUITOR_BY_ID.get(sid)
+        s = _SUITOR_BY_ID.get(str(sid or ""))
         spouse_name = s.name if s else "your spouse"
 
         nw = g._net_worth()
@@ -26093,15 +27204,17 @@ def main() -> None:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Merchant Tycoon")
-    app.setApplicationDisplayName("Merchant Tycoon — Expanded Edition")
-    app.setOrganizationName("MerchantTycoon")
+    if isinstance(app, QApplication):
+        app.setApplicationName("Merchant Tycoon")
+        app.setApplicationDisplayName("Merchant Tycoon — Expanded Edition")
+        app.setOrganizationName("MerchantTycoon")
 
     # Initialise deferred colour tables (requires QApplication)
     _init_table_tag_colours()
 
     # Apply global QSS
-    app.setStyleSheet(_build_qss(UIScale.factor()))
+    if isinstance(app, QApplication):
+        app.setStyleSheet(_build_qss(UIScale.factor()))
     # Scale-change QSS rebuild is handled inside GameApp._on_scale_changed
     # (connected via UIScale.connect in GameApp.__init__)
 
